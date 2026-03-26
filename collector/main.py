@@ -87,7 +87,7 @@ INSERT_SQL = """
                          timeframe, timestamp, open, high, low, close,
                          volume, quote_volume, trades)
     VALUES (%(exchange)s, %(market_type)s, %(asset_id)s, %(symbol)s, %(native_symbol)s,
-            %(timeframe)s, to_timestamp(%(timestamp)s) AT TIME ZONE 'UTC', %(open)s, %(high)s, %(low)s, %(close)s,
+            %(timeframe)s, to_timestamp(%(timestamp)s), %(open)s, %(high)s, %(low)s, %(close)s,
             %(volume)s, %(quote_volume)s, %(trades)s)
     ON CONFLICT DO NOTHING
 """
