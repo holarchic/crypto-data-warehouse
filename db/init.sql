@@ -1,0 +1,26 @@
+CREATE EXTENSION IF NOT EXISTS timescaledb;
+
+CREATE TABLE IF NOT EXISTS candles (
+    exchange        TEXT NOT NULL,
+    market_type     TEXT NOT NULL,
+    asset_id        TEXT NOT NULL,
+    symbol          TEXT NOT NULL,
+    native_symbol   TEXT NOT NULL,
+    timeframe       TEXT NOT NULL,
+    timestamp       TIMESTAMPTZ NOT NULL,
+    open            DOUBLE PRECISION,
+    high            DOUBLE PRECISION,
+    low             DOUBLE PRECISION,
+    close           DOUBLE PRECISION,
+    volume          DOUBLE PRECISION,
+    quote_volume    DOUBLE PRECISION,
+    trades          INTEGER,
+    PRIMARY KEY (exchange, market_type, symbol, timeframe, timestamp)
+);
+
+SELECT create_hypertable('candles', 'timestamp',
+    chunk_time_interval => INTERVAL '1 week',
+    if_not_exists => TRUE);
+
+CREATE INDEX IF NOT EXISTS idx_candles_asset_timeframe_ts
+    ON candles (asset_id, timeframe, timestamp DESC);
