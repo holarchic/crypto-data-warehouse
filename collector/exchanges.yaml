@@ -1,0 +1,134 @@
+# Exchange definitions for candle-collector v0.2
+# Per-exchange: ccxt_class, btc_symbol, market_type, rate_limit_ms, enabled, supported_timeframes
+# Per-timeframe: interval_s (poll interval), buffer_s (wait after candle close before fetch)
+
+timeframes:
+  5m:   { interval_s: 300,    buffer_s: 30 }
+  15m:  { interval_s: 900,    buffer_s: 30 }
+  30m:  { interval_s: 1800,   buffer_s: 30 }
+  1h:   { interval_s: 3600,   buffer_s: 60 }
+  2h:   { interval_s: 7200,   buffer_s: 60 }
+  4h:   { interval_s: 14400,  buffer_s: 60 }
+  12h:  { interval_s: 43200,  buffer_s: 120 }
+  1d:   { interval_s: 86400,  buffer_s: 300 }
+  3d:   { interval_s: 259200, buffer_s: 300 }
+  1w:   { interval_s: 604800, buffer_s: 300 }
+
+exchanges:
+  hyperliquid:
+    ccxt_class: hyperliquid
+    btc_symbol: "BTC/USDC:USDC"
+    market_type: perp
+    rate_limit_ms: 200
+    enabled: true
+    supported_timeframes:
+      - 5m
+      - 15m
+      - 30m
+      - 1h
+      - 2h
+      - 4h
+      - 12h
+      - 1d
+      - 3d
+      - 1w
+
+  binance:
+    ccxt_class: binanceusdm
+    btc_symbol: "BTC/USDT:USDT"
+    market_type: perp
+    rate_limit_ms: 100
+    enabled: true
+    supported_timeframes:
+      - 5m
+      - 15m
+      - 30m
+      - 1h
+      - 2h
+      - 4h
+      - 12h
+      - 1d
+      - 3d
+      - 1w
+
+  bybit:
+    ccxt_class: bybit
+    btc_symbol: "BTC/USDT:USDT"
+    market_type: perp
+    rate_limit_ms: 100
+    enabled: true
+    supported_timeframes:
+      - 5m
+      - 15m
+      - 30m
+      - 1h
+      - 2h
+      - 4h
+      - 12h
+      - 1d
+      - 1w
+
+  okx:
+    ccxt_class: okx
+    btc_symbol: "BTC/USDT:USDT"
+    market_type: perp
+    rate_limit_ms: 100
+    enabled: true
+    options:
+      defaultType: swap
+    supported_timeframes:
+      - 5m
+      - 15m
+      - 30m
+      - 1h
+      - 2h
+      - 4h
+      - 12h
+      - 1d
+      - 3d
+      - 1w
+
+  kraken:
+    ccxt_class: krakenfutures
+    btc_symbol: "BTC/USD:USD"
+    market_type: perp
+    rate_limit_ms: 500
+    enabled: true
+    supported_timeframes:
+      - 5m
+      - 15m
+      - 30m
+      - 1h
+      - 4h
+      - 12h
+      - 1d
+      - 1w
+
+  coinbase:
+    ccxt_class: coinbase
+    btc_symbol: "BTC/USD"
+    market_type: spot
+    rate_limit_ms: 200
+    enabled: true
+    supported_timeframes:
+      - 5m
+      - 15m
+      - 30m
+      - 1h
+      - 2h
+      - 4h
+      - 1d
+
+  dydx:
+    ccxt_class: dydx
+    btc_symbol: "BTC/USD:USD"
+    market_type: perp
+    rate_limit_ms: 200
+    enabled: true
+    supported_timeframes:
+      - 5m
+      - 15m
+      - 30m
+      - 1h
+      - 4h
+      - 1d

@@ -4,14 +4,11 @@ import time
 
 import ccxt
 import psycopg
+from config import ExchangeConfig, load_config
 from dotenv import load_dotenv
 
 log = logging.getLogger(__name__)
 
-SYMBOL = "BTC/USDC:USDC"
-TIMEFRAME = "5m"
-INTERVAL_S = 300
-BUFFER_S = 30
 
 # ---------------------------------------------------------------------------
 # SafeHyperliquid — guard against ccxt bug in load_markets()
@@ -31,6 +28,37 @@ class SafeHyperliquid(ccxt.hyperliquid):
 
 
 # ---------------------------------------------------------------------------
+# Exchange factory
+# ---------------------------------------------------------------------------
+
+
+def create_exchange(config: ExchangeConfig):
+    """Create a ccxt exchange instance from config. SafeHyperliquid for HL, generic for others."""
+    opts = {"timeout": 30000, **config.options}
+
+    if config.ccxt_class == "hyperliquid":
+        exchange = SafeHyperliquid(opts)
+    else:
+        cls = getattr(ccxt, config.ccxt_class, None)
+        if cls is None:
+            raise ValueError(f"ccxt has no class '{config.ccxt_class}'")
+        exchange = cls(opts)
+
+    exchange.load_markets()
+    return exchange
+
+
+def resolve_market_info(exchange, config: ExchangeConfig):
+    """Extract asset_id, native_symbol, market_type from the exchange's BTC market."""
+    market = exchange.market(config.btc_symbol)
+    asset_id = market["base"]
+    native_symbol = market["id"]
+    mtype = config.market_type
+    log.info("Resolved %s — asset_id=%s native_symbol=%s market_type=%s", config.name, asset_id, native_symbol, mtype)
+    return {"asset_id": asset_id, "native_symbol": native_symbol, "market_type": mtype}
+
+
+# ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 
@@ -44,32 +72,21 @@ def build_dsn():
     return f"postgresql://{user}:{password}@{host}:{port}/{db}"
 
 
-def init_exchange():
-    exchange = SafeHyperliquid({"timeout": 30000})
-    exchange.load_markets()
-    market = exchange.market(SYMBOL)
-    asset_id = market["base"]
-    native_symbol = market["id"]
-    log.info("Initialized HyperLiquid — asset_id=%s native_symbol=%s", asset_id, native_symbol)
-    mtype = "perp" if market.get("swap") else market.get("type", "spot")
-    return exchange, {"asset_id": asset_id, "native_symbol": native_symbol, "market_type": mtype}
-
-
-def fetch_candles(exchange, symbol, market_info, limit=10):
-    raw = exchange.fetch_ohlcv(symbol, TIMEFRAME, limit=limit)
+def fetch_candles(exchange, symbol, market_info, exchange_name, timeframe, interval_s, limit=10):
+    raw = exchange.fetch_ohlcv(symbol, timeframe, limit=limit)
     now_ms = int(time.time() * 1000)
     candles = []
     for ts_ms, o, h, lo, c, vol in raw:
         # Drop incomplete candle (still forming)
-        if ts_ms + INTERVAL_S * 1000 > now_ms:
+        if ts_ms + interval_s * 1000 > now_ms:
             continue
         candles.append({
-            "exchange": "hyperliquid",
+            "exchange": exchange_name,
             "market_type": market_info["market_type"],
             "asset_id": market_info["asset_id"],
             "symbol": symbol,
             "native_symbol": market_info["native_symbol"],
-            "timeframe": TIMEFRAME,
+            "timeframe": timeframe,
             "timestamp": ts_ms / 1000,  # psycopg handles epoch -> timestamptz
             "open": o,
             "high": h,
@@ -105,11 +122,11 @@ def insert_candles(conn, candles):
     return inserted
 
 
-def sleep_until_next_boundary(interval_s=INTERVAL_S, buffer_s=BUFFER_S):
+def sleep_until_next_boundary(interval_s, buffer_s):
     now = time.time()
     next_boundary = (now // interval_s + 1) * interval_s + buffer_s
     sleep_s = next_boundary - now
-    log.info("Sleeping %.0fs until next %sm boundary (+%ss buffer)", sleep_s, interval_s // 60, buffer_s)
+    log.info("Sleeping %.0fs until next %ss boundary (+%ss buffer)", sleep_s, interval_s, buffer_s)
     time.sleep(sleep_s)
 
 
@@ -134,23 +151,37 @@ def run():
     load_dotenv()
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 
-    exchange, market_info = init_exchange()
+    config = load_config()
+    log.info("Starting collector for exchange=%s symbol=%s timeframes=%s", config.name, config.btc_symbol, [tf.name for tf in config.timeframes])
+
+    exchange = create_exchange(config)
+    market_info = resolve_market_info(exchange, config)
     dsn = build_dsn()
     conn = connect_db(dsn)
 
+    # Use first timeframe for single-threaded mode (v0.1 compat)
+    # Multi-timeframe threading added in Chunk 3
+    tf = config.timeframes[0] if config.timeframes else None
+    if tf is None:
+        raise RuntimeError(f"No timeframes configured for {config.name}")
+
+    timeframe = tf.name
+    interval_s = tf.interval_s
+    buffer_s = tf.buffer_s
+
     # Seed: fetch last 100 closed candles
-    log.info("Seeding candles...")
-    candles = fetch_candles(exchange, SYMBOL, market_info, limit=100)
+    log.info("Seeding %s candles...", timeframe)
+    candles = fetch_candles(exchange, config.btc_symbol, market_info, config.name, timeframe, interval_s, limit=100)
     inserted = insert_candles(conn, candles)
     log.info("Seeded %d candles (%d fetched, %d already existed)", inserted, len(candles), len(candles) - inserted)
 
     # Poll loop
     while True:
         try:
-            sleep_until_next_boundary()
-            candles = fetch_candles(exchange, SYMBOL, market_info, limit=10)
+            sleep_until_next_boundary(interval_s, buffer_s)
+            candles = fetch_candles(exchange, config.btc_symbol, market_info, config.name, timeframe, interval_s, limit=10)
             inserted = insert_candles(conn, candles)
-            log.info("Poll: fetched=%d inserted=%d", len(candles), inserted)
+            log.info("Poll [%s]: fetched=%d inserted=%d", timeframe, len(candles), inserted)
         except KeyboardInterrupt:
             log.info("Shutting down")
             break
