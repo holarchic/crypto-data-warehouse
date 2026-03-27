@@ -6,10 +6,10 @@ log = logging.getLogger(__name__)
 
 UPSERT_SUCCESS_SQL = """
     INSERT INTO collection_status (exchange, market_type, symbol, timeframe, active, last_timestamp, last_success, error_count)
-    VALUES (%(exchange)s, %(market_type)s, %(symbol)s, %(timeframe)s, TRUE, %(last_timestamp)s, NOW(), 0)
+    VALUES (%(exchange)s, %(market_type)s, %(symbol)s, %(timeframe)s, TRUE, to_timestamp(%(last_timestamp)s), NOW(), 0)
     ON CONFLICT (exchange, market_type, symbol, timeframe) DO UPDATE SET
         active = TRUE,
-        last_timestamp = GREATEST(collection_status.last_timestamp, %(last_timestamp)s),
+        last_timestamp = GREATEST(collection_status.last_timestamp, to_timestamp(%(last_timestamp)s)),
         last_success = NOW(),
         error_count = 0,
         last_error = NULL

@@ -185,12 +185,14 @@ def collect_loop(exchange, config: ExchangeConfig, market_info: dict, tf: Timefr
                 except RuntimeError:
                     log.error("[%s] DB reconnect failed, will retry next cycle", thread_name)
             if not conn.closed:
+                conn.rollback()
                 upsert_status_error(conn, config.name, market_info["market_type"], config.btc_symbol, tf.name, str(exc))
             backoff_sleep(error_count)
         except Exception as exc:
             error_count += 1
             log.exception("[%s] Unexpected error (error_count=%d)", thread_name, error_count)
             if not conn.closed:
+                conn.rollback()
                 upsert_status_error(conn, config.name, market_info["market_type"], config.btc_symbol, tf.name, str(exc))
             backoff_sleep(error_count)
 
