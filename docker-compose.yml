@@ -1,3 +1,16 @@
+x-collector-common: &collector-common
+  build: ./collector
+  depends_on:
+    db:
+      condition: service_healthy
+  environment: &collector-env
+    POSTGRES_USER: ${POSTGRES_USER:-candles}
+    POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+    POSTGRES_HOST: db
+    POSTGRES_PORT: "5432"
+    POSTGRES_DB: ${POSTGRES_DB:-candle_collector}
+  restart: always
+
 services:
   db:
     image: timescale/timescaledb:latest-pg16
@@ -15,19 +28,49 @@ services:
       interval: 5s
       timeout: 5s
       retries: 5
+    restart: always
 
-  collector:
-    build: ./collector
-    depends_on:
-      db:
-        condition: service_healthy
+  collector-hyperliquid:
+    <<: *collector-common
     environment:
-      POSTGRES_USER: ${POSTGRES_USER:-candles}
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
-      POSTGRES_HOST: db
-      POSTGRES_PORT: "5432"
-      POSTGRES_DB: ${POSTGRES_DB:-candle_collector}
-    restart: unless-stopped
+      <<: *collector-env
+      EXCHANGE: hyperliquid
+
+  collector-binance:
+    <<: *collector-common
+    environment:
+      <<: *collector-env
+      EXCHANGE: binance
+
+  collector-bybit:
+    <<: *collector-common
+    environment:
+      <<: *collector-env
+      EXCHANGE: bybit
+
+  collector-okx:
+    <<: *collector-common
+    environment:
+      <<: *collector-env
+      EXCHANGE: okx
+
+  collector-kraken:
+    <<: *collector-common
+    environment:
+      <<: *collector-env
+      EXCHANGE: kraken
+
+  collector-coinbase:
+    <<: *collector-common
+    environment:
+      <<: *collector-env
+      EXCHANGE: coinbase
+
+  collector-dydx:
+    <<: *collector-common
+    environment:
+      <<: *collector-env
+      EXCHANGE: dydx
 
   api:
     build: ./api
@@ -42,7 +85,7 @@ services:
       POSTGRES_HOST: db
       POSTGRES_PORT: "5432"
       POSTGRES_DB: ${POSTGRES_DB:-candle_collector}
-    restart: unless-stopped
+    restart: always
 
 volumes:
   pgdata:
