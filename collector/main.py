@@ -8,6 +8,7 @@ import psycopg
 from backoff import RETRIABLE_EXCEPTIONS, backoff_sleep
 from config import ExchangeConfig, TimeframeConfig, load_config
 from dotenv import load_dotenv
+from status import upsert_status_error, upsert_status_success
 
 log = logging.getLogger(__name__)
 
@@ -173,7 +174,9 @@ def collect_loop(exchange, config: ExchangeConfig, market_info: dict, tf: Timefr
             inserted = insert_candles(conn, candles)
             log.info("[%s] Poll: fetched=%d inserted=%d", thread_name, len(candles), inserted)
             error_count = 0
-        except RETRIABLE_EXCEPTIONS:
+            last_ts = max((c["timestamp"] for c in candles), default=None) if candles else None
+            upsert_status_success(conn, config.name, market_info["market_type"], config.btc_symbol, tf.name, last_ts)
+        except RETRIABLE_EXCEPTIONS as exc:
             error_count += 1
             log.exception("[%s] Retriable error (error_count=%d)", thread_name, error_count)
             if conn.closed:
@@ -181,10 +184,14 @@ def collect_loop(exchange, config: ExchangeConfig, market_info: dict, tf: Timefr
                     conn = connect_db(dsn)
                 except RuntimeError:
                     log.error("[%s] DB reconnect failed, will retry next cycle", thread_name)
+            if not conn.closed:
+                upsert_status_error(conn, config.name, market_info["market_type"], config.btc_symbol, tf.name, str(exc))
             backoff_sleep(error_count)
-        except Exception:
+        except Exception as exc:
             error_count += 1
             log.exception("[%s] Unexpected error (error_count=%d)", thread_name, error_count)
+            if not conn.closed:
+                upsert_status_error(conn, config.name, market_info["market_type"], config.btc_symbol, tf.name, str(exc))
             backoff_sleep(error_count)
 
 

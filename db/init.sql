@@ -24,3 +24,16 @@ SELECT create_hypertable('candles', 'timestamp',
 
 CREATE INDEX IF NOT EXISTS idx_candles_asset_timeframe_ts
     ON candles (asset_id, timeframe, timestamp DESC);
+
+CREATE TABLE IF NOT EXISTS collection_status (
+    exchange        TEXT NOT NULL,
+    market_type     TEXT NOT NULL,
+    symbol          TEXT NOT NULL,
+    timeframe       TEXT NOT NULL,
+    active          BOOLEAN DEFAULT TRUE,
+    last_timestamp  TIMESTAMPTZ,
+    last_success    TIMESTAMPTZ,
+    error_count     INTEGER DEFAULT 0,
+    last_error      TEXT,
+    PRIMARY KEY (exchange, market_type, symbol, timeframe)
+);
