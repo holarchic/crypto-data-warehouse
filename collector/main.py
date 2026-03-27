@@ -1,11 +1,12 @@
 import logging
 import os
+import threading
 import time
 
 import ccxt
 import psycopg
 from backoff import RETRIABLE_EXCEPTIONS, backoff_sleep
-from config import ExchangeConfig, load_config
+from config import ExchangeConfig, TimeframeConfig, load_config
 from dotenv import load_dotenv
 
 log = logging.getLogger(__name__)
@@ -73,8 +74,9 @@ def build_dsn():
     return f"postgresql://{user}:{password}@{host}:{port}/{db}"
 
 
-def fetch_candles(exchange, symbol, market_info, exchange_name, timeframe, interval_s, limit=10):
-    raw = exchange.fetch_ohlcv(symbol, timeframe, limit=limit)
+def fetch_candles(exchange, symbol, market_info, exchange_name, timeframe, interval_s, api_lock, limit=10):
+    with api_lock:
+        raw = exchange.fetch_ohlcv(symbol, timeframe, limit=limit)
     now_ms = int(time.time() * 1000)
     candles = []
     for ts_ms, o, h, lo, c, vol in raw:
@@ -144,6 +146,49 @@ def connect_db(dsn, max_retries=10, retry_delay=5):
 
 
 # ---------------------------------------------------------------------------
+# Per-timeframe collection loop (runs in its own thread)
+# ---------------------------------------------------------------------------
+
+
+def collect_loop(exchange, config: ExchangeConfig, market_info: dict, tf: TimeframeConfig, dsn: str, api_lock: threading.Lock):
+    """Seed + poll loop for a single timeframe. Own DB connection. Never exits."""
+    thread_name = f"{config.name}/{tf.name}"
+    conn = connect_db(dsn)
+
+    # Seed: fetch last 100 closed candles
+    log.info("[%s] Seeding candles...", thread_name)
+    try:
+        candles = fetch_candles(exchange, config.btc_symbol, market_info, config.name, tf.name, tf.interval_s, api_lock, limit=100)
+        inserted = insert_candles(conn, candles)
+        log.info("[%s] Seeded %d candles (%d fetched, %d already existed)", thread_name, inserted, len(candles), len(candles) - inserted)
+    except Exception:
+        log.exception("[%s] Seed failed, will retry in poll loop", thread_name)
+
+    # Poll loop — never exits
+    error_count = 0
+    while True:
+        try:
+            sleep_until_next_boundary(tf.interval_s, tf.buffer_s)
+            candles = fetch_candles(exchange, config.btc_symbol, market_info, config.name, tf.name, tf.interval_s, api_lock, limit=10)
+            inserted = insert_candles(conn, candles)
+            log.info("[%s] Poll: fetched=%d inserted=%d", thread_name, len(candles), inserted)
+            error_count = 0
+        except RETRIABLE_EXCEPTIONS:
+            error_count += 1
+            log.exception("[%s] Retriable error (error_count=%d)", thread_name, error_count)
+            if conn.closed:
+                try:
+                    conn = connect_db(dsn)
+                except RuntimeError:
+                    log.error("[%s] DB reconnect failed, will retry next cycle", thread_name)
+            backoff_sleep(error_count)
+        except Exception:
+            error_count += 1
+            log.exception("[%s] Unexpected error (error_count=%d)", thread_name, error_count)
+            backoff_sleep(error_count)
+
+
+# ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
 
@@ -153,55 +198,37 @@ def run():
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 
     config = load_config()
+    if not config.timeframes:
+        raise RuntimeError(f"No timeframes configured for {config.name}")
+
     log.info("Starting collector for exchange=%s symbol=%s timeframes=%s", config.name, config.btc_symbol, [tf.name for tf in config.timeframes])
 
     exchange = create_exchange(config)
     market_info = resolve_market_info(exchange, config)
     dsn = build_dsn()
-    conn = connect_db(dsn)
 
-    # Use first timeframe for single-threaded mode (v0.1 compat)
-    # Multi-timeframe threading added in Chunk 3
-    tf = config.timeframes[0] if config.timeframes else None
-    if tf is None:
-        raise RuntimeError(f"No timeframes configured for {config.name}")
+    # Shared lock — serializes API calls when timeframe boundaries align
+    api_lock = threading.Lock()
 
-    timeframe = tf.name
-    interval_s = tf.interval_s
-    buffer_s = tf.buffer_s
+    # One daemon thread per timeframe
+    threads = []
+    for tf in config.timeframes:
+        t = threading.Thread(
+            target=collect_loop,
+            args=(exchange, config, market_info, tf, dsn, api_lock),
+            name=f"{config.name}-{tf.name}",
+            daemon=True,
+        )
+        t.start()
+        threads.append(t)
+        log.info("Started thread %s", t.name)
 
-    # Seed: fetch last 100 closed candles
-    log.info("Seeding %s candles...", timeframe)
-    candles = fetch_candles(exchange, config.btc_symbol, market_info, config.name, timeframe, interval_s, limit=100)
-    inserted = insert_candles(conn, candles)
-    log.info("Seeded %d candles (%d fetched, %d already existed)", inserted, len(candles), len(candles) - inserted)
-
-    # Poll loop
-    error_count = 0
-    while True:
-        try:
-            sleep_until_next_boundary(interval_s, buffer_s)
-            candles = fetch_candles(exchange, config.btc_symbol, market_info, config.name, timeframe, interval_s, limit=10)
-            inserted = insert_candles(conn, candles)
-            log.info("Poll [%s]: fetched=%d inserted=%d", timeframe, len(candles), inserted)
-            error_count = 0
-        except KeyboardInterrupt:
-            log.info("Shutting down")
-            break
-        except RETRIABLE_EXCEPTIONS:
-            error_count += 1
-            log.exception("Retriable error in poll cycle (error_count=%d)", error_count)
-            # Reconnect DB on psycopg errors
-            if isinstance(conn, psycopg.Connection) and conn.closed:
-                try:
-                    conn = connect_db(dsn)
-                except RuntimeError:
-                    log.error("DB reconnect failed, will retry next cycle")
-            backoff_sleep(error_count)
-        except Exception:
-            error_count += 1
-            log.exception("Unexpected error in poll cycle (error_count=%d)", error_count)
-            backoff_sleep(error_count)
+    # Main thread waits — daemon threads die with the process
+    try:
+        while True:
+            time.sleep(60)
+    except KeyboardInterrupt:
+        log.info("Shutting down")
 
 
 if __name__ == "__main__":
