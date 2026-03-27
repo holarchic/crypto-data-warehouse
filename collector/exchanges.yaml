@@ -121,7 +121,7 @@ exchanges:
 
   dydx:
     ccxt_class: dydx
-    btc_symbol: "BTC/USD:USD"
+    btc_symbol: "BTC/USDC:USDC"
     market_type: perp
     rate_limit_ms: 200
     enabled: true
