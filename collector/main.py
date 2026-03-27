@@ -4,6 +4,7 @@ import time
 
 import ccxt
 import psycopg
+from backoff import RETRIABLE_EXCEPTIONS, backoff_sleep
 from config import ExchangeConfig, load_config
 from dotenv import load_dotenv
 
@@ -176,18 +177,31 @@ def run():
     log.info("Seeded %d candles (%d fetched, %d already existed)", inserted, len(candles), len(candles) - inserted)
 
     # Poll loop
+    error_count = 0
     while True:
         try:
             sleep_until_next_boundary(interval_s, buffer_s)
             candles = fetch_candles(exchange, config.btc_symbol, market_info, config.name, timeframe, interval_s, limit=10)
             inserted = insert_candles(conn, candles)
             log.info("Poll [%s]: fetched=%d inserted=%d", timeframe, len(candles), inserted)
+            error_count = 0
         except KeyboardInterrupt:
             log.info("Shutting down")
             break
+        except RETRIABLE_EXCEPTIONS:
+            error_count += 1
+            log.exception("Retriable error in poll cycle (error_count=%d)", error_count)
+            # Reconnect DB on psycopg errors
+            if isinstance(conn, psycopg.Connection) and conn.closed:
+                try:
+                    conn = connect_db(dsn)
+                except RuntimeError:
+                    log.error("DB reconnect failed, will retry next cycle")
+            backoff_sleep(error_count)
         except Exception:
-            log.exception("Error in poll cycle, sleeping 30s before retry")
-            time.sleep(30)
+            error_count += 1
+            log.exception("Unexpected error in poll cycle (error_count=%d)", error_count)
+            backoff_sleep(error_count)
 
 
 if __name__ == "__main__":
