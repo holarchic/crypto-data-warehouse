@@ -238,15 +238,13 @@ def get_status(exchange: str | None = None, timeframe: str | None = None):
     """
 
     compression_sql = """
-        SELECT hypertable_name,
-               total_chunks,
-               compressed_chunks
-        FROM hypertable_compression_stats(ht.hypertable_name)
-        RIGHT JOIN (
-            SELECT hypertable_name FROM timescaledb_information.hypertables
-            WHERE hypertable_schema = 'public'
-        ) ht USING (hypertable_name)
-        ORDER BY hypertable_name
+        SELECT ht.hypertable_name,
+               s.total_chunks,
+               s.compressed_chunks
+        FROM timescaledb_information.hypertables ht
+        CROSS JOIN LATERAL hypertable_compression_stats(ht.hypertable_name) s
+        WHERE ht.hypertable_schema = 'public'
+        ORDER BY ht.hypertable_name
     """
 
     with pool.connection() as conn:
