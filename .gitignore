@@ -25,6 +25,9 @@ Thumbs.db
 # Docker
 docker-compose.override.yml
 
+# Backups
+backups/
+
 # Data
 *.csv
 *.parquet
