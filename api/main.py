@@ -31,7 +31,7 @@ async def lifespan(app: FastAPI):
     pool.close()
 
 
-app = FastAPI(title="candle-collector", version="0.4.0", lifespan=lifespan)
+app = FastAPI(title="candle-collector", version="0.5.0", lifespan=lifespan)
 
 
 @app.get("/health")
@@ -202,3 +202,109 @@ def get_oi_latest(asset_id: str):
         if row.get("timestamp"):
             row["timestamp"] = row["timestamp"].isoformat()
     return rows
+
+
+# ---------------------------------------------------------------------------
+# Status / health monitoring endpoints
+# ---------------------------------------------------------------------------
+
+TIMEFRAME_INTERVALS = {
+    "5m": 300, "15m": 900, "30m": 1800, "1h": 3600, "2h": 7200,
+    "4h": 14400, "12h": 43200, "1d": 86400, "3d": 259200, "1w": 604800,
+}
+
+
+@app.get("/status")
+def get_status(exchange: str | None = None, timeframe: str | None = None):
+    conditions = ["active = TRUE"]
+    params: dict = {}
+    if exchange is not None:
+        conditions.append("exchange = %(exchange)s")
+        params["exchange"] = exchange
+    if timeframe is not None:
+        conditions.append("timeframe = %(timeframe)s")
+        params["timeframe"] = timeframe
+
+    where = " AND ".join(conditions)
+    query = f"""
+        SELECT exchange, symbol, timeframe, last_success, error_count, last_error,
+               EXTRACT(EPOCH FROM NOW() - last_success) AS seconds_since_success
+        FROM collection_status
+        WHERE {where}
+        ORDER BY exchange, timeframe, symbol
+    """
+
+    with pool.connection() as conn:
+        rows = conn.execute(query, params).fetchall()
+        db_size = conn.execute("SELECT pg_database_size(current_database()) AS size_bytes").fetchone()
+
+    # Compute is_stale flag
+    for row in rows:
+        interval_s = TIMEFRAME_INTERVALS.get(row["timeframe"])
+        since = row.get("seconds_since_success")
+        row["is_stale"] = interval_s is not None and (since is None or since > 2 * interval_s)
+        if row.get("last_success") and hasattr(row["last_success"], "isoformat"):
+            row["last_success"] = row["last_success"].isoformat()
+
+    return {
+        "collectors": rows,
+        "total": len(rows),
+        "stale": sum(1 for r in rows if r["is_stale"]),
+        "db_size_bytes": db_size["size_bytes"] if db_size else None,
+    }
+
+
+@app.get("/status/gaps")
+def get_status_gaps(
+    exchange: str,
+    timeframe: str,
+    asset_id: str | None = None,
+    lookback: int = Query(default=10, ge=1, le=1000),
+):
+    interval_s = TIMEFRAME_INTERVALS.get(timeframe)
+    if interval_s is None:
+        return {"error": f"Unknown timeframe: {timeframe}", "gaps": []}
+
+    lookback_s = lookback * interval_s
+
+    conditions = [
+        "exchange = %(exchange)s",
+        "timeframe = %(timeframe)s",
+        "timestamp > NOW() - INTERVAL '1 second' * %(lookback_s)s",
+    ]
+    params: dict = {
+        "exchange": exchange,
+        "timeframe": timeframe,
+        "lookback_s": lookback_s,
+        "interval_s": interval_s,
+    }
+
+    if asset_id is not None:
+        conditions.append("asset_id = %(asset_id)s")
+        params["asset_id"] = asset_id
+
+    where = " AND ".join(conditions)
+    query = f"""
+        WITH consecutive AS (
+            SELECT symbol, timestamp,
+                   LEAD(timestamp) OVER (PARTITION BY symbol ORDER BY timestamp) AS next_ts
+            FROM candles
+            WHERE {where}
+        )
+        SELECT symbol, timestamp AS gap_after, next_ts AS gap_before,
+               EXTRACT(EPOCH FROM next_ts - timestamp) / %(interval_s)s - 1 AS missing_count
+        FROM consecutive
+        WHERE next_ts IS NOT NULL
+          AND EXTRACT(EPOCH FROM next_ts - timestamp) > %(interval_s)s * 1.5
+        ORDER BY symbol, timestamp
+    """
+
+    with pool.connection() as conn:
+        rows = conn.execute(query, params).fetchall()
+
+    for row in rows:
+        for key in ("gap_after", "gap_before"):
+            if row.get(key) and hasattr(row[key], "isoformat"):
+                row[key] = row[key].isoformat()
+
+    return {"exchange": exchange, "timeframe": timeframe, "gaps": rows, "total": len(rows)}
