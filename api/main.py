@@ -31,7 +31,7 @@ async def lifespan(app: FastAPI):
     pool.close()
 
 
-app = FastAPI(title="candle-collector", version="0.3.0", lifespan=lifespan)
+app = FastAPI(title="candle-collector", version="0.4.0", lifespan=lifespan)
 
 
 @app.get("/health")
@@ -97,4 +97,108 @@ def get_symbols(exchange: str | None = None):
     query += " ORDER BY asset_id, exchange"
     with pool.connection() as conn:
         rows = conn.execute(query, params).fetchall()
+    return rows
+
+
+# ---------------------------------------------------------------------------
+# Funding rate endpoints
+# ---------------------------------------------------------------------------
+
+
+@app.get("/funding")
+def get_funding(
+    exchange: str,
+    asset_id: str,
+    start: datetime | None = None,
+    end: datetime | None = None,
+    limit: int = Query(default=1000, le=5000),
+):
+    conditions = ["exchange = %(exchange)s", "asset_id = %(asset_id)s"]
+    params: dict = {"exchange": exchange, "asset_id": asset_id, "limit": limit}
+
+    if start is not None:
+        conditions.append("timestamp >= %(start)s")
+        params["start"] = start
+    if end is not None:
+        conditions.append("timestamp <= %(end)s")
+        params["end"] = end
+
+    where = " AND ".join(conditions)
+    query = f"SELECT * FROM funding_rates WHERE {where} ORDER BY timestamp DESC LIMIT %(limit)s"
+
+    with pool.connection() as conn:
+        rows = conn.execute(query, params).fetchall()
+
+    for row in rows:
+        if row.get("timestamp"):
+            row["timestamp"] = row["timestamp"].isoformat()
+    return rows
+
+
+@app.get("/funding/latest")
+def get_funding_latest(asset_id: str):
+    query = """
+        SELECT DISTINCT ON (exchange) exchange, asset_id, symbol, timestamp, rate, predicted_rate, interval_hours
+        FROM funding_rates
+        WHERE asset_id = %(asset_id)s
+        ORDER BY exchange, timestamp DESC
+    """
+    with pool.connection() as conn:
+        rows = conn.execute(query, {"asset_id": asset_id}).fetchall()
+
+    for row in rows:
+        if row.get("timestamp"):
+            row["timestamp"] = row["timestamp"].isoformat()
+    return rows
+
+
+# ---------------------------------------------------------------------------
+# Open interest endpoints
+# ---------------------------------------------------------------------------
+
+
+@app.get("/oi")
+def get_oi(
+    exchange: str,
+    asset_id: str,
+    start: datetime | None = None,
+    end: datetime | None = None,
+    limit: int = Query(default=1000, le=5000),
+):
+    conditions = ["exchange = %(exchange)s", "asset_id = %(asset_id)s"]
+    params: dict = {"exchange": exchange, "asset_id": asset_id, "limit": limit}
+
+    if start is not None:
+        conditions.append("timestamp >= %(start)s")
+        params["start"] = start
+    if end is not None:
+        conditions.append("timestamp <= %(end)s")
+        params["end"] = end
+
+    where = " AND ".join(conditions)
+    query = f"SELECT * FROM open_interest WHERE {where} ORDER BY timestamp DESC LIMIT %(limit)s"
+
+    with pool.connection() as conn:
+        rows = conn.execute(query, params).fetchall()
+
+    for row in rows:
+        if row.get("timestamp"):
+            row["timestamp"] = row["timestamp"].isoformat()
+    return rows
+
+
+@app.get("/oi/latest")
+def get_oi_latest(asset_id: str):
+    query = """
+        SELECT DISTINCT ON (exchange) exchange, asset_id, symbol, timestamp, open_interest, oi_value_usd
+        FROM open_interest
+        WHERE asset_id = %(asset_id)s
+        ORDER BY exchange, timestamp DESC
+    """
+    with pool.connection() as conn:
+        rows = conn.execute(query, {"asset_id": asset_id}).fetchall()
+
+    for row in rows:
+        if row.get("timestamp"):
+            row["timestamp"] = row["timestamp"].isoformat()
     return rows

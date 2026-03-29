@@ -8,6 +8,8 @@ import psycopg
 from backoff import RETRIABLE_EXCEPTIONS
 from config import ExchangeConfig, TimeframeConfig, load_config
 from dotenv import load_dotenv
+from funding import funding_loop
+from oi import oi_loop
 from status import query_active_pairs, upsert_status_error, upsert_status_success
 
 log = logging.getLogger(__name__)
@@ -259,6 +261,30 @@ def run():
             target=collect_loop,
             args=(exchange, config, tf, dsn, api_lock),
             name=f"{config.name}-{tf.name}",
+            daemon=True,
+        )
+        t.start()
+        threads.append(t)
+        log.info("Started thread %s", t.name)
+
+    # Funding rate thread
+    if config.has_funding:
+        t = threading.Thread(
+            target=funding_loop,
+            args=(exchange, config, dsn, api_lock),
+            name=f"{config.name}-funding",
+            daemon=True,
+        )
+        t.start()
+        threads.append(t)
+        log.info("Started thread %s", t.name)
+
+    # Open interest thread
+    if config.has_oi:
+        t = threading.Thread(
+            target=oi_loop,
+            args=(exchange, config, dsn, api_lock),
+            name=f"{config.name}-oi",
             daemon=True,
         )
         t.start()

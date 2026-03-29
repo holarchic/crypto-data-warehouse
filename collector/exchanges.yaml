@@ -1,4 +1,4 @@
-# Exchange definitions for candle-collector v0.3
+# Exchange definitions for candle-collector v0.4
 # Per-exchange: ccxt_class, btc_symbol, market_type, rate_limit_ms, enabled, supported_timeframes
 # Per-timeframe: interval_s (poll interval), buffer_s (wait after candle close before fetch)
 
@@ -27,6 +27,8 @@ exchanges:
     market_type: perp
     rate_limit_ms: 200
     enabled: true
+    has_funding: true
+    has_oi: true
     supported_timeframes:
       - 5m
       - 15m
@@ -45,6 +47,8 @@ exchanges:
     market_type: perp
     rate_limit_ms: 100
     enabled: true
+    has_funding: true
+    has_oi: true
     supported_timeframes:
       - 5m
       - 15m
@@ -63,6 +67,8 @@ exchanges:
     market_type: perp
     rate_limit_ms: 100
     enabled: true
+    has_funding: true
+    has_oi: true
     supported_timeframes:
       - 5m
       - 15m
@@ -80,6 +86,8 @@ exchanges:
     market_type: perp
     rate_limit_ms: 100
     enabled: true
+    has_funding: true
+    has_oi: true
     options:
       defaultType: swap
     supported_timeframes:
@@ -100,6 +108,8 @@ exchanges:
     market_type: spot
     rate_limit_ms: 200
     enabled: true
+    has_funding: false
+    has_oi: false
     supported_timeframes:
       - 5m
       - 15m
@@ -115,6 +125,8 @@ exchanges:
     market_type: perp
     rate_limit_ms: 200
     enabled: true
+    has_funding: true
+    has_oi: false
     supported_timeframes:
       - 5m
       - 15m

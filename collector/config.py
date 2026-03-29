@@ -24,6 +24,8 @@ class ExchangeConfig:
     market_type: str
     rate_limit_ms: int
     enabled: bool
+    has_funding: bool = False
+    has_oi: bool = False
     options: dict = field(default_factory=dict)
     timeframes: list[TimeframeConfig] = field(default_factory=list)
 
@@ -48,6 +50,8 @@ def _parse_exchange(exchange_name: str, ex: dict, tf_defs: dict) -> ExchangeConf
         market_type=ex["market_type"],
         rate_limit_ms=ex.get("rate_limit_ms", 200),
         enabled=True,
+        has_funding=ex.get("has_funding", False),
+        has_oi=ex.get("has_oi", False),
         options=ex.get("options", {}),
         timeframes=timeframes,
     )
