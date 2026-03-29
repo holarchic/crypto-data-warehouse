@@ -25,6 +25,15 @@ SELECT create_hypertable('candles', 'timestamp',
 CREATE INDEX IF NOT EXISTS idx_candles_asset_timeframe_ts
     ON candles (asset_id, timeframe, timestamp DESC);
 
+-- Compression: segmentby = PK minus timestamp
+ALTER TABLE candles SET (
+    timescaledb.compress,
+    timescaledb.compress_segmentby = 'exchange, market_type, symbol, timeframe',
+    timescaledb.compress_orderby = 'timestamp DESC'
+);
+SELECT add_compression_policy('candles', INTERVAL '7 days', if_not_exists => TRUE);
+SELECT add_retention_policy('candles', INTERVAL '2 years', if_not_exists => TRUE);
+
 CREATE TABLE IF NOT EXISTS funding_rates (
     exchange        TEXT NOT NULL,
     asset_id        TEXT NOT NULL,
@@ -43,6 +52,14 @@ SELECT create_hypertable('funding_rates', 'timestamp',
 CREATE INDEX IF NOT EXISTS idx_funding_rates_asset_ts
     ON funding_rates (asset_id, timestamp DESC);
 
+ALTER TABLE funding_rates SET (
+    timescaledb.compress,
+    timescaledb.compress_segmentby = 'exchange, symbol',
+    timescaledb.compress_orderby = 'timestamp DESC'
+);
+SELECT add_compression_policy('funding_rates', INTERVAL '7 days', if_not_exists => TRUE);
+SELECT add_retention_policy('funding_rates', INTERVAL '1 year', if_not_exists => TRUE);
+
 CREATE TABLE IF NOT EXISTS open_interest (
     exchange        TEXT NOT NULL,
     asset_id        TEXT NOT NULL,
@@ -59,6 +76,14 @@ SELECT create_hypertable('open_interest', 'timestamp',
 
 CREATE INDEX IF NOT EXISTS idx_open_interest_asset_ts
     ON open_interest (asset_id, timestamp DESC);
+
+ALTER TABLE open_interest SET (
+    timescaledb.compress,
+    timescaledb.compress_segmentby = 'exchange, symbol',
+    timescaledb.compress_orderby = 'timestamp DESC'
+);
+SELECT add_compression_policy('open_interest', INTERVAL '7 days', if_not_exists => TRUE);
+SELECT add_retention_policy('open_interest', INTERVAL '1 year', if_not_exists => TRUE);
 
 CREATE TABLE IF NOT EXISTS collection_status (
     exchange            TEXT NOT NULL,
