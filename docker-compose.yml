@@ -54,12 +54,6 @@ services:
       <<: *collector-env
       EXCHANGE: okx
 
-  collector-kraken:
-    <<: *collector-common
-    environment:
-      <<: *collector-env
-      EXCHANGE: kraken
-
   collector-coinbase:
     <<: *collector-common
     environment:
@@ -71,6 +65,12 @@ services:
     environment:
       <<: *collector-env
       EXCHANGE: dydx
+
+  discovery:
+    <<: *collector-common
+    profiles: ["discovery"]
+    command: ["python", "-m", "discovery"]
+    restart: "no"
 
   api:
     build: ./api

@@ -5,10 +5,10 @@ import time
 
 import ccxt
 import psycopg
-from backoff import RETRIABLE_EXCEPTIONS, backoff_sleep
+from backoff import RETRIABLE_EXCEPTIONS
 from config import ExchangeConfig, TimeframeConfig, load_config
 from dotenv import load_dotenv
-from status import upsert_status_error, upsert_status_success
+from status import query_active_pairs, upsert_status_error, upsert_status_success
 
 log = logging.getLogger(__name__)
 
@@ -51,16 +51,6 @@ def create_exchange(config: ExchangeConfig):
     return exchange
 
 
-def resolve_market_info(exchange, config: ExchangeConfig):
-    """Extract asset_id, native_symbol, market_type from the exchange's BTC market."""
-    market = exchange.market(config.btc_symbol)
-    asset_id = market["base"]
-    native_symbol = market["id"]
-    mtype = config.market_type
-    log.info("Resolved %s — asset_id=%s native_symbol=%s market_type=%s", config.name, asset_id, native_symbol, mtype)
-    return {"asset_id": asset_id, "native_symbol": native_symbol, "market_type": mtype}
-
-
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -75,8 +65,9 @@ def build_dsn():
     return f"postgresql://{user}:{password}@{host}:{port}/{db}"
 
 
-def fetch_candles(exchange, symbol, market_info, exchange_name, timeframe, interval_s, api_lock, limit=10):
+def fetch_candles(exchange, symbol, market_info, exchange_name, timeframe, interval_s, api_lock, rate_limit_s, limit=10):
     with api_lock:
+        time.sleep(rate_limit_s)
         raw = exchange.fetch_ohlcv(symbol, timeframe, limit=limit)
     now_ms = int(time.time() * 1000)
     candles = []
@@ -151,50 +142,93 @@ def connect_db(dsn, max_retries=10, retry_delay=5):
 # ---------------------------------------------------------------------------
 
 
-def collect_loop(exchange, config: ExchangeConfig, market_info: dict, tf: TimeframeConfig, dsn: str, api_lock: threading.Lock):
-    """Seed + poll loop for a single timeframe. Own DB connection. Never exits."""
+def _btc_fallback_pairs(config: ExchangeConfig, exchange) -> list[dict]:
+    """Build a single-pair list from config btc_symbol for backward compat (no discovery data)."""
+    market = exchange.markets.get(config.btc_symbol, {})
+    return [{
+        "symbol": config.btc_symbol,
+        "asset_id": market.get("base", "BTC"),
+        "native_symbol": market.get("id", ""),
+        "market_type": config.market_type,
+        "last_timestamp": None,
+    }]
+
+
+def _collect_pair(exchange, pair, config, tf, api_lock, conn, thread_name):
+    """Fetch and insert candles for a single pair. Returns True on success."""
+    market_info = {
+        "asset_id": pair["asset_id"] or "BTC",
+        "native_symbol": pair["native_symbol"] or "",
+        "market_type": pair["market_type"] or config.market_type,
+    }
+    # Seed (100) on first encounter, poll (10) thereafter
+    limit = 100 if pair["last_timestamp"] is None else 10
+    rate_limit_s = config.rate_limit_ms / 1000
+    candles = fetch_candles(
+        exchange, pair["symbol"], market_info, config.name, tf.name, tf.interval_s, api_lock, rate_limit_s, limit=limit,
+    )
+    inserted = insert_candles(conn, candles)
+    last_ts = max((c["timestamp"] for c in candles), default=None) if candles else None
+    upsert_status_success(conn, config.name, market_info["market_type"], pair["symbol"], tf.name, last_ts)
+
+    label = "Seed" if limit == 100 else "Poll"
+    log.info("[%s] %s %s: fetched=%d inserted=%d", thread_name, label, pair["asset_id"], len(candles), inserted)
+    return True
+
+
+def collect_loop(exchange, config: ExchangeConfig, tf: TimeframeConfig, dsn: str, api_lock: threading.Lock):
+    """Multi-pair poll loop for a single timeframe. Own DB connection. Never exits."""
     thread_name = f"{config.name}/{tf.name}"
     conn = connect_db(dsn)
 
-    # Seed: fetch last 100 closed candles
-    log.info("[%s] Seeding candles...", thread_name)
-    try:
-        candles = fetch_candles(exchange, config.btc_symbol, market_info, config.name, tf.name, tf.interval_s, api_lock, limit=100)
-        inserted = insert_candles(conn, candles)
-        log.info("[%s] Seeded %d candles (%d fetched, %d already existed)", thread_name, inserted, len(candles), len(candles) - inserted)
-    except Exception:
-        log.exception("[%s] Seed failed, will retry in poll loop", thread_name)
-
     # Poll loop — never exits
-    error_count = 0
+    first_cycle = True
     while True:
-        try:
+        if not first_cycle:
             sleep_until_next_boundary(tf.interval_s, tf.buffer_s)
-            candles = fetch_candles(exchange, config.btc_symbol, market_info, config.name, tf.name, tf.interval_s, api_lock, limit=10)
-            inserted = insert_candles(conn, candles)
-            log.info("[%s] Poll: fetched=%d inserted=%d", thread_name, len(candles), inserted)
-            error_count = 0
-            last_ts = max((c["timestamp"] for c in candles), default=None) if candles else None
-            upsert_status_success(conn, config.name, market_info["market_type"], config.btc_symbol, tf.name, last_ts)
-        except RETRIABLE_EXCEPTIONS as exc:
-            error_count += 1
-            log.exception("[%s] Retriable error (error_count=%d)", thread_name, error_count)
-            if conn.closed:
-                try:
-                    conn = connect_db(dsn)
-                except RuntimeError:
-                    log.error("[%s] DB reconnect failed, will retry next cycle", thread_name)
-            if not conn.closed:
-                conn.rollback()
-                upsert_status_error(conn, config.name, market_info["market_type"], config.btc_symbol, tf.name, str(exc))
-            backoff_sleep(error_count)
-        except Exception as exc:
-            error_count += 1
-            log.exception("[%s] Unexpected error (error_count=%d)", thread_name, error_count)
-            if not conn.closed:
-                conn.rollback()
-                upsert_status_error(conn, config.name, market_info["market_type"], config.btc_symbol, tf.name, str(exc))
-            backoff_sleep(error_count)
+        first_cycle = False
+
+        # Reconnect if needed
+        if conn.closed:
+            try:
+                conn = connect_db(dsn)
+            except RuntimeError:
+                log.error("[%s] DB reconnect failed, will retry next cycle", thread_name)
+                time.sleep(30)
+                continue
+
+        # Get active pairs from discovery, fall back to BTC from config
+        try:
+            pairs = query_active_pairs(conn, config.name, tf.name)
+        except Exception:
+            log.exception("[%s] Failed to query active pairs", thread_name)
+            conn.rollback()
+            pairs = []
+        if not pairs:
+            pairs = _btc_fallback_pairs(config, exchange)
+
+        log.info("[%s] Cycle: %d active pairs", thread_name, len(pairs))
+
+        # Iterate over each pair — errors are isolated per-pair
+        for pair in pairs:
+            try:
+                _collect_pair(exchange, pair, config, tf, api_lock, conn, thread_name)
+            except RETRIABLE_EXCEPTIONS as exc:
+                log.warning("[%s] Retriable error on %s: %s", thread_name, pair["symbol"], exc)
+                if conn.closed:
+                    try:
+                        conn = connect_db(dsn)
+                    except RuntimeError:
+                        log.error("[%s] DB reconnect failed mid-cycle", thread_name)
+                        break
+                if not conn.closed:
+                    conn.rollback()
+                    upsert_status_error(conn, config.name, pair.get("market_type", config.market_type), pair["symbol"], tf.name, str(exc))
+            except Exception as exc:
+                log.warning("[%s] Error on %s: %s", thread_name, pair["symbol"], exc)
+                if not conn.closed:
+                    conn.rollback()
+                    upsert_status_error(conn, config.name, pair.get("market_type", config.market_type), pair["symbol"], tf.name, str(exc))
 
 
 # ---------------------------------------------------------------------------
@@ -210,13 +244,12 @@ def run():
     if not config.timeframes:
         raise RuntimeError(f"No timeframes configured for {config.name}")
 
-    log.info("Starting collector for exchange=%s symbol=%s timeframes=%s", config.name, config.btc_symbol, [tf.name for tf in config.timeframes])
+    log.info("Starting collector for exchange=%s timeframes=%s", config.name, [tf.name for tf in config.timeframes])
 
     exchange = create_exchange(config)
-    market_info = resolve_market_info(exchange, config)
     dsn = build_dsn()
 
-    # Shared lock — serializes API calls when timeframe boundaries align
+    # Shared lock — serializes API calls to respect exchange rate limits
     api_lock = threading.Lock()
 
     # One daemon thread per timeframe
@@ -224,7 +257,7 @@ def run():
     for tf in config.timeframes:
         t = threading.Thread(
             target=collect_loop,
-            args=(exchange, config, market_info, tf, dsn, api_lock),
+            args=(exchange, config, tf, dsn, api_lock),
             name=f"{config.name}-{tf.name}",
             daemon=True,
         )

@@ -6,6 +6,8 @@ from pathlib import Path
 
 import yaml
 
+YAML_PATH = Path(__file__).parent / "exchanges.yaml"
+
 
 @dataclass
 class TimeframeConfig:
@@ -26,24 +28,12 @@ class ExchangeConfig:
     timeframes: list[TimeframeConfig] = field(default_factory=list)
 
 
-def load_config(exchange_name: str | None = None) -> ExchangeConfig:
-    """Load config for the given exchange (default: EXCHANGE env var or 'hyperliquid')."""
-    exchange_name = exchange_name or os.environ.get("EXCHANGE", "hyperliquid")
+def _load_yaml():
+    with open(YAML_PATH) as f:
+        return yaml.safe_load(f)
 
-    yaml_path = Path(__file__).parent / "exchanges.yaml"
-    with open(yaml_path) as f:
-        raw = yaml.safe_load(f)
 
-    tf_defs = raw["timeframes"]
-    exchanges = raw["exchanges"]
-
-    if exchange_name not in exchanges:
-        raise ValueError(f"Unknown exchange '{exchange_name}'. Available: {list(exchanges.keys())}")
-
-    ex = exchanges[exchange_name]
-    if not ex.get("enabled", True):
-        raise ValueError(f"Exchange '{exchange_name}' is disabled in config")
-
+def _parse_exchange(exchange_name: str, ex: dict, tf_defs: dict) -> ExchangeConfig:
     timeframes = []
     for tf_name in ex.get("supported_timeframes", []):
         if tf_name not in tf_defs:
@@ -61,3 +51,37 @@ def load_config(exchange_name: str | None = None) -> ExchangeConfig:
         options=ex.get("options", {}),
         timeframes=timeframes,
     )
+
+
+def load_config(exchange_name: str | None = None) -> ExchangeConfig:
+    """Load config for the given exchange (default: EXCHANGE env var or 'hyperliquid')."""
+    exchange_name = exchange_name or os.environ.get("EXCHANGE", "hyperliquid")
+    raw = _load_yaml()
+    tf_defs = raw["timeframes"]
+    exchanges = raw["exchanges"]
+
+    if exchange_name not in exchanges:
+        raise ValueError(f"Unknown exchange '{exchange_name}'. Available: {list(exchanges.keys())}")
+
+    ex = exchanges[exchange_name]
+    if not ex.get("enabled", True):
+        raise ValueError(f"Exchange '{exchange_name}' is disabled in config")
+
+    return _parse_exchange(exchange_name, ex, tf_defs)
+
+
+def load_all_configs() -> list[ExchangeConfig]:
+    """Load configs for all enabled exchanges."""
+    raw = _load_yaml()
+    tf_defs = raw["timeframes"]
+    configs = []
+    for name, ex in raw["exchanges"].items():
+        if ex.get("enabled", True):
+            configs.append(_parse_exchange(name, ex, tf_defs))
+    return configs
+
+
+def load_discovery_config() -> dict:
+    """Load discovery section from exchanges.yaml."""
+    raw = _load_yaml()
+    return raw.get("discovery", {"volume_threshold_usd": 1_000_000, "symbol_overrides": {}})

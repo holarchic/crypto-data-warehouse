@@ -31,7 +31,7 @@ async def lifespan(app: FastAPI):
     pool.close()
 
 
-app = FastAPI(title="candle-collector", version="0.2.0", lifespan=lifespan)
+app = FastAPI(title="candle-collector", version="0.3.0", lifespan=lifespan)
 
 
 @app.get("/health")
@@ -85,3 +85,16 @@ def get_timeframes():
     with pool.connection() as conn:
         rows = conn.execute("SELECT DISTINCT timeframe FROM collection_status WHERE active = TRUE ORDER BY timeframe").fetchall()
     return [row["timeframe"] for row in rows]
+
+
+@app.get("/candles/symbols")
+def get_symbols(exchange: str | None = None):
+    query = "SELECT DISTINCT asset_id, symbol, exchange FROM collection_status WHERE active = TRUE"
+    params: dict = {}
+    if exchange is not None:
+        query += " AND exchange = %(exchange)s"
+        params["exchange"] = exchange
+    query += " ORDER BY asset_id, exchange"
+    with pool.connection() as conn:
+        rows = conn.execute(query, params).fetchall()
+    return rows
