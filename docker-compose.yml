@@ -66,6 +66,15 @@ services:
       <<: *collector-env
       EXCHANGE: dydx
 
+  monitor:
+    <<: *collector-common
+    command: ["python", "-m", "monitor"]
+    environment:
+      <<: *collector-env
+      WEBHOOK_URL: ${WEBHOOK_URL:-}
+      MONITOR_INTERVAL_S: ${MONITOR_INTERVAL_S:-300}
+      ALERT_COOLDOWN_S: ${ALERT_COOLDOWN_S:-3600}
+
   discovery:
     <<: *collector-common
     profiles: ["discovery"]
