@@ -89,3 +89,9 @@ def load_discovery_config() -> dict:
     """Load discovery section from exchanges.yaml."""
     raw = _load_yaml()
     return raw.get("discovery", {"volume_threshold_usd": 1_000_000, "symbol_overrides": {}})
+
+
+def load_timeframe_intervals() -> dict[str, int]:
+    """Return {timeframe: interval_s} for all configured timeframes."""
+    raw = _load_yaml()
+    return {name: td["interval_s"] for name, td in raw["timeframes"].items()}
