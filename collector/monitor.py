@@ -179,7 +179,7 @@ def monitor_loop(dsn, timeframe_intervals, webhook_url, poll_s=300, cooldown_s=3
 
     while True:
         try:
-            conn = psycopg.connect(dsn)
+            conn = psycopg.connect(dsn, options="-c statement_timeout=30000")
         except Exception as exc:
             log.error("Monitor DB connect failed: %s", exc)
             time.sleep(poll_s)

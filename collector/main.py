@@ -130,7 +130,7 @@ def sleep_until_next_boundary(interval_s, buffer_s):
 def connect_db(dsn, max_retries=10, retry_delay=5):
     for attempt in range(1, max_retries + 1):
         try:
-            conn = psycopg.connect(dsn)
+            conn = psycopg.connect(dsn, options="-c statement_timeout=60000")
             log.info("Connected to PostgreSQL")
             return conn
         except psycopg.OperationalError:

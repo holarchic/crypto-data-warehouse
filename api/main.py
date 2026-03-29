@@ -25,7 +25,10 @@ pool: ConnectionPool | None = None
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global pool
-    pool = ConnectionPool(build_dsn(), min_size=2, max_size=10, kwargs={"row_factory": dict_row})
+    pool = ConnectionPool(
+        build_dsn(), min_size=2, max_size=10,
+        kwargs={"row_factory": dict_row, "options": "-c statement_timeout=30000"},
+    )
     pool.wait()
     yield
     pool.close()
