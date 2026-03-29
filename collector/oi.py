@@ -56,6 +56,18 @@ def _sleep_until_next_5m():
 # ---------------------------------------------------------------------------
 
 
+def _fetch_price_map(exchange, api_lock, rate_limit_s):
+    """Bulk fetch_tickers() → {symbol: last_price}. One API call."""
+    try:
+        with api_lock:
+            time.sleep(rate_limit_s)
+            tickers = exchange.fetch_tickers()
+        return {sym: t.get("last") or t.get("close") for sym, t in tickers.items() if t.get("last") or t.get("close")}
+    except Exception as exc:
+        log.warning("[oi] fetch_tickers failed (oi_value_usd will be None): %s", exc)
+        return {}
+
+
 def _oi_loop_ccxt(exchange, config: ExchangeConfig, dsn: str, api_lock: threading.Lock):
     """Per-symbol fetch_open_interest() for ccxt exchanges."""
     thread_name = f"{config.name}/oi"
@@ -86,6 +98,9 @@ def _oi_loop_ccxt(exchange, config: ExchangeConfig, dsn: str, api_lock: threadin
             _sleep_until_next_5m()
             continue
 
+        # Bulk price map for computing oi_value_usd when ccxt doesn't return it
+        price_map = _fetch_price_map(exchange, api_lock, rate_limit_s)
+
         rows = []
         for pair in pairs:
             try:
@@ -102,13 +117,22 @@ def _oi_loop_ccxt(exchange, config: ExchangeConfig, dsn: str, api_lock: threadin
                 else:
                     ts = time.time()
 
+                oi_amount = oi_data.get("openInterestAmount")
+                oi_value = oi_data.get("openInterestValue")
+
+                # Compute oi_value_usd from price map if ccxt didn't return it
+                if oi_value is None and oi_amount is not None:
+                    price = price_map.get(pair["symbol"])
+                    if price is not None:
+                        oi_value = oi_amount * price
+
                 rows.append({
                     "exchange": config.name,
                     "asset_id": pair["asset_id"],
                     "symbol": pair["symbol"],
                     "timestamp": ts,
-                    "open_interest": oi_data.get("openInterestAmount"),
-                    "oi_value_usd": oi_data.get("openInterestValue"),
+                    "open_interest": oi_amount,
+                    "oi_value_usd": oi_value,
                 })
             except RETRIABLE_EXCEPTIONS as exc:
                 log.warning("[%s] Retriable error on %s: %s", thread_name, pair["symbol"], exc)
