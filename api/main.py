@@ -34,7 +34,7 @@ async def lifespan(app: FastAPI):
     pool.close()
 
 
-app = FastAPI(title="candle-collector", version="0.5.0", lifespan=lifespan)
+app = FastAPI(title="candle-collector", version="0.6.0", lifespan=lifespan)
 
 
 @app.get("/health")
@@ -237,9 +237,25 @@ def get_status(exchange: str | None = None, timeframe: str | None = None):
         ORDER BY exchange, timeframe, symbol
     """
 
+    compression_sql = """
+        SELECT hypertable_name,
+               total_chunks,
+               compressed_chunks
+        FROM hypertable_compression_stats(ht.hypertable_name)
+        RIGHT JOIN (
+            SELECT hypertable_name FROM timescaledb_information.hypertables
+            WHERE hypertable_schema = 'public'
+        ) ht USING (hypertable_name)
+        ORDER BY hypertable_name
+    """
+
     with pool.connection() as conn:
         rows = conn.execute(query, params).fetchall()
         db_size = conn.execute("SELECT pg_database_size(current_database()) AS size_bytes").fetchone()
+        try:
+            compression_rows = conn.execute(compression_sql).fetchall()
+        except Exception:
+            compression_rows = []
 
     # Compute is_stale flag
     for row in rows:
@@ -249,11 +265,20 @@ def get_status(exchange: str | None = None, timeframe: str | None = None):
         if row.get("last_success") and hasattr(row["last_success"], "isoformat"):
             row["last_success"] = row["last_success"].isoformat()
 
+    compression = {
+        r["hypertable_name"]: {
+            "total_chunks": r.get("total_chunks", 0),
+            "compressed_chunks": r.get("compressed_chunks", 0),
+        }
+        for r in compression_rows
+    }
+
     return {
         "collectors": rows,
         "total": len(rows),
         "stale": sum(1 for r in rows if r["is_stale"]),
         "db_size_bytes": db_size["size_bytes"] if db_size else None,
+        "compression": compression,
     }
 
 
