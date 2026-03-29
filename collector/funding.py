@@ -29,19 +29,33 @@ def _get_active_pairs(conn, exchange_name):
     return query_active_pairs(conn, exchange_name, "5m")
 
 
-def _parse_funding_record(record, exchange_name, pair):
-    """Parse a ccxt funding rate record into an insert dict."""
-    ts = record.get("fundingTimestamp") or record.get("timestamp")
-    if ts is None:
-        return None
+def _parse_funding_record(record, exchange_name, pair, from_bulk=False):
+    """Parse a ccxt funding rate record into an insert dict.
+
+    Bulk endpoint: fundingTimestamp = NEXT settlement (future).
+      → last settlement = fundingTimestamp - interval_hours * 3600s
+    History endpoint: timestamp = actual settlement time, fundingTimestamp = None.
+    """
+    interval_hours = FUNDING_INTERVAL_HOURS.get(exchange_name, DEFAULT_FUNDING_INTERVAL)
+
+    if from_bulk:
+        fts = record.get("fundingTimestamp")
+        if fts is None:
+            return None
+        ts_ms = fts - interval_hours * 3600 * 1000
+    else:
+        ts_ms = record.get("timestamp")
+        if ts_ms is None:
+            return None
+
     return {
         "exchange": exchange_name,
         "asset_id": pair["asset_id"],
         "symbol": pair["symbol"],
-        "timestamp": ts / 1000,
+        "timestamp": ts_ms / 1000,
         "rate": record.get("fundingRate"),
         "predicted_rate": record.get("nextFundingRate"),
-        "interval_hours": FUNDING_INTERVAL_HOURS.get(exchange_name, DEFAULT_FUNDING_INTERVAL),
+        "interval_hours": interval_hours,
     }
 
 
@@ -117,7 +131,7 @@ def _poll_bulk(exchange, config, conn, pairs, api_lock):
         if symbol not in active_symbols:
             continue
         pair = active_symbols[symbol]
-        row = _parse_funding_record(record, config.name, pair)
+        row = _parse_funding_record(record, config.name, pair, from_bulk=True)
         if row:
             rows.append(row)
 
