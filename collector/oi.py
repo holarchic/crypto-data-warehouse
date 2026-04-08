@@ -8,8 +8,9 @@ import urllib.request
 
 from backoff import RETRIABLE_EXCEPTIONS
 from config import ExchangeConfig
-from main import connect_db
 from status import query_active_pairs
+
+from db import connect_db
 
 log = logging.getLogger(__name__)
 
