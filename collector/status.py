@@ -5,10 +5,11 @@ import logging
 log = logging.getLogger(__name__)
 
 UPSERT_SUCCESS_SQL = """
-    INSERT INTO collection_status (exchange, market_type, symbol, timeframe, active, last_timestamp, last_success, error_count)
-    VALUES (%(exchange)s, %(market_type)s, %(symbol)s, %(timeframe)s, TRUE, to_timestamp(%(last_timestamp)s), NOW(), 0)
+    INSERT INTO collection_status (exchange, market_type, symbol, timeframe, active, asset_id, last_timestamp, last_success, error_count)
+    VALUES (%(exchange)s, %(market_type)s, %(symbol)s, %(timeframe)s, TRUE, %(asset_id)s, to_timestamp(%(last_timestamp)s), NOW(), 0)
     ON CONFLICT (exchange, market_type, symbol, timeframe) DO UPDATE SET
         active = TRUE,
+        asset_id = COALESCE(%(asset_id)s, collection_status.asset_id),
         last_timestamp = GREATEST(collection_status.last_timestamp, to_timestamp(%(last_timestamp)s)),
         last_success = NOW(),
         error_count = 0,
@@ -49,7 +50,7 @@ QUERY_ACTIVE_PAIRS_SQL = """
 """
 
 
-def upsert_status_success(conn, exchange: str, market_type: str, symbol: str, timeframe: str, last_timestamp):
+def upsert_status_success(conn, exchange: str, market_type: str, symbol: str, timeframe: str, last_timestamp, asset_id: str | None = None):
     """Record a successful fetch cycle."""
     params = {
         "exchange": exchange,
@@ -57,6 +58,7 @@ def upsert_status_success(conn, exchange: str, market_type: str, symbol: str, ti
         "symbol": symbol,
         "timeframe": timeframe,
         "last_timestamp": last_timestamp,
+        "asset_id": asset_id,
     }
     with conn.cursor() as cur:
         cur.execute(UPSERT_SUCCESS_SQL, params)
