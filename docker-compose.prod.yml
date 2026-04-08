@@ -1,0 +1,72 @@
+# Production overrides — use with:
+#   docker compose -f docker-compose.yml -f docker-compose.prod.yml up -d
+#
+# Changes from dev:
+#   - DB port 5432 NOT exposed to host
+#   - Memory limits on all containers
+#   - API port explicit (no env var override)
+
+services:
+  db:
+    ports: !reset []
+    deploy:
+      resources:
+        limits:
+          memory: 2g
+
+  collector-hyperliquid:
+    deploy:
+      resources:
+        limits:
+          memory: 512m
+
+  collector-binance:
+    deploy:
+      resources:
+        limits:
+          memory: 512m
+
+  collector-bybit:
+    deploy:
+      resources:
+        limits:
+          memory: 512m
+
+  collector-okx:
+    deploy:
+      resources:
+        limits:
+          memory: 512m
+
+  collector-coinbase:
+    deploy:
+      resources:
+        limits:
+          memory: 512m
+
+  collector-dydx:
+    deploy:
+      resources:
+        limits:
+          memory: 512m
+
+  monitor:
+    deploy:
+      resources:
+        limits:
+          memory: 256m
+
+  discovery:
+    deploy:
+      resources:
+        limits:
+          memory: 512m
+
+  api:
+    ports: !override
+      - "8000:8000"
+    # !override replaces the base ports list (removes env var override)
+    deploy:
+      resources:
+        limits:
+          memory: 512m
