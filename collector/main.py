@@ -111,7 +111,7 @@ def _collect_pair(exchange, pair, config, tf, api_lock, conn, thread_name):
     )
     inserted = insert_candles(conn, candles)
     last_ts = max((c["timestamp"] for c in candles), default=None) if candles else None
-    upsert_status_success(conn, config.name, market_info["market_type"], pair["symbol"], tf.name, last_ts)
+    upsert_status_success(conn, config.name, market_info["market_type"], pair["symbol"], tf.name, last_ts, asset_id=market_info["asset_id"])
 
     label = "Seed" if limit == 100 else "Poll"
     log.info("[%s] %s %s: fetched=%d inserted=%d", thread_name, label, pair["asset_id"], len(candles), inserted)
