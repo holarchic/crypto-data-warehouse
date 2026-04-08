@@ -10,9 +10,10 @@ from collections import defaultdict
 
 from config import load_all_configs, load_discovery_config
 from dotenv import load_dotenv
-from main import build_dsn, connect_db, create_exchange
 from status import deactivate_stale_pairs, upsert_discovery_pair
 from symbols import resolve_asset_id
+
+from db import build_dsn, connect_db, create_exchange
 
 log = logging.getLogger(__name__)
 
