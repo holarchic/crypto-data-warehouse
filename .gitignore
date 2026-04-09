@@ -31,3 +31,4 @@ backups/
 # Data
 *.csv
 *.parquet
+*.db
