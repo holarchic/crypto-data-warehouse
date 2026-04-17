@@ -144,11 +144,20 @@ GAP_SQL = """
 
 
 def send_webhook(url, text):
-    """POST alert to Slack/Discord webhook. Returns True on success."""
+    """POST alert to Slack/Discord webhook. Returns True on success.
+
+    Cloudflare sits in front of Discord webhooks and blocks the default
+    `Python-urllib` User-Agent (returns 403 with cf error 1010). A real
+    UA string bypasses that.
+    """
     if not url:
         return False
     payload = build_webhook_payload(text)
-    req = urllib.request.Request(url, data=payload, headers={"Content-Type": "application/json"})
+    headers = {
+        "Content-Type": "application/json",
+        "User-Agent": "candle-collector-monitor/1.0 (+https://github.com/holarchic/candle-collector)",
+    }
+    req = urllib.request.Request(url, data=payload, headers=headers)
     try:
         with urllib.request.urlopen(req, timeout=10) as resp:
             return 200 <= resp.status < 300
@@ -197,8 +206,11 @@ def ping_healthcheck(url):
     """
     if not url:
         return False
+    req = urllib.request.Request(
+        url, headers={"User-Agent": "candle-collector-monitor/1.0"}
+    )
     try:
-        with urllib.request.urlopen(url, timeout=10) as resp:
+        with urllib.request.urlopen(req, timeout=10) as resp:
             return 200 <= resp.status < 300
     except Exception as exc:
         log.warning("Healthcheck ping failed: %s", exc)
