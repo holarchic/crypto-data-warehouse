@@ -99,7 +99,6 @@ exchanges:
       - 4h
       - 12h
       - 1d
-      - 3d
       - 1w
 
   coinbase:
@@ -116,7 +115,6 @@ exchanges:
       - 30m
       - 1h
       - 2h
-      - 4h
       - 1d
 
   dydx:
