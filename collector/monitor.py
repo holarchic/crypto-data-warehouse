@@ -42,16 +42,23 @@ def compute_staleness(status_rows, timeframe_intervals):
     return stale
 
 
-def format_stale_alert(stale_pairs):
-    """Human-readable stale alert message."""
+def format_stale_alert(stale_pairs, max_rows=15):
+    """Human-readable stale alert — summary header + first `max_rows` rows.
+
+    Discord caps webhook content at 2000 chars; a full 500-row dump 403s.
+    We send a headline count plus a sample; the dashboard/DB is the
+    authoritative source when investigating.
+    """
     if not stale_pairs:
         return ""
     lines = [f"🔴 {len(stale_pairs)} stale collector(s) detected:"]
-    for p in stale_pairs:
+    for p in stale_pairs[:max_rows]:
         since = p.get("seconds_since_success")
         since_str = f"{since:.0f}s ago" if since is not None else "never"
         errors = p.get("error_count", 0)
         lines.append(f"  • {p['exchange']}/{p['symbol']}/{p['timeframe']} — last success: {since_str}, errors: {errors}")
+    if len(stale_pairs) > max_rows:
+        lines.append(f"  … plus {len(stale_pairs) - max_rows} more (see /status for full list)")
     return "\n".join(lines)
 
 
@@ -279,8 +286,10 @@ def monitor_loop(dsn, timeframe_intervals, webhook_url, poll_s=300, cooldown_s=3
                 log.warning("Stale collectors: %d", len(stale))
                 alert_text = format_stale_alert(stale)
                 if should_alert("staleness", cooldowns, cooldown_s):
-                    send_webhook(webhook_url, alert_text)
-                    log.info("Stale alert sent")
+                    if send_webhook(webhook_url, alert_text):
+                        log.info("Stale alert sent")
+                    else:
+                        log.warning("Stale alert delivery failed")
             else:
                 log.info("All collectors healthy")
 
@@ -309,8 +318,10 @@ def monitor_loop(dsn, timeframe_intervals, webhook_url, poll_s=300, cooldown_s=3
                     alert_text = format_gap_alert(exchange, timeframe, gaps)
                     alert_key = f"gaps:{exchange}:{timeframe}"
                     if should_alert(alert_key, cooldowns, cooldown_s):
-                        send_webhook(webhook_url, alert_text)
-                        log.warning("Gap alert: %s/%s — %d gaps", exchange, timeframe, len(gaps))
+                        if send_webhook(webhook_url, alert_text):
+                            log.warning("Gap alert: %s/%s — %d gaps", exchange, timeframe, len(gaps))
+                        else:
+                            log.warning("Gap alert delivery failed: %s/%s", exchange, timeframe)
                 last_gap_scan[timeframe] = now
 
             # --- Daily heartbeat (Discord summary) ---
