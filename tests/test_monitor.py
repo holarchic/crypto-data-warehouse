@@ -26,9 +26,10 @@ def test_compute_staleness_none_stale():
 
 
 def test_compute_staleness_one_stale():
+    # 5m threshold = 300 + max(300, 1800) = 2100s
     rows = [
         {"exchange": "binance", "symbol": "BTC/USDT:USDT", "timeframe": "5m", "seconds_since_success": 100, "error_count": 0},
-        {"exchange": "binance", "symbol": "ETH/USDT:USDT", "timeframe": "5m", "seconds_since_success": 700, "error_count": 3},
+        {"exchange": "binance", "symbol": "ETH/USDT:USDT", "timeframe": "5m", "seconds_since_success": 2500, "error_count": 3},
     ]
     stale = compute_staleness(rows, TF_INTERVALS)
     assert len(stale) == 1
@@ -44,17 +45,19 @@ def test_compute_staleness_null_last_success():
 
 
 def test_compute_staleness_at_threshold():
-    """Exactly 2x = not stale (needs >)."""
+    """Exactly at threshold = not stale (needs >). 5m threshold = 2100s."""
     rows = [
-        {"exchange": "okx", "symbol": "BTC/USDT:USDT", "timeframe": "5m", "seconds_since_success": 600, "error_count": 0},
+        {"exchange": "okx", "symbol": "BTC/USDT:USDT", "timeframe": "5m", "seconds_since_success": 2100, "error_count": 0},
     ]
     assert compute_staleness(rows, TF_INTERVALS) == []
 
 
 def test_compute_staleness_different_timeframes():
-    """5m pair stale, 1d pair fine — only 5m returned."""
+    """5m pair stale, 1d pair fine — only 5m returned.
+    5m threshold = 2100s; 1d threshold = 86400 + max(86400, 1800) = 172800s.
+    """
     rows = [
-        {"exchange": "binance", "symbol": "BTC/USDT:USDT", "timeframe": "5m", "seconds_since_success": 700, "error_count": 0},
+        {"exchange": "binance", "symbol": "BTC/USDT:USDT", "timeframe": "5m", "seconds_since_success": 2500, "error_count": 0},
         {"exchange": "binance", "symbol": "BTC/USDT:USDT", "timeframe": "1d", "seconds_since_success": 50000, "error_count": 0},
     ]
     stale = compute_staleness(rows, TF_INTERVALS)

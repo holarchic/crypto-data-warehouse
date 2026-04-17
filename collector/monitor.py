@@ -21,14 +21,20 @@ log = logging.getLogger(__name__)
 
 def compute_staleness(status_rows, timeframe_intervals):
     """Given collection_status rows + {tf: interval_s}, return rows where
-    seconds_since_success > 2 * interval_s or last_success is NULL."""
+    seconds_since_success > threshold or last_success is NULL.
+
+    Threshold is interval_s + max(interval_s, 1800). The 30-minute floor
+    absorbs the serial-fetch cycle time across hundreds of pairs per TF —
+    without it, short-TF pairs near the end of a fetch cycle trip the 2x
+    interval threshold every cycle, drowning real signal in noise.
+    """
     stale = []
     for row in status_rows:
         tf = row["timeframe"]
         interval_s = timeframe_intervals.get(tf)
         if interval_s is None:
             continue
-        threshold = 2 * interval_s
+        threshold = interval_s + max(interval_s, 1800)
         since = row.get("seconds_since_success")
         if since is None or since > threshold:
             stale.append(row)
