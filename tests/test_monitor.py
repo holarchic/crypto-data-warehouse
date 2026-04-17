@@ -102,6 +102,19 @@ def test_format_stale_alert_empty():
     assert format_stale_alert([]) == ""
 
 
+def test_format_stale_alert_truncates_large_lists():
+    """Discord caps webhook content at 2000 chars — long lists must truncate."""
+    stale = [
+        {"exchange": "binance", "symbol": f"SYM{i}/USDT:USDT", "timeframe": "5m",
+         "seconds_since_success": 2500, "error_count": 1}
+        for i in range(500)
+    ]
+    text = format_stale_alert(stale)
+    assert "500 stale" in text
+    assert "plus 485 more" in text
+    assert len(text) < 2000
+
+
 # --- format_gap_alert ---
 
 
