@@ -8,6 +8,7 @@ import logging
 import os
 import time
 import urllib.request
+from datetime import datetime, timezone
 
 from config import load_timeframe_intervals
 from dotenv import load_dotenv
@@ -79,6 +80,32 @@ def build_webhook_payload(text):
     return json.dumps({"text": text, "content": text}).encode("utf-8")
 
 
+def build_heartbeat_text(stats):
+    """One-line summary for the daily heartbeat.
+
+    stats keys: fresh_1h, stale_3h, total_active, candles_24h, total_errors.
+    """
+    return (
+        "candle-collector alive: "
+        f"{stats['fresh_1h']}/{stats['total_active']} collectors fresh (<1h), "
+        f"{stats['stale_3h']} stale (>3h), "
+        f"{stats['candles_24h']:,} candles/24h, "
+        f"{stats['total_errors']} errors"
+    )
+
+
+def should_send_heartbeat(now_utc, last_sent_date, target_hour):
+    """True if a daily heartbeat should fire right now.
+
+    Fires once per UTC day when `now_utc.hour == target_hour`. Uses the
+    last_sent_date as idempotency key so the same hour-window doesn't
+    trigger multiple sends across consecutive monitor cycles.
+    """
+    if now_utc.hour != target_hour:
+        return False
+    return last_sent_date != now_utc.date()
+
+
 # ---------------------------------------------------------------------------
 # I/O functions
 # ---------------------------------------------------------------------------
@@ -120,6 +147,54 @@ def send_webhook(url, text):
             return 200 <= resp.status < 300
     except Exception as exc:
         log.warning("Webhook POST failed: %s", exc)
+        return False
+
+
+HEARTBEAT_STATS_SQL = """
+    SELECT
+        count(*) FILTER (WHERE last_success > NOW() - INTERVAL '1 hour') AS fresh_1h,
+        count(*) FILTER (WHERE last_success IS NULL OR last_success < NOW() - INTERVAL '3 hours') AS stale_3h,
+        count(*) AS total_active,
+        COALESCE(sum(error_count), 0) AS total_errors
+    FROM collection_status
+    WHERE active = TRUE
+"""
+
+HEARTBEAT_CANDLES_SQL = """
+    SELECT count(*) AS candles_24h
+    FROM candles
+    WHERE timestamp > NOW() - INTERVAL '24 hours'
+"""
+
+
+def fetch_heartbeat_stats(conn):
+    """Query DB for daily heartbeat summary stats."""
+    with conn.cursor() as cur:
+        cur.execute(HEARTBEAT_STATS_SQL)
+        fresh_1h, stale_3h, total_active, total_errors = cur.fetchone()
+        cur.execute(HEARTBEAT_CANDLES_SQL)
+        (candles_24h,) = cur.fetchone()
+    return {
+        "fresh_1h": fresh_1h,
+        "stale_3h": stale_3h,
+        "total_active": total_active,
+        "total_errors": int(total_errors),
+        "candles_24h": candles_24h,
+    }
+
+
+def ping_healthcheck(url):
+    """Hit an uptime-monitor URL (e.g. healthchecks.io) as a dead-man's switch.
+    Silent failure is intentional — the point is the absence of pings signals
+    to an external watcher that the monitor is down. Returns True on success.
+    """
+    if not url:
+        return False
+    try:
+        with urllib.request.urlopen(url, timeout=10) as resp:
+            return 200 <= resp.status < 300
+    except Exception as exc:
+        log.warning("Healthcheck ping failed: %s", exc)
         return False
 
 
@@ -176,12 +251,18 @@ _TF_SCAN_INTERVALS = {
 }
 
 
-def monitor_loop(dsn, timeframe_intervals, webhook_url, poll_s=300, cooldown_s=3600):
-    """Main monitor loop. Checks staleness + gaps on each cycle."""
+def monitor_loop(dsn, timeframe_intervals, webhook_url, poll_s=300, cooldown_s=3600,
+                 healthcheck_url="", heartbeat_hour_utc=0):
+    """Main monitor loop. Checks staleness + gaps on each cycle.
+
+    Also hits healthcheck_url every cycle (dead-man's switch) and posts a
+    daily heartbeat summary at heartbeat_hour_utc.
+    """
     import psycopg
 
     cooldowns = {}
     last_gap_scan = {}  # {timeframe: last_scan_epoch}
+    last_heartbeat_date = None  # date of last heartbeat send
 
     while True:
         try:
@@ -232,10 +313,25 @@ def monitor_loop(dsn, timeframe_intervals, webhook_url, poll_s=300, cooldown_s=3
                         log.warning("Gap alert: %s/%s — %d gaps", exchange, timeframe, len(gaps))
                 last_gap_scan[timeframe] = now
 
+            # --- Daily heartbeat (Discord summary) ---
+            now_utc = datetime.now(timezone.utc)
+            if should_send_heartbeat(now_utc, last_heartbeat_date, heartbeat_hour_utc):
+                try:
+                    stats = fetch_heartbeat_stats(conn)
+                    text = build_heartbeat_text(stats)
+                    send_webhook(webhook_url, text)
+                    last_heartbeat_date = now_utc.date()
+                    log.info("Heartbeat sent: %s", text)
+                except Exception:
+                    log.exception("Heartbeat send failed")
+
         except Exception:
             log.exception("Monitor cycle error")
         finally:
             conn.close()
+
+        # --- Dead-man's switch ping (every cycle, end-of-cycle) ---
+        ping_healthcheck(healthcheck_url)
 
         log.info("Monitor cycle complete, sleeping %ds", poll_s)
         time.sleep(poll_s)
@@ -258,11 +354,20 @@ def run():
     webhook_url = os.environ.get("WEBHOOK_URL", "")
     poll_s = int(os.environ.get("MONITOR_INTERVAL_S", "300"))
     cooldown_s = int(os.environ.get("ALERT_COOLDOWN_S", "3600"))
+    healthcheck_url = os.environ.get("HEALTHCHECK_PING_URL", "")
+    heartbeat_hour_utc = int(os.environ.get("HEARTBEAT_HOUR_UTC", "0"))
 
     timeframe_intervals = load_timeframe_intervals()
 
-    log.info("Monitor starting: poll=%ds cooldown=%ds webhook=%s", poll_s, cooldown_s, "configured" if webhook_url else "none")
-    monitor_loop(dsn, timeframe_intervals, webhook_url, poll_s, cooldown_s)
+    log.info(
+        "Monitor starting: poll=%ds cooldown=%ds webhook=%s healthcheck=%s heartbeat=%02d:00 UTC",
+        poll_s, cooldown_s,
+        "configured" if webhook_url else "none",
+        "configured" if healthcheck_url else "none",
+        heartbeat_hour_utc,
+    )
+    monitor_loop(dsn, timeframe_intervals, webhook_url, poll_s, cooldown_s,
+                 healthcheck_url, heartbeat_hour_utc)
 
 
 if __name__ == "__main__":

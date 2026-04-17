@@ -2,13 +2,16 @@
 
 import json
 import time
+from datetime import date, datetime, timezone
 
 from monitor import (
+    build_heartbeat_text,
     build_webhook_payload,
     compute_staleness,
     format_gap_alert,
     format_stale_alert,
     should_alert,
+    should_send_heartbeat,
 )
 
 TF_INTERVALS = {"5m": 300, "15m": 900, "1h": 3600, "1d": 86400}
@@ -144,3 +147,61 @@ def test_build_webhook_payload():
     assert data["text"] == "hello"
     assert data["content"] == "hello"
     assert isinstance(payload, bytes)
+
+
+# --- build_heartbeat_text ---
+
+
+HEARTBEAT_STATS = {
+    "fresh_1h": 8500,
+    "stale_3h": 40,
+    "total_active": 8540,
+    "total_errors": 312,
+    "candles_24h": 124382,
+}
+
+
+def test_build_heartbeat_text_contains_all_fields():
+    text = build_heartbeat_text(HEARTBEAT_STATS)
+    assert "8500/8540" in text
+    assert "40 stale" in text
+    assert "124,382" in text  # thousands separator
+    assert "312 errors" in text
+
+
+def test_build_heartbeat_text_zero_errors():
+    stats = {**HEARTBEAT_STATS, "total_errors": 0, "stale_3h": 0}
+    text = build_heartbeat_text(stats)
+    assert "0 errors" in text
+    assert "0 stale" in text
+
+
+# --- should_send_heartbeat ---
+
+
+def test_should_send_heartbeat_wrong_hour():
+    now = datetime(2026, 4, 17, 3, 0, tzinfo=timezone.utc)
+    assert should_send_heartbeat(now, last_sent_date=None, target_hour=0) is False
+
+
+def test_should_send_heartbeat_right_hour_never_sent():
+    now = datetime(2026, 4, 17, 0, 30, tzinfo=timezone.utc)
+    assert should_send_heartbeat(now, last_sent_date=None, target_hour=0) is True
+
+
+def test_should_send_heartbeat_right_hour_already_sent_today():
+    now = datetime(2026, 4, 17, 0, 30, tzinfo=timezone.utc)
+    assert should_send_heartbeat(now, last_sent_date=date(2026, 4, 17), target_hour=0) is False
+
+
+def test_should_send_heartbeat_right_hour_yesterday_sent():
+    now = datetime(2026, 4, 17, 0, 30, tzinfo=timezone.utc)
+    assert should_send_heartbeat(now, last_sent_date=date(2026, 4, 16), target_hour=0) is True
+
+
+def test_should_send_heartbeat_non_zero_target_hour():
+    # 7am UTC target
+    now_ok = datetime(2026, 4, 17, 7, 5, tzinfo=timezone.utc)
+    now_bad = datetime(2026, 4, 17, 6, 55, tzinfo=timezone.utc)
+    assert should_send_heartbeat(now_ok, None, target_hour=7) is True
+    assert should_send_heartbeat(now_bad, None, target_hour=7) is False
