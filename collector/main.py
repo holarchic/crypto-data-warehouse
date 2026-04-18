@@ -118,13 +118,19 @@ def _collect_pair(exchange, pair, config, tf, api_lock, conn, thread_name):
     return True
 
 
-# Timeframes at/above this threshold sleep to the next boundary on container startup
-# instead of polling immediately. All TF threads hammering the shared api_lock in
-# parallel saturates it for tens of minutes after every restart; long-TF data is no
-# worse for waiting to the next boundary (a 30m candle closes every 30m regardless).
-# Only 5m and 15m run immediately — enough to keep fresh data flowing, light enough
-# that api_lock doesn't become the critical path.
-_DEFER_FIRST_CYCLE_S = 1800
+# Defer first cycle to the next boundary only for mid-interval TFs (30m-12h). These
+# have many pairs and cluster-start on shared boundaries, so running them all at once
+# on restart saturates the shared api_lock for tens of minutes and starves short-TF
+# cycles. Short TFs (< 30m) run immediately so candle data starts flowing. Very long
+# TFs (>= 1d) also run immediately because their "next boundary" computed from the
+# UNIX epoch can be days away (1w boundaries are Thursdays — a post-restart defer
+# could leave 1w pairs stale for a week).
+_DEFER_FIRST_CYCLE_MIN_S = 1800   # 30m
+_DEFER_FIRST_CYCLE_MAX_S = 86400  # 1d (exclusive)
+
+
+def _defer_first_cycle(interval_s: int) -> bool:
+    return _DEFER_FIRST_CYCLE_MIN_S <= interval_s < _DEFER_FIRST_CYCLE_MAX_S
 
 
 def collect_loop(exchange, config: ExchangeConfig, tf: TimeframeConfig, dsn: str, api_lock: threading.Lock):
@@ -133,7 +139,7 @@ def collect_loop(exchange, config: ExchangeConfig, tf: TimeframeConfig, dsn: str
     conn = connect_db(dsn)
 
     # Poll loop — never exits
-    first_cycle = tf.interval_s < _DEFER_FIRST_CYCLE_S
+    first_cycle = not _defer_first_cycle(tf.interval_s)
     while True:
         if not first_cycle:
             sleep_until_next_boundary(tf.interval_s, tf.buffer_s)
