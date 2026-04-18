@@ -118,13 +118,20 @@ def _collect_pair(exchange, pair, config, tf, api_lock, conn, thread_name):
     return True
 
 
+# Timeframes at/above this threshold sleep to the next boundary on container startup
+# instead of polling immediately. All 10 TF threads running a catch-up cycle in parallel
+# saturates the shared api_lock for hours after every restart; long-TF data is no worse
+# for waiting to the next boundary (a 12h candle closes every 12h regardless).
+_DEFER_FIRST_CYCLE_S = 43200
+
+
 def collect_loop(exchange, config: ExchangeConfig, tf: TimeframeConfig, dsn: str, api_lock: threading.Lock):
     """Multi-pair poll loop for a single timeframe. Own DB connection. Never exits."""
     thread_name = f"{config.name}/{tf.name}"
     conn = connect_db(dsn)
 
     # Poll loop — never exits
-    first_cycle = True
+    first_cycle = tf.interval_s < _DEFER_FIRST_CYCLE_S
     while True:
         if not first_cycle:
             sleep_until_next_boundary(tf.interval_s, tf.buffer_s)
