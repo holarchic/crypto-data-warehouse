@@ -33,7 +33,13 @@ def fetch_exchange_tickers(exchange, config):
         return []
 
     overrides = load_discovery_config().get("symbol_overrides", {})
-    results = []
+
+    # Pick the highest-volume symbol per asset_id. Exchanges list multiple quote pairs
+    # for the same base (e.g. ADA/USDT:USDT + ADA/USDC:USDC). Without a deterministic
+    # tiebreaker, discovery flips between them daily as volumes cross, leaving the
+    # previously-active sibling with a stale last_success that trips the monitor.
+    best_per_asset: dict[str, dict] = {}
+    total_matched = 0
 
     for symbol, ticker in tickers.items():
         market = exchange.markets.get(symbol)
@@ -53,16 +59,24 @@ def fetch_exchange_tickers(exchange, config):
         volume = ticker.get("quoteVolume") or 0
         asset_id = resolve_asset_id(base, overrides)
         native_symbol = market.get("id", "")
+        total_matched += 1
 
-        results.append({
+        candidate = {
             "asset_id": asset_id,
             "symbol": symbol,
             "market_type": config.market_type,
             "native_symbol": native_symbol,
             "volume": volume,
-        })
+        }
+        existing = best_per_asset.get(asset_id)
+        if existing is None or volume > existing["volume"]:
+            best_per_asset[asset_id] = candidate
 
-    log.info("[%s] Fetched %d tickers, %d passed market_type filter (%s)", config.name, len(tickers), len(results), config.market_type)
+    results = list(best_per_asset.values())
+    log.info(
+        "[%s] Fetched %d tickers, %d passed market_type filter, %d unique assets after dedup (%s)",
+        config.name, len(tickers), total_matched, len(results), config.market_type,
+    )
     return results
 
 
