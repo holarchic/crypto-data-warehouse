@@ -32,7 +32,15 @@ UPSERT_DISCOVERY_SQL = """
         asset_id = %(asset_id)s,
         native_symbol = %(native_symbol)s,
         last_24h_volume_usd = %(volume)s,
-        deactivated_at = NULL
+        deactivated_at = NULL,
+        -- Reset last_success on reactivation: the stored timestamp is from the last
+        -- time the pair was being polled (possibly days/weeks ago), which would
+        -- trip the monitor's staleness alert the moment the pair is re-added. The
+        -- next collector cycle will update last_success with a real value.
+        last_success = CASE
+            WHEN collection_status.active = FALSE THEN NOW()
+            ELSE collection_status.last_success
+        END
 """
 
 DEACTIVATE_STALE_SQL = """

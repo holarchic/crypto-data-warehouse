@@ -49,7 +49,9 @@ info "Pulling base images"
 $COMPOSE pull db
 
 info "Building application images"
-$COMPOSE build
+# Include profile-gated services (discovery) so they don't run stale code after
+# a git pull — `compose build` alone skips anything behind a profile flag.
+$COMPOSE --profile discovery build
 
 info "Starting services"
 $COMPOSE up -d
