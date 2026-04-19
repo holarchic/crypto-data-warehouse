@@ -1,11 +1,11 @@
 """Funding rate collection — one thread per exchange, polls every hour."""
 
 import logging
-import threading
 import time
 
 from backoff import RETRIABLE_EXCEPTIONS
 from config import ExchangeConfig
+from rate_limiter import RateLimiter
 from status import query_active_pairs
 
 from db import connect_db
@@ -73,20 +73,18 @@ def _insert_funding(conn, rows):
     return inserted
 
 
-def _seed_funding(exchange, config, conn, pairs, api_lock):
+def _seed_funding(exchange, config, conn, pairs, rate_limiter):
     """Seed historical funding rates — fetch_funding_rate_history(limit=100) per pair."""
     if config.ccxt_class == "dydx":
         log.info("[%s/funding] Skipping seed for dYdX (expensive for limited value)", config.name)
         return
 
-    rate_limit_s = config.rate_limit_ms / 1000
     total_inserted = 0
 
     for pair in pairs:
         try:
-            with api_lock:
-                time.sleep(rate_limit_s)
-                history = exchange.fetch_funding_rate_history(pair["symbol"], limit=100)
+            rate_limiter.acquire()
+            history = exchange.fetch_funding_rate_history(pair["symbol"], limit=100)
             rows = []
             for record in history:
                 row = _parse_funding_record(record, config.name, pair)
@@ -107,13 +105,11 @@ def _seed_funding(exchange, config, conn, pairs, api_lock):
     log.info("[%s/funding] Seed complete: %d rows inserted across %d pairs", config.name, total_inserted, len(pairs))
 
 
-def _poll_bulk(exchange, config, conn, pairs, api_lock):
+def _poll_bulk(exchange, config, conn, pairs, rate_limiter):
     """Bulk fetch_funding_rates() — 1 API call per exchange."""
-    rate_limit_s = config.rate_limit_ms / 1000
     try:
-        with api_lock:
-            time.sleep(rate_limit_s)
-            all_rates = exchange.fetch_funding_rates()
+        rate_limiter.acquire()
+        all_rates = exchange.fetch_funding_rates()
     except RETRIABLE_EXCEPTIONS as exc:
         log.warning("[%s/funding] Bulk fetch retriable error: %s", config.name, exc)
         if not conn.closed:
@@ -140,16 +136,14 @@ def _poll_bulk(exchange, config, conn, pairs, api_lock):
     return inserted
 
 
-def _poll_dydx(exchange, config, conn, pairs, api_lock):
+def _poll_dydx(exchange, config, conn, pairs, rate_limiter):
     """dYdX fallback: per-symbol fetch_funding_rate_history(limit=1)."""
-    rate_limit_s = config.rate_limit_ms / 1000
     total_inserted = 0
 
     for pair in pairs:
         try:
-            with api_lock:
-                time.sleep(rate_limit_s)
-                history = exchange.fetch_funding_rate_history(pair["symbol"], limit=1)
+            rate_limiter.acquire()
+            history = exchange.fetch_funding_rate_history(pair["symbol"], limit=1)
             rows = []
             for record in history:
                 row = _parse_funding_record(record, config.name, pair)
@@ -178,7 +172,7 @@ def _sleep_until_next_hour():
     time.sleep(sleep_s)
 
 
-def funding_loop(exchange, config: ExchangeConfig, dsn: str, api_lock: threading.Lock):
+def funding_loop(exchange, config: ExchangeConfig, dsn: str, rate_limiter: RateLimiter):
     """Funding rate collection loop. Own DB connection. Runs as daemon thread."""
     thread_name = f"{config.name}/funding"
     conn = connect_db(dsn)
@@ -211,14 +205,14 @@ def funding_loop(exchange, config: ExchangeConfig, dsn: str, api_lock: threading
         # Seed on first cycle
         if not seeded:
             log.info("[%s] Seeding funding history for %d pairs", thread_name, len(pairs))
-            _seed_funding(exchange, config, conn, pairs, api_lock)
+            _seed_funding(exchange, config, conn, pairs, rate_limiter)
             seeded = True
 
         # Poll
         if config.ccxt_class == "dydx":
-            inserted = _poll_dydx(exchange, config, conn, pairs, api_lock)
+            inserted = _poll_dydx(exchange, config, conn, pairs, rate_limiter)
         else:
-            inserted = _poll_bulk(exchange, config, conn, pairs, api_lock)
+            inserted = _poll_bulk(exchange, config, conn, pairs, rate_limiter)
 
         log.info("[%s] Poll: %d funding rates inserted (%d pairs)", thread_name, inserted, len(pairs))
 

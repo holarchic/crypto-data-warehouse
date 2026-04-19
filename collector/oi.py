@@ -2,12 +2,12 @@
 
 import json
 import logging
-import threading
 import time
 import urllib.request
 
 from backoff import RETRIABLE_EXCEPTIONS
 from config import ExchangeConfig
+from rate_limiter import RateLimiter
 from status import query_active_pairs
 
 from db import connect_db
@@ -57,23 +57,21 @@ def _sleep_until_next_5m():
 # ---------------------------------------------------------------------------
 
 
-def _fetch_price_map(exchange, api_lock, rate_limit_s):
+def _fetch_price_map(exchange, rate_limiter):
     """Bulk fetch_tickers() → {symbol: last_price}. One API call."""
     try:
-        with api_lock:
-            time.sleep(rate_limit_s)
-            tickers = exchange.fetch_tickers()
+        rate_limiter.acquire()
+        tickers = exchange.fetch_tickers()
         return {sym: t.get("last") or t.get("close") for sym, t in tickers.items() if t.get("last") or t.get("close")}
     except Exception as exc:
         log.warning("[oi] fetch_tickers failed (oi_value_usd will be None): %s", exc)
         return {}
 
 
-def _oi_loop_ccxt(exchange, config: ExchangeConfig, dsn: str, api_lock: threading.Lock):
+def _oi_loop_ccxt(exchange, config: ExchangeConfig, dsn: str, rate_limiter: RateLimiter):
     """Per-symbol fetch_open_interest() for ccxt exchanges."""
     thread_name = f"{config.name}/oi"
     conn = connect_db(dsn)
-    rate_limit_s = config.rate_limit_ms / 1000
 
     while True:
         # Reconnect if needed
@@ -100,14 +98,13 @@ def _oi_loop_ccxt(exchange, config: ExchangeConfig, dsn: str, api_lock: threadin
             continue
 
         # Bulk price map for computing oi_value_usd when ccxt doesn't return it
-        price_map = _fetch_price_map(exchange, api_lock, rate_limit_s)
+        price_map = _fetch_price_map(exchange, rate_limiter)
 
         rows = []
         for pair in pairs:
             try:
-                with api_lock:
-                    time.sleep(rate_limit_s)
-                    oi_data = exchange.fetch_open_interest(pair["symbol"])
+                rate_limiter.acquire()
+                oi_data = exchange.fetch_open_interest(pair["symbol"])
 
                 if oi_data is None:
                     continue
@@ -243,9 +240,9 @@ def _oi_loop_hyperliquid(config: ExchangeConfig, dsn: str):
 # ---------------------------------------------------------------------------
 
 
-def oi_loop(exchange, config: ExchangeConfig, dsn: str, api_lock: threading.Lock):
+def oi_loop(exchange, config: ExchangeConfig, dsn: str, rate_limiter: RateLimiter):
     """OI collection loop. Dispatches to native HL bulk or ccxt per-symbol."""
     if config.ccxt_class == "hyperliquid":
         _oi_loop_hyperliquid(config, dsn)
     else:
-        _oi_loop_ccxt(exchange, config, dsn, api_lock)
+        _oi_loop_ccxt(exchange, config, dsn, rate_limiter)
