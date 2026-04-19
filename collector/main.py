@@ -7,6 +7,7 @@ from config import ExchangeConfig, TimeframeConfig, load_config
 from dotenv import load_dotenv
 from funding import funding_loop
 from oi import oi_loop
+from rate_limiter import RateLimiter
 from status import query_active_pairs, upsert_status_error, upsert_status_success
 
 from db import build_dsn, connect_db, create_exchange
@@ -19,10 +20,9 @@ log = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 
-def fetch_candles(exchange, symbol, market_info, exchange_name, timeframe, interval_s, api_lock, rate_limit_s, limit=10):
-    with api_lock:
-        time.sleep(rate_limit_s)
-        raw = exchange.fetch_ohlcv(symbol, timeframe, limit=limit)
+def fetch_candles(exchange, symbol, market_info, exchange_name, timeframe, interval_s, rate_limiter: RateLimiter, limit=10):
+    rate_limiter.acquire()
+    raw = exchange.fetch_ohlcv(symbol, timeframe, limit=limit)
     now_ms = int(time.time() * 1000)
     candles = []
     for ts_ms, o, h, lo, c, vol in raw:
@@ -96,7 +96,7 @@ def _btc_fallback_pairs(config: ExchangeConfig, exchange) -> list[dict]:
     }]
 
 
-def _collect_pair(exchange, pair, config, tf, api_lock, conn, thread_name):
+def _collect_pair(exchange, pair, config, tf, rate_limiter, conn, thread_name):
     """Fetch and insert candles for a single pair. Returns True on success."""
     market_info = {
         "asset_id": pair["asset_id"] or "BTC",
@@ -105,9 +105,8 @@ def _collect_pair(exchange, pair, config, tf, api_lock, conn, thread_name):
     }
     # Seed (100) on first encounter, poll (10) thereafter
     limit = 100 if pair["last_timestamp"] is None else 10
-    rate_limit_s = config.rate_limit_ms / 1000
     candles = fetch_candles(
-        exchange, pair["symbol"], market_info, config.name, tf.name, tf.interval_s, api_lock, rate_limit_s, limit=limit,
+        exchange, pair["symbol"], market_info, config.name, tf.name, tf.interval_s, rate_limiter, limit=limit,
     )
     inserted = insert_candles(conn, candles)
     last_ts = max((c["timestamp"] for c in candles), default=None) if candles else None
@@ -120,11 +119,11 @@ def _collect_pair(exchange, pair, config, tf, api_lock, conn, thread_name):
 
 # Defer first cycle to the next boundary only for mid-interval TFs (30m-12h). These
 # have many pairs and cluster-start on shared boundaries, so running them all at once
-# on restart saturates the shared api_lock for tens of minutes and starves short-TF
-# cycles. Short TFs (< 30m) run immediately so candle data starts flowing. Very long
-# TFs (>= 1d) also run immediately because their "next boundary" computed from the
-# UNIX epoch can be days away (1w boundaries are Thursdays — a post-restart defer
-# could leave 1w pairs stale for a week).
+# on restart saturates the exchange's rate-limit budget the hardest. Short TFs (< 30m)
+# run immediately so candle data starts flowing. Very long TFs (>= 1d) also run
+# immediately because their "next boundary" computed from the UNIX epoch can be days
+# away (1w boundaries are Thursdays — a post-restart defer could leave 1w pairs stale
+# for a week).
 _DEFER_FIRST_CYCLE_MIN_S = 1800   # 30m
 _DEFER_FIRST_CYCLE_MAX_S = 86400  # 1d (exclusive)
 
@@ -133,7 +132,7 @@ def _defer_first_cycle(interval_s: int) -> bool:
     return _DEFER_FIRST_CYCLE_MIN_S <= interval_s < _DEFER_FIRST_CYCLE_MAX_S
 
 
-def collect_loop(exchange, config: ExchangeConfig, tf: TimeframeConfig, dsn: str, api_lock: threading.Lock):
+def collect_loop(exchange, config: ExchangeConfig, tf: TimeframeConfig, dsn: str, rate_limiter: RateLimiter):
     """Multi-pair poll loop for a single timeframe. Own DB connection. Never exits."""
     thread_name = f"{config.name}/{tf.name}"
     conn = connect_db(dsn)
@@ -169,7 +168,7 @@ def collect_loop(exchange, config: ExchangeConfig, tf: TimeframeConfig, dsn: str
         # Iterate over each pair — errors are isolated per-pair
         for pair in pairs:
             try:
-                _collect_pair(exchange, pair, config, tf, api_lock, conn, thread_name)
+                _collect_pair(exchange, pair, config, tf, rate_limiter, conn, thread_name)
             except RETRIABLE_EXCEPTIONS as exc:
                 log.warning("[%s] Retriable error on %s: %s", thread_name, pair["symbol"], exc)
                 if conn.closed:
@@ -206,15 +205,16 @@ def run():
     exchange = create_exchange(config)
     dsn = build_dsn()
 
-    # Shared lock — serializes API calls to respect exchange rate limits
-    api_lock = threading.Lock()
+    # Shared rate limiter — paces API calls to respect the exchange rate limit without
+    # serializing the actual network round-trip across threads.
+    rate_limiter = RateLimiter(config.rate_limit_ms / 1000)
 
     # One daemon thread per timeframe
     threads = []
     for tf in config.timeframes:
         t = threading.Thread(
             target=collect_loop,
-            args=(exchange, config, tf, dsn, api_lock),
+            args=(exchange, config, tf, dsn, rate_limiter),
             name=f"{config.name}-{tf.name}",
             daemon=True,
         )
@@ -226,7 +226,7 @@ def run():
     if config.has_funding:
         t = threading.Thread(
             target=funding_loop,
-            args=(exchange, config, dsn, api_lock),
+            args=(exchange, config, dsn, rate_limiter),
             name=f"{config.name}-funding",
             daemon=True,
         )
@@ -238,7 +238,7 @@ def run():
     if config.has_oi:
         t = threading.Thread(
             target=oi_loop,
-            args=(exchange, config, dsn, api_lock),
+            args=(exchange, config, dsn, rate_limiter),
             name=f"{config.name}-oi",
             daemon=True,
         )
