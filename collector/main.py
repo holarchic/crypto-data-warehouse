@@ -20,9 +20,9 @@ log = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 
-def fetch_candles(exchange, symbol, market_info, exchange_name, timeframe, interval_s, rate_limiter: RateLimiter, limit=10):
+def fetch_candles(exchange, symbol, market_info, exchange_name, timeframe, interval_s, rate_limiter: RateLimiter, since_ms=None, limit=1000):
     rate_limiter.acquire()
-    raw = exchange.fetch_ohlcv(symbol, timeframe, limit=limit)
+    raw = exchange.fetch_ohlcv(symbol, timeframe, since=since_ms, limit=limit)
     now_ms = int(time.time() * 1000)
     candles = []
     for ts_ms, o, h, lo, c, vol in raw:
@@ -97,22 +97,36 @@ def _btc_fallback_pairs(config: ExchangeConfig, exchange) -> list[dict]:
 
 
 def _collect_pair(exchange, pair, config, tf, rate_limiter, conn, thread_name):
-    """Fetch and insert candles for a single pair. Returns True on success."""
+    """Fetch and insert candles for a single pair. Returns True on success.
+
+    Gap-aware: fetches from last_timestamp forward (`since`), so a pair that
+    missed N cycles backfills N candles on its next successful run. The fixed
+    limit=10 approach lost data permanently after 10 consecutive failures.
+    """
     market_info = {
         "asset_id": pair["asset_id"] or "BTC",
         "native_symbol": pair["native_symbol"] or "",
         "market_type": pair["market_type"] or config.market_type,
     }
-    # Seed (100) on first encounter, poll (10) thereafter
-    limit = 100 if pair["last_timestamp"] is None else 10
+    stored_last = pair["last_timestamp"]
+    if stored_last is None:
+        # Seed: fetch max history the exchange will return
+        since_ms = None
+        label = "Seed"
+    else:
+        # Poll: fetch from just after last stored candle. 1ms nudge avoids the
+        # ambiguous "since == last candle open" edge case across exchanges.
+        # last_timestamp is a timestamptz → datetime, convert to epoch ms.
+        since_ms = int(stored_last.timestamp() * 1000) + 1
+        label = "Poll"
     candles = fetch_candles(
-        exchange, pair["symbol"], market_info, config.name, tf.name, tf.interval_s, rate_limiter, limit=limit,
+        exchange, pair["symbol"], market_info, config.name, tf.name, tf.interval_s, rate_limiter,
+        since_ms=since_ms, limit=1000,
     )
     inserted = insert_candles(conn, candles)
     last_ts = max((c["timestamp"] for c in candles), default=None) if candles else None
     upsert_status_success(conn, config.name, market_info["market_type"], pair["symbol"], tf.name, last_ts, asset_id=market_info["asset_id"])
 
-    label = "Seed" if limit == 100 else "Poll"
     log.info("[%s] %s %s: fetched=%d inserted=%d", thread_name, label, pair["asset_id"], len(candles), inserted)
     return True
 

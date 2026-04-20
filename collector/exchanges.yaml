@@ -25,7 +25,10 @@ exchanges:
     ccxt_class: hyperliquid
     btc_symbol: "BTC/USDC:USDC"
     market_type: perp
-    rate_limit_ms: 200
+    # HL info endpoint has weight ~20; IP budget 1200 weight/min ⇒ ~1 req/sec.
+    # 1100ms leaves a small margin under the cap and eliminates the 429 flood
+    # that was causing hundreds of stale alerts on long TFs.
+    rate_limit_ms: 1100
     enabled: true
     has_funding: true
     has_oi: true
