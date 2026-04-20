@@ -46,6 +46,13 @@ def fetch_exchange_tickers(exchange, config):
         if not market:
             continue
 
+        # Skip delisted/inactive markets. HL (and some others) keep tickers for
+        # inactive pairs but fetch_ohlcv returns 0 candles, leaving them stuck as
+        # null_ls stale in the monitor. `active` defaults to True for exchanges
+        # that don't populate the field — don't filter those out by mistake.
+        if market.get("active") is False:
+            continue
+
         # Filter by market type
         if config.market_type == "perp":
             if not market.get("swap"):
