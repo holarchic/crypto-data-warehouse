@@ -7,7 +7,12 @@ import urllib.request
 
 from backoff import RETRIABLE_EXCEPTIONS
 from config import ExchangeConfig
-from rate_limiter import RateLimiter
+from rate_limiter import (
+    BINANCE_OI_WEIGHT,
+    BINANCE_TICKERS_BULK_WEIGHT,
+    RateLimiter,
+    paced_call,
+)
 from status import query_active_pairs
 
 from db import connect_db
@@ -60,8 +65,10 @@ def _sleep_until_next_5m():
 def _fetch_price_map(exchange, rate_limiter):
     """Bulk fetch_tickers() → {symbol: last_price}. One API call."""
     try:
-        rate_limiter.acquire()
-        tickers = exchange.fetch_tickers()
+        tickers = paced_call(
+            rate_limiter, exchange, BINANCE_TICKERS_BULK_WEIGHT,
+            exchange.fetch_tickers,
+        )
         return {sym: t.get("last") or t.get("close") for sym, t in tickers.items() if t.get("last") or t.get("close")}
     except Exception as exc:
         log.warning("[oi] fetch_tickers failed (oi_value_usd will be None): %s", exc)
@@ -103,8 +110,10 @@ def _oi_loop_ccxt(exchange, config: ExchangeConfig, dsn: str, rate_limiter: Rate
         rows = []
         for pair in pairs:
             try:
-                rate_limiter.acquire()
-                oi_data = exchange.fetch_open_interest(pair["symbol"])
+                oi_data = paced_call(
+                    rate_limiter, exchange, BINANCE_OI_WEIGHT,
+                    exchange.fetch_open_interest, pair["symbol"],
+                )
 
                 if oi_data is None:
                     continue

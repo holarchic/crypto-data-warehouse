@@ -159,3 +159,16 @@ def binance_kline_weight(limit: int) -> int:
     if limit <= 1000:
         return 5
     return 10
+
+
+def paced_call(rate_limiter, exchange, weight, fn, *args, **kwargs):
+    """Acquire budget, run `fn`, release budget using the exchange's last
+    response headers. Release happens in a `finally` so failed calls don't
+    leak the reservation. `exchange` may be None for non-ccxt callers.
+    """
+    rate_limiter.acquire(weight=weight)
+    try:
+        return fn(*args, **kwargs)
+    finally:
+        headers = getattr(exchange, "last_response_headers", None) if exchange else None
+        rate_limiter.update_from_response(headers, weight=weight)

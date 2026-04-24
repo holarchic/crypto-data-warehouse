@@ -5,7 +5,12 @@ import time
 
 from backoff import RETRIABLE_EXCEPTIONS
 from config import ExchangeConfig
-from rate_limiter import RateLimiter
+from rate_limiter import (
+    BINANCE_FUNDING_BULK_WEIGHT,
+    BINANCE_FUNDING_HISTORY_WEIGHT,
+    RateLimiter,
+    paced_call,
+)
 from status import query_active_pairs
 
 from db import connect_db
@@ -83,8 +88,10 @@ def _seed_funding(exchange, config, conn, pairs, rate_limiter):
 
     for pair in pairs:
         try:
-            rate_limiter.acquire()
-            history = exchange.fetch_funding_rate_history(pair["symbol"], limit=100)
+            history = paced_call(
+                rate_limiter, exchange, BINANCE_FUNDING_HISTORY_WEIGHT,
+                exchange.fetch_funding_rate_history, pair["symbol"], limit=100,
+            )
             rows = []
             for record in history:
                 row = _parse_funding_record(record, config.name, pair)
@@ -108,8 +115,10 @@ def _seed_funding(exchange, config, conn, pairs, rate_limiter):
 def _poll_bulk(exchange, config, conn, pairs, rate_limiter):
     """Bulk fetch_funding_rates() — 1 API call per exchange."""
     try:
-        rate_limiter.acquire()
-        all_rates = exchange.fetch_funding_rates()
+        all_rates = paced_call(
+            rate_limiter, exchange, BINANCE_FUNDING_BULK_WEIGHT,
+            exchange.fetch_funding_rates,
+        )
     except RETRIABLE_EXCEPTIONS as exc:
         log.warning("[%s/funding] Bulk fetch retriable error: %s", config.name, exc)
         if not conn.closed:
@@ -142,8 +151,10 @@ def _poll_dydx(exchange, config, conn, pairs, rate_limiter):
 
     for pair in pairs:
         try:
-            rate_limiter.acquire()
-            history = exchange.fetch_funding_rate_history(pair["symbol"], limit=1)
+            history = paced_call(
+                rate_limiter, exchange, BINANCE_FUNDING_HISTORY_WEIGHT,
+                exchange.fetch_funding_rate_history, pair["symbol"], limit=1,
+            )
             rows = []
             for record in history:
                 row = _parse_funding_record(record, config.name, pair)

@@ -7,7 +7,12 @@ from config import ExchangeConfig, TimeframeConfig, load_config
 from dotenv import load_dotenv
 from funding import funding_loop
 from oi import oi_loop
-from rate_limiter import RateLimiter, WeightRateLimiter
+from rate_limiter import (
+    RateLimiter,
+    WeightRateLimiter,
+    binance_kline_weight,
+    paced_call,
+)
 from status import query_active_pairs, upsert_status_error, upsert_status_success
 
 from db import build_dsn, connect_db, create_exchange
@@ -20,9 +25,11 @@ log = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 
-def fetch_candles(exchange, symbol, market_info, exchange_name, timeframe, interval_s, rate_limiter: RateLimiter, since_ms=None, limit=1000):
-    rate_limiter.acquire()
-    raw = exchange.fetch_ohlcv(symbol, timeframe, since=since_ms, limit=limit)
+def fetch_candles(exchange, symbol, market_info, exchange_name, timeframe, interval_s, rate_limiter, since_ms=None, limit=1000):
+    raw = paced_call(
+        rate_limiter, exchange, binance_kline_weight(limit),
+        exchange.fetch_ohlcv, symbol, timeframe, since=since_ms, limit=limit,
+    )
     now_ms = int(time.time() * 1000)
     candles = []
     for ts_ms, o, h, lo, c, vol in raw:
