@@ -28,6 +28,11 @@ class ExchangeConfig:
     has_oi: bool = False
     options: dict = field(default_factory=dict)
     timeframes: list[TimeframeConfig] = field(default_factory=list)
+    # Weight-budget limiter (Binance): set to enable WeightRateLimiter instead
+    # of the interval-based RateLimiter. Leave None to keep interval pacing.
+    rate_limit_weight_budget: int | None = None
+    rate_limit_window_s: int = 60
+    rate_limit_safety: int = 400
 
 
 def _load_yaml():
@@ -54,6 +59,9 @@ def _parse_exchange(exchange_name: str, ex: dict, tf_defs: dict) -> ExchangeConf
         has_oi=ex.get("has_oi", False),
         options=ex.get("options", {}),
         timeframes=timeframes,
+        rate_limit_weight_budget=ex.get("rate_limit_weight_budget"),
+        rate_limit_window_s=ex.get("rate_limit_window_s", 60),
+        rate_limit_safety=ex.get("rate_limit_safety", 400),
     )
 
 
