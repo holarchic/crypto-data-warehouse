@@ -48,7 +48,15 @@ exchanges:
     ccxt_class: binanceusdm
     btc_symbol: "BTC/USDT:USDT"
     market_type: perp
+    # Binance USDM budgets per *weight* not per request. fapi/v1/klines weight
+    # scales with limit (limit<=1000 → weight 5). Setting a weight budget
+    # routes this exchange through WeightRateLimiter, which paces against the
+    # X-MBX-USED-WEIGHT-1M response header. rate_limit_ms is kept as a floor
+    # but not the primary gate.
     rate_limit_ms: 100
+    rate_limit_weight_budget: 2400   # Binance IP weight cap per minute
+    rate_limit_window_s: 60
+    rate_limit_safety: 400           # headroom for in-flight bursts at shared TF boundaries
     enabled: true
     has_funding: true
     has_oi: true
