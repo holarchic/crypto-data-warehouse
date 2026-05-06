@@ -2,6 +2,7 @@
 
 import logging
 import os
+import threading
 import time
 
 import ccxt
@@ -9,6 +10,9 @@ import psycopg
 from config import ExchangeConfig
 
 log = logging.getLogger(__name__)
+
+MARKETS_RELOAD_INTERVAL_S = int(os.environ.get("MARKETS_RELOAD_INTERVAL_S", 86400))
+_MARKETS_RELOAD_LOCK = threading.Lock()
 
 
 # ---------------------------------------------------------------------------
@@ -46,7 +50,28 @@ def create_exchange(config: ExchangeConfig):
         exchange = cls(opts)
 
     exchange.load_markets()
+    exchange._cc_markets_loaded_at = time.time()
     return exchange
+
+
+def maybe_reload_markets(exchange, interval_s: int = MARKETS_RELOAD_INTERVAL_S):
+    """Refresh ccxt's in-memory markets dict if it's older than `interval_s`.
+
+    Daily discovery adds newly-listed pairs to collection_status, but the
+    collector's `exchange.markets` is only populated at container start. Without
+    this, newly-discovered symbols return "does not have market symbol" until
+    the next container restart — which can be weeks. The lock keeps the reload
+    serialized across the per-timeframe threads that share one exchange.
+    """
+    with _MARKETS_RELOAD_LOCK:
+        last = getattr(exchange, "_cc_markets_loaded_at", 0)
+        age = time.time() - last
+        if age <= interval_s:
+            return False
+        exchange.load_markets(reload=True)
+        exchange._cc_markets_loaded_at = time.time()
+        log.info("Reloaded markets (age was %.0fs, %d symbols)", age, len(exchange.markets))
+        return True
 
 
 # ---------------------------------------------------------------------------
