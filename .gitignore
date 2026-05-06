@@ -32,4 +32,10 @@ backups/
 *.csv
 *.parquet
 *.db
+*.db-shm
+*.db-wal
+*.db-journal
 data/
+
+# Claude Code session state
+.claude/
