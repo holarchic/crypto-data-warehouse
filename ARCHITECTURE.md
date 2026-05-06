@@ -6,6 +6,8 @@
 
 Fetches OHLCV candles, funding rates, and open interest from exchanges. Writes directly to PostgreSQL. One container per exchange (6 total), one thread per timeframe + optional funding thread + optional OI thread per container. Config in `exchanges.yaml` (`has_funding` / `has_oi` flags per exchange).
 
+`collect_loop` calls `maybe_reload_markets()` (in `db.py`) at the top of each cycle. The helper is age-gated (`MARKETS_RELOAD_INTERVAL_S`, default 86400s) and lock-guarded so the per-timeframe threads sharing one ccxt `exchange` reload at most once per interval. Without this, symbols added by daily discovery stay invisible to the long-running collector container.
+
 ### api/
 
 FastAPI read-only REST API. Queries PostgreSQL, serves consumers on GCP.

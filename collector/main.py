@@ -15,7 +15,7 @@ from rate_limiter import (
 )
 from status import query_active_pairs, upsert_status_error, upsert_status_success
 
-from db import build_dsn, connect_db, create_exchange
+from db import build_dsn, connect_db, create_exchange, maybe_reload_markets
 
 log = logging.getLogger(__name__)
 
@@ -164,6 +164,11 @@ def collect_loop(exchange, config: ExchangeConfig, tf: TimeframeConfig, dsn: str
         if not first_cycle:
             sleep_until_next_boundary(tf.interval_s, tf.buffer_s)
         first_cycle = False
+
+        try:
+            maybe_reload_markets(exchange)
+        except Exception:
+            log.exception("[%s] Markets reload failed — continuing with stale cache", thread_name)
 
         # Reconnect if needed
         if conn.closed:
