@@ -59,8 +59,12 @@ def _sleep_until_next_5m():
 
 def _heartbeat(conn, config: ExchangeConfig, thread_name: str):
     """Write the per-loop liveness heartbeat, guarded so a write hiccup can't kill
-    the loop (it reconnects next cycle via the `if conn.closed` guard). Called only
-    on healthy cycle exits — error paths `continue` before reaching it."""
+    the loop (it reconnects next cycle via the `if conn.closed` guard).
+
+    Marks loop *liveness*, not data-flow success: it fires once per completed cycle
+    INCLUDING cycles where the poll caught an API/per-pair error (the loop is alive).
+    Only the reconnect-fail and pairs-query-fail paths skip it — they `continue` first.
+    """
     try:
         upsert_loop_heartbeat(conn, config.name, config.market_type, OI_LOOP)
     except Exception:
