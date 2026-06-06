@@ -8,6 +8,8 @@ Fetches OHLCV candles, funding rates, and open interest from exchanges. Writes d
 
 `collect_loop` calls `maybe_reload_markets()` (in `db.py`) at the top of each cycle. The helper is age-gated (`MARKETS_RELOAD_INTERVAL_S`, default 86400s) and lock-guarded so the per-timeframe threads sharing one ccxt `exchange` reload at most once per interval. Without this, symbols added by daily discovery stay invisible to the long-running collector container.
 
+The funding and OI threads upsert a per-loop **liveness heartbeat** each cycle (`status.upsert_loop_heartbeat`): a sentinel `collection_status` row with `symbol = "*"` and a pseudo-timeframe from `config.LOOP_INTERVALS` (`funding` / `oi`). These threads write no per-pair candle status, so without the heartbeat a silently-dead funding/OI thread produces no staleness footprint; the monitor flags the sentinel row when it goes stale.
+
 ### api/
 
 FastAPI read-only REST API. Queries PostgreSQL, serves consumers on GCP.
@@ -46,6 +48,10 @@ PK: `(exchange, market_type, symbol, timeframe, timestamp)`
 ### `collection_status`
 
 PK: `(exchange, market_type, symbol, timeframe)` — health tracking + discovery metadata per pair.
+Also holds per-loop **liveness heartbeats** for the funding/OI threads: sentinel rows with
+`symbol = "*"` and `timeframe ∈ {funding, oi}` (one per exchange/loop). Candle-facing readers
+(`query_active_pairs`, the `/candles/*` and `/status` API endpoints) exclude these by pseudo-timeframe;
+the monitor's staleness check is the only consumer that acts on them.
 
 | Column | Type | Notes |
 |--------|------|-------|
