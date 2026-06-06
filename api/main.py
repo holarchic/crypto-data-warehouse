@@ -79,7 +79,11 @@ def get_candles(
 @app.get("/candles/exchanges")
 def get_exchanges():
     with pool.connection() as conn:
-        rows = conn.execute("SELECT DISTINCT exchange FROM collection_status WHERE active = TRUE ORDER BY exchange").fetchall()
+        rows = conn.execute(
+            "SELECT DISTINCT exchange FROM collection_status "
+            "WHERE active = TRUE AND timeframe <> ALL(%(loop_tfs)s) ORDER BY exchange",
+            {"loop_tfs": list(LOOP_INTERVALS)},
+        ).fetchall()
     return [row["exchange"] for row in rows]
 
 
