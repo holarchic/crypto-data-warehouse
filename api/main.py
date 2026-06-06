@@ -224,17 +224,17 @@ TIMEFRAME_INTERVALS = {
 # Funding/OI per-loop heartbeat pseudo-timeframes. MIRROR of collector/config.py
 # LOOP_INTERVALS — the API is a separate container and cannot import collector/
 # (same reason TIMEFRAME_INTERVALS above is duplicated rather than imported). Keep aligned.
+# CONTRACT: every candle-facing collection_status query (the three endpoints below)
+# excludes these sentinel rows. Loop liveness is surfaced by the monitor, not this API.
 LOOP_INTERVALS = {"funding": 3600, "oi": 300}
-
-# Candle metadata endpoints exclude these sentinel rows; /status is loop-aware and uses
-# the combined map so a stale funding/OI heartbeat reports is_stale correctly.
-STATUS_INTERVALS = {**TIMEFRAME_INTERVALS, **LOOP_INTERVALS}
 
 
 @app.get("/status")
 def get_status(exchange: str | None = None, timeframe: str | None = None):
-    conditions = ["active = TRUE"]
-    params: dict = {}
+    # Candle-only: exclude funding/OI loop heartbeat sentinel rows (loop liveness is
+    # the monitor's surface, and its staleness threshold differs from this endpoint's).
+    conditions = ["active = TRUE", "timeframe <> ALL(%(loop_tfs)s)"]
+    params: dict = {"loop_tfs": list(LOOP_INTERVALS)}
     if exchange is not None:
         conditions.append("exchange = %(exchange)s")
         params["exchange"] = exchange
@@ -269,10 +269,9 @@ def get_status(exchange: str | None = None, timeframe: str | None = None):
         except Exception:
             compression_rows = []
 
-    # Compute is_stale flag. STATUS_INTERVALS includes the funding/OI loop pseudo-TFs,
-    # so /status is loop-aware (a stale loop heartbeat reports is_stale=True).
+    # Compute is_stale flag (candle TFs only — loop rows are excluded above).
     for row in rows:
-        interval_s = STATUS_INTERVALS.get(row["timeframe"])
+        interval_s = TIMEFRAME_INTERVALS.get(row["timeframe"])
         since = row.get("seconds_since_success")
         row["is_stale"] = interval_s is not None and (since is None or since > 2 * interval_s)
         if row.get("last_success") and hasattr(row["last_success"], "isoformat"):

@@ -185,7 +185,12 @@ def _sleep_until_next_hour():
 
 def _heartbeat(conn, config: ExchangeConfig, thread_name: str):
     """Write the per-loop liveness heartbeat, guarded so a write hiccup can't kill
-    the loop (it reconnects next cycle via the `if conn.closed` guard)."""
+    the loop (it reconnects next cycle via the `if conn.closed` guard).
+
+    Marks loop *liveness*, not data-flow success: it fires once per completed cycle
+    (incl. no-pairs and caught-poll-error cycles). Only the reconnect-fail and
+    pairs-query-fail paths skip it — they `continue` before the convergence point.
+    """
     try:
         upsert_loop_heartbeat(conn, config.name, config.market_type, FUNDING_LOOP)
     except Exception:
