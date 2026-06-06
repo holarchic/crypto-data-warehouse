@@ -4,14 +4,14 @@ import logging
 import time
 
 from backoff import RETRIABLE_EXCEPTIONS
-from config import ExchangeConfig
+from config import FUNDING_LOOP, ExchangeConfig
 from rate_limiter import (
     BINANCE_FUNDING_BULK_WEIGHT,
     BINANCE_FUNDING_HISTORY_WEIGHT,
     RateLimiter,
     paced_call,
 )
-from status import query_active_pairs
+from status import query_active_pairs, upsert_loop_heartbeat
 
 from db import connect_db
 
@@ -183,6 +183,17 @@ def _sleep_until_next_hour():
     time.sleep(sleep_s)
 
 
+def _heartbeat(conn, config: ExchangeConfig, thread_name: str):
+    """Write the per-loop liveness heartbeat, guarded so a write hiccup can't kill
+    the loop (it reconnects next cycle via the `if conn.closed` guard)."""
+    try:
+        upsert_loop_heartbeat(conn, config.name, config.market_type, FUNDING_LOOP)
+    except Exception:
+        log.exception("[%s] Heartbeat upsert failed", thread_name)
+        if not conn.closed:
+            conn.rollback()
+
+
 def funding_loop(exchange, config: ExchangeConfig, dsn: str, rate_limiter: RateLimiter):
     """Funding rate collection loop. Own DB connection. Runs as daemon thread."""
     thread_name = f"{config.name}/funding"
@@ -208,23 +219,22 @@ def funding_loop(exchange, config: ExchangeConfig, dsn: str, rate_limiter: RateL
             _sleep_until_next_hour()
             continue
 
-        if not pairs:
-            log.info("[%s] No active pairs, sleeping", thread_name)
-            _sleep_until_next_hour()
-            continue
+        if pairs:
+            # Seed on first cycle
+            if not seeded:
+                log.info("[%s] Seeding funding history for %d pairs", thread_name, len(pairs))
+                _seed_funding(exchange, config, conn, pairs, rate_limiter)
+                seeded = True
 
-        # Seed on first cycle
-        if not seeded:
-            log.info("[%s] Seeding funding history for %d pairs", thread_name, len(pairs))
-            _seed_funding(exchange, config, conn, pairs, rate_limiter)
-            seeded = True
+            # Poll
+            if config.ccxt_class == "dydx":
+                inserted = _poll_dydx(exchange, config, conn, pairs, rate_limiter)
+            else:
+                inserted = _poll_bulk(exchange, config, conn, pairs, rate_limiter)
 
-        # Poll
-        if config.ccxt_class == "dydx":
-            inserted = _poll_dydx(exchange, config, conn, pairs, rate_limiter)
+            log.info("[%s] Poll: %d funding rates inserted (%d pairs)", thread_name, inserted, len(pairs))
         else:
-            inserted = _poll_bulk(exchange, config, conn, pairs, rate_limiter)
+            log.info("[%s] No active pairs, sleeping", thread_name)
 
-        log.info("[%s] Poll: %d funding rates inserted (%d pairs)", thread_name, inserted, len(pairs))
-
+        _heartbeat(conn, config, thread_name)
         _sleep_until_next_hour()

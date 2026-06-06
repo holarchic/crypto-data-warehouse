@@ -6,14 +6,14 @@ import time
 import urllib.request
 
 from backoff import RETRIABLE_EXCEPTIONS
-from config import ExchangeConfig
+from config import OI_LOOP, ExchangeConfig
 from rate_limiter import (
     BINANCE_OI_WEIGHT,
     BINANCE_TICKERS_BULK_WEIGHT,
     RateLimiter,
     paced_call,
 )
-from status import query_active_pairs
+from status import query_active_pairs, upsert_loop_heartbeat
 
 from db import connect_db
 
@@ -55,6 +55,18 @@ def _sleep_until_next_5m():
     sleep_s = next_boundary - now
     log.info("[oi] Sleeping %.0fs until next 5m boundary", sleep_s)
     time.sleep(sleep_s)
+
+
+def _heartbeat(conn, config: ExchangeConfig, thread_name: str):
+    """Write the per-loop liveness heartbeat, guarded so a write hiccup can't kill
+    the loop (it reconnects next cycle via the `if conn.closed` guard). Called only
+    on healthy cycle exits — error paths `continue` before reaching it."""
+    try:
+        upsert_loop_heartbeat(conn, config.name, config.market_type, OI_LOOP)
+    except Exception:
+        log.exception("[%s] Heartbeat upsert failed", thread_name)
+        if not conn.closed:
+            conn.rollback()
 
 
 # ---------------------------------------------------------------------------
@@ -101,6 +113,7 @@ def _oi_loop_ccxt(exchange, config: ExchangeConfig, dsn: str, rate_limiter: Rate
 
         if not pairs:
             log.info("[%s] No active pairs, sleeping", thread_name)
+            _heartbeat(conn, config, thread_name)
             _sleep_until_next_5m()
             continue
 
@@ -154,6 +167,7 @@ def _oi_loop_ccxt(exchange, config: ExchangeConfig, dsn: str, rate_limiter: Rate
         inserted = _insert_oi(conn, rows)
         log.info("[%s] Poll: %d OI snapshots inserted (%d pairs)", thread_name, inserted, len(pairs))
 
+        _heartbeat(conn, config, thread_name)
         _sleep_until_next_5m()
 
 
@@ -202,6 +216,7 @@ def _oi_loop_hyperliquid(config: ExchangeConfig, dsn: str):
 
         if not pairs:
             log.info("[%s] No active pairs, sleeping", thread_name)
+            _heartbeat(conn, config, thread_name)
             _sleep_until_next_5m()
             continue
 
@@ -241,6 +256,7 @@ def _oi_loop_hyperliquid(config: ExchangeConfig, dsn: str):
             if not conn.closed:
                 conn.rollback()
 
+        _heartbeat(conn, config, thread_name)
         _sleep_until_next_5m()
 
 

@@ -8,6 +8,15 @@ import yaml
 
 YAML_PATH = Path(__file__).parent / "exchanges.yaml"
 
+# Per-loop liveness heartbeats. The funding/OI threads upsert a sentinel
+# collection_status row under these pseudo-timeframes (symbol "*") at the end of
+# each poll cycle; the monitor's staleness check flags a silently-dead loop.
+# NOT candle timeframes — deliberately kept out of exchanges.yaml. Intervals feed
+# the monitor's `interval + max(interval, 1800)` threshold: funding → 2h, oi → 35m.
+FUNDING_LOOP = "funding"
+OI_LOOP = "oi"
+LOOP_INTERVALS = {FUNDING_LOOP: 3600, OI_LOOP: 300}
+
 
 @dataclass
 class TimeframeConfig:

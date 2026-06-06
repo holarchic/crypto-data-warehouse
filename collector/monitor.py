@@ -10,10 +10,15 @@ import time
 import urllib.request
 from datetime import datetime, timezone
 
-from config import load_timeframe_intervals
+from config import LOOP_INTERVALS, load_timeframe_intervals
 from dotenv import load_dotenv
 
 log = logging.getLogger(__name__)
+
+# Funding/OI per-loop heartbeat pseudo-timeframes (config.LOOP_INTERVALS keys).
+# Their sentinel collection_status rows are checked for staleness like any
+# collector, but carry no candle series — so gap detection skips them.
+LOOP_TIMEFRAMES = frozenset(LOOP_INTERVALS)
 
 # ---------------------------------------------------------------------------
 # Pure functions (testable)
@@ -315,6 +320,10 @@ def monitor_loop(dsn, timeframe_intervals, webhook_url, poll_s=300, cooldown_s=3
                 if (exchange, timeframe) in stale_keys:
                     continue
 
+                # Loop heartbeat pseudo-TFs have no candle series — nothing to gap-check
+                if timeframe in LOOP_TIMEFRAMES:
+                    continue
+
                 # Tiered scanning — check slower TFs less often
                 scan_interval = _TF_SCAN_INTERVALS.get(timeframe, 300)
                 last_scan = last_gap_scan.get(timeframe, 0)
@@ -380,7 +389,9 @@ def run():
     healthcheck_url = os.environ.get("HEALTHCHECK_PING_URL", "")
     heartbeat_hour_utc = int(os.environ.get("HEARTBEAT_HOUR_UTC", "0"))
 
-    timeframe_intervals = load_timeframe_intervals()
+    # Candle TFs + funding/OI loop heartbeat pseudo-TFs — so compute_staleness
+    # flags a silently-dead funding/OI loop via the same staleness path.
+    timeframe_intervals = {**load_timeframe_intervals(), **LOOP_INTERVALS}
 
     log.info(
         "Monitor starting: poll=%ds cooldown=%ds webhook=%s healthcheck=%s heartbeat=%02d:00 UTC",
