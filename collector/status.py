@@ -4,6 +4,11 @@ import logging
 
 log = logging.getLogger(__name__)
 
+# Sentinel symbol for the per-loop liveness heartbeat rows (funding/OI threads).
+# One row per (exchange, loop), keyed (exchange, market_type, "*", loop-pseudo-tf).
+# Never a real ccxt symbol, so it can't collide with a candle pair.
+LOOP_SENTINEL_SYMBOL = "*"
+
 UPSERT_SUCCESS_SQL = """
     INSERT INTO collection_status (exchange, market_type, symbol, timeframe, active, asset_id, last_timestamp, last_success, error_count)
     VALUES (%(exchange)s, %(market_type)s, %(symbol)s, %(timeframe)s, TRUE, %(asset_id)s, to_timestamp(%(last_timestamp)s), NOW(), 0)
@@ -57,6 +62,16 @@ QUERY_ACTIVE_PAIRS_SQL = """
     ORDER BY symbol
 """
 
+UPSERT_LOOP_HEARTBEAT_SQL = """
+    INSERT INTO collection_status (exchange, market_type, symbol, timeframe, active, last_success, error_count)
+    VALUES (%(exchange)s, %(market_type)s, %(symbol)s, %(loop)s, TRUE, NOW(), 0)
+    ON CONFLICT (exchange, market_type, symbol, timeframe) DO UPDATE SET
+        active = TRUE,
+        last_success = NOW(),
+        error_count = 0,
+        last_error = NULL
+"""
+
 
 def upsert_status_success(conn, exchange: str, market_type: str, symbol: str, timeframe: str, last_timestamp, asset_id: str | None = None):
     """Record a successful fetch cycle."""
@@ -84,6 +99,24 @@ def upsert_status_error(conn, exchange: str, market_type: str, symbol: str, time
     }
     with conn.cursor() as cur:
         cur.execute(UPSERT_ERROR_SQL, params)
+    conn.commit()
+
+
+def upsert_loop_heartbeat(conn, exchange: str, market_type: str, loop: str):
+    """Record a completed funding/OI poll cycle as a per-loop liveness heartbeat.
+
+    `loop` is a pseudo-timeframe (config.FUNDING_LOOP / OI_LOOP) stored in the
+    `timeframe` column. The monitor's staleness check flags this sentinel row when
+    it goes stale — the signal a silently-dead loop would otherwise never produce.
+    """
+    params = {
+        "exchange": exchange,
+        "market_type": market_type,
+        "symbol": LOOP_SENTINEL_SYMBOL,
+        "loop": loop,
+    }
+    with conn.cursor() as cur:
+        cur.execute(UPSERT_LOOP_HEARTBEAT_SQL, params)
     conn.commit()
 
 

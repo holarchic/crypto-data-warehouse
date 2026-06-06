@@ -86,14 +86,19 @@ def get_exchanges():
 @app.get("/candles/timeframes")
 def get_timeframes():
     with pool.connection() as conn:
-        rows = conn.execute("SELECT DISTINCT timeframe FROM collection_status WHERE active = TRUE ORDER BY timeframe").fetchall()
+        rows = conn.execute(
+            "SELECT DISTINCT timeframe FROM collection_status "
+            "WHERE active = TRUE AND timeframe <> ALL(%(loop_tfs)s) ORDER BY timeframe",
+            {"loop_tfs": list(LOOP_INTERVALS)},
+        ).fetchall()
     return [row["timeframe"] for row in rows]
 
 
 @app.get("/candles/symbols")
 def get_symbols(exchange: str | None = None):
-    query = "SELECT DISTINCT asset_id, symbol, exchange FROM collection_status WHERE active = TRUE"
-    params: dict = {}
+    # Exclude the funding/OI loop heartbeat sentinel rows — this is candle metadata.
+    query = "SELECT DISTINCT asset_id, symbol, exchange FROM collection_status WHERE active = TRUE AND timeframe <> ALL(%(loop_tfs)s)"
+    params: dict = {"loop_tfs": list(LOOP_INTERVALS)}
     if exchange is not None:
         query += " AND exchange = %(exchange)s"
         params["exchange"] = exchange
@@ -216,6 +221,15 @@ TIMEFRAME_INTERVALS = {
     "4h": 14400, "12h": 43200, "1d": 86400, "3d": 259200, "1w": 604800,
 }
 
+# Funding/OI per-loop heartbeat pseudo-timeframes. MIRROR of collector/config.py
+# LOOP_INTERVALS — the API is a separate container and cannot import collector/
+# (same reason TIMEFRAME_INTERVALS above is duplicated rather than imported). Keep aligned.
+LOOP_INTERVALS = {"funding": 3600, "oi": 300}
+
+# Candle metadata endpoints exclude these sentinel rows; /status is loop-aware and uses
+# the combined map so a stale funding/OI heartbeat reports is_stale correctly.
+STATUS_INTERVALS = {**TIMEFRAME_INTERVALS, **LOOP_INTERVALS}
+
 
 @app.get("/status")
 def get_status(exchange: str | None = None, timeframe: str | None = None):
@@ -255,9 +269,10 @@ def get_status(exchange: str | None = None, timeframe: str | None = None):
         except Exception:
             compression_rows = []
 
-    # Compute is_stale flag
+    # Compute is_stale flag. STATUS_INTERVALS includes the funding/OI loop pseudo-TFs,
+    # so /status is loop-aware (a stale loop heartbeat reports is_stale=True).
     for row in rows:
-        interval_s = TIMEFRAME_INTERVALS.get(row["timeframe"])
+        interval_s = STATUS_INTERVALS.get(row["timeframe"])
         since = row.get("seconds_since_success")
         row["is_stale"] = interval_s is not None and (since is None or since > 2 * interval_s)
         if row.get("last_success") and hasattr(row["last_success"], "isoformat"):

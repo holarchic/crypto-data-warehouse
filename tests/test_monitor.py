@@ -4,7 +4,9 @@ import json
 import time
 from datetime import date, datetime, timezone
 
+from config import FUNDING_LOOP, LOOP_INTERVALS, OI_LOOP
 from monitor import (
+    LOOP_TIMEFRAMES,
     build_heartbeat_text,
     build_webhook_payload,
     compute_staleness,
@@ -15,6 +17,8 @@ from monitor import (
 )
 
 TF_INTERVALS = {"5m": 300, "15m": 900, "1h": 3600, "1d": 86400}
+# The monitor merges LOOP_INTERVALS into the candle-TF map at startup (monitor.run()).
+LOOP_AWARE_INTERVALS = {**TF_INTERVALS, **LOOP_INTERVALS}
 
 
 # --- compute_staleness ---
@@ -72,6 +76,54 @@ def test_compute_staleness_unknown_timeframe_skipped():
     """Rows with timeframes not in the interval map are ignored."""
     rows = [
         {"exchange": "binance", "symbol": "BTC/USDT:USDT", "timeframe": "2m", "seconds_since_success": 1, "error_count": 0},
+    ]
+    assert compute_staleness(rows, TF_INTERVALS) == []
+
+
+# --- funding/OI loop heartbeats (T-004) ---
+
+
+def test_loop_timeframes_match_config():
+    """Producer (config), consumer (monitor gap-skip), and the pseudo-TF set agree —
+    pins against name drift between the heartbeat writers and the monitor."""
+    assert LOOP_TIMEFRAMES == set(LOOP_INTERVALS)
+    assert {FUNDING_LOOP, OI_LOOP} == set(LOOP_INTERVALS)
+
+
+def test_compute_staleness_flags_dead_funding_loop():
+    """funding threshold = 3600 + max(3600, 1800) = 7200s; an older heartbeat = dead loop."""
+    rows = [
+        {"exchange": "binance", "symbol": "*", "timeframe": FUNDING_LOOP, "seconds_since_success": 7500, "error_count": 0},
+    ]
+    stale = compute_staleness(rows, LOOP_AWARE_INTERVALS)
+    assert len(stale) == 1
+    assert stale[0]["timeframe"] == FUNDING_LOOP
+
+
+def test_compute_staleness_flags_dead_oi_loop():
+    """oi threshold = 300 + max(300, 1800) = 2100s."""
+    rows = [
+        {"exchange": "bybit", "symbol": "*", "timeframe": OI_LOOP, "seconds_since_success": 2500, "error_count": 0},
+    ]
+    stale = compute_staleness(rows, LOOP_AWARE_INTERVALS)
+    assert len(stale) == 1
+    assert stale[0]["timeframe"] == OI_LOOP
+
+
+def test_compute_staleness_fresh_loop_heartbeats_ok():
+    """Live funding/OI loops (recent heartbeat) are not flagged."""
+    rows = [
+        {"exchange": "binance", "symbol": "*", "timeframe": FUNDING_LOOP, "seconds_since_success": 120, "error_count": 0},
+        {"exchange": "hyperliquid", "symbol": "*", "timeframe": OI_LOOP, "seconds_since_success": 90, "error_count": 0},
+    ]
+    assert compute_staleness(rows, LOOP_AWARE_INTERVALS) == []
+
+
+def test_compute_staleness_loop_heartbeat_ignored_without_loop_intervals():
+    """Without the loop intervals merged in, a loop row is skipped like any unknown TF —
+    guards against the monitor silently checking loop rows on the bare candle map."""
+    rows = [
+        {"exchange": "okx", "symbol": "*", "timeframe": OI_LOOP, "seconds_since_success": 99999, "error_count": 0},
     ]
     assert compute_staleness(rows, TF_INTERVALS) == []
 
