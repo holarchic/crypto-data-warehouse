@@ -82,7 +82,7 @@ def get_exchanges():
         rows = conn.execute(
             "SELECT DISTINCT exchange FROM collection_status "
             "WHERE active = TRUE AND timeframe <> ALL(%(loop_tfs)s) ORDER BY exchange",
-            {"loop_tfs": list(LOOP_INTERVALS)},
+            {"loop_tfs": list(LOOP_TIMEFRAMES)},
         ).fetchall()
     return [row["exchange"] for row in rows]
 
@@ -93,7 +93,7 @@ def get_timeframes():
         rows = conn.execute(
             "SELECT DISTINCT timeframe FROM collection_status "
             "WHERE active = TRUE AND timeframe <> ALL(%(loop_tfs)s) ORDER BY timeframe",
-            {"loop_tfs": list(LOOP_INTERVALS)},
+            {"loop_tfs": list(LOOP_TIMEFRAMES)},
         ).fetchall()
     return [row["timeframe"] for row in rows]
 
@@ -102,7 +102,7 @@ def get_timeframes():
 def get_symbols(exchange: str | None = None):
     # Exclude the funding/OI loop heartbeat sentinel rows — this is candle metadata.
     query = "SELECT DISTINCT asset_id, symbol, exchange FROM collection_status WHERE active = TRUE AND timeframe <> ALL(%(loop_tfs)s)"
-    params: dict = {"loop_tfs": list(LOOP_INTERVALS)}
+    params: dict = {"loop_tfs": list(LOOP_TIMEFRAMES)}
     if exchange is not None:
         query += " AND exchange = %(exchange)s"
         params["exchange"] = exchange
@@ -225,12 +225,13 @@ TIMEFRAME_INTERVALS = {
     "4h": 14400, "12h": 43200, "1d": 86400, "3d": 259200, "1w": 604800,
 }
 
-# Funding/OI per-loop heartbeat pseudo-timeframes. MIRROR of collector/config.py
-# LOOP_INTERVALS — the API is a separate container and cannot import collector/
-# (same reason TIMEFRAME_INTERVALS above is duplicated rather than imported). Keep aligned.
-# CONTRACT: every candle-facing collection_status query (the three endpoints below)
-# excludes these sentinel rows. Loop liveness is surfaced by the monitor, not this API.
-LOOP_INTERVALS = {"funding": 3600, "oi": 300}
+# Funding/OI per-loop heartbeat pseudo-timeframes (the keys of collector/config.py
+# LOOP_INTERVALS). The API is a separate container and cannot import collector/, so the
+# names are mirrored here (as TIMEFRAME_INTERVALS above is). Only the NAMES are needed —
+# the staleness intervals are the monitor's concern. CONTRACT: every candle-facing
+# collection_status query in this module excludes these sentinel rows; loop liveness is
+# surfaced by the monitor, not this API.
+LOOP_TIMEFRAMES = ("funding", "oi")
 
 
 @app.get("/status")
@@ -238,7 +239,7 @@ def get_status(exchange: str | None = None, timeframe: str | None = None):
     # Candle-only: exclude funding/OI loop heartbeat sentinel rows (loop liveness is
     # the monitor's surface, and its staleness threshold differs from this endpoint's).
     conditions = ["active = TRUE", "timeframe <> ALL(%(loop_tfs)s)"]
-    params: dict = {"loop_tfs": list(LOOP_INTERVALS)}
+    params: dict = {"loop_tfs": list(LOOP_TIMEFRAMES)}
     if exchange is not None:
         conditions.append("exchange = %(exchange)s")
         params["exchange"] = exchange

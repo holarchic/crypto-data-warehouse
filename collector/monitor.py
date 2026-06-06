@@ -223,7 +223,8 @@ def ping_healthcheck(url):
 
 
 def check_staleness(conn, timeframe_intervals):
-    """Query collection_status and return stale pairs."""
+    """Query collection_status and return the stale rows — candle collectors AND
+    funding/OI loop heartbeats (whose pseudo-TFs are in timeframe_intervals)."""
     with conn.cursor() as cur:
         cur.execute(STALENESS_SQL)
         cols = [desc[0] for desc in cur.description]
