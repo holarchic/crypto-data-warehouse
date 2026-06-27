@@ -159,6 +159,14 @@ def should_alert(key, cooldowns, cooldown_s):
     return True
 
 
+def gap_scan_due(last_gap_scan, key, scan_interval_s, now):
+    """True if `key`'s tiered gap scan is due. `key` is `(exchange, timeframe)`, NOT timeframe
+    alone — keying by timeframe would let the first exchange scanned for a timeframe suppress
+    every other exchange sharing it, so gap detection would silently cover one exchange per TF.
+    """
+    return now - last_gap_scan.get(key, 0) >= scan_interval_s
+
+
 def build_webhook_payload(text):
     """JSON-encoded payload with both Slack (text) and Discord (content) keys."""
     return json.dumps({"text": text, "content": text}).encode("utf-8")
@@ -361,7 +369,7 @@ def monitor_loop(dsn, timeframe_intervals, webhook_url, poll_s=300, cooldown_s=3
     import psycopg
 
     cooldowns = {}
-    last_gap_scan = {}  # {timeframe: last_scan_epoch}
+    last_gap_scan = {}  # {(exchange, timeframe): last_scan_epoch}
     last_heartbeat_date = None  # date of last heartbeat send
     # Rolling-1h baseline of the alarming count (quiescent counts only) + the run of
     # consecutive breaches. In-memory like cooldowns — resets on restart, rebuilds over 1h.
@@ -426,10 +434,9 @@ def monitor_loop(dsn, timeframe_intervals, webhook_url, poll_s=300, cooldown_s=3
                 if timeframe in LOOP_TIMEFRAMES:
                     continue
 
-                # Tiered scanning — check slower TFs less often
+                # Tiered scanning — check slower TFs less often, per (exchange, timeframe)
                 scan_interval = _TF_SCAN_INTERVALS.get(timeframe, 300)
-                last_scan = last_gap_scan.get(timeframe, 0)
-                if now - last_scan < scan_interval:
+                if not gap_scan_due(last_gap_scan, (exchange, timeframe), scan_interval, now):
                     continue
 
                 interval_s = timeframe_intervals.get(timeframe)
@@ -445,7 +452,7 @@ def monitor_loop(dsn, timeframe_intervals, webhook_url, poll_s=300, cooldown_s=3
                             log.warning("Gap alert: %s/%s — %d gaps", exchange, timeframe, len(gaps))
                         else:
                             log.warning("Gap alert delivery failed: %s/%s", exchange, timeframe)
-                last_gap_scan[timeframe] = now
+                last_gap_scan[(exchange, timeframe)] = now
 
             # --- Daily heartbeat (Discord summary) ---
             now_utc = datetime.now(timezone.utc)
