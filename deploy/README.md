@@ -16,6 +16,8 @@
 | `HEARTBEAT_HOUR_UTC` | UTC hour for the daily heartbeat. Default `0` |
 | `MONITOR_INTERVAL_S` | Monitor cycle interval. Default `300` |
 | `ALERT_COOLDOWN_S` | Dedup window for staleness/gap alerts. Default `3600` |
+| `ALARMING_DELTA_THRESHOLD` | Alarming-collector count must exceed its rolling-1h median by this much to page. Default `25` |
+| `ALARMING_SUSTAIN_CYCLES` | Consecutive breaching cycles required before the alarming alert fires. Default `2` |
 
 ## Local Dev Commands
 

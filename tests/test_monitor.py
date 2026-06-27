@@ -2,6 +2,7 @@
 
 import json
 import time
+from collections import deque
 from datetime import date, datetime, timezone
 
 from config import FUNDING_LOOP, LOOP_INTERVALS, OI_LOOP
@@ -9,7 +10,10 @@ from monitor import (
     LOOP_TIMEFRAMES,
     build_heartbeat_text,
     build_webhook_payload,
+    compute_alarming,
     compute_staleness,
+    evaluate_alarming,
+    format_alarming_alert,
     format_gap_alert,
     format_stale_alert,
     should_alert,
@@ -270,3 +274,161 @@ def test_should_send_heartbeat_non_zero_target_hour():
     now_bad = datetime(2026, 4, 17, 6, 55, tzinfo=timezone.utc)
     assert should_send_heartbeat(now_ok, None, target_hour=7) is True
     assert should_send_heartbeat(now_bad, None, target_hour=7) is False
+
+
+# --- compute_alarming (T-005): the high-signal subset, 5m → 4×interval = 1200s ---
+
+
+def test_compute_alarming_excludes_hl_5m_cursor():
+    """HL 5m within-cycle cursor: ~12 min behind, no errors — below the 4×interval (1200s) gate."""
+    rows = [{"exchange": "hyperliquid", "symbol": "BTC/USDC:USDC", "timeframe": "5m",
+             "seconds_since_success": 720, "error_count": 0}]
+    assert compute_alarming(rows, TF_INTERVALS) == []
+
+
+def test_compute_alarming_excludes_new_listing_floor():
+    """Never-succeeded new listing: last_success NULL (since None), no errors — excluded."""
+    rows = [{"exchange": "binance", "symbol": "PUMP/USDT:USDT", "timeframe": "1d",
+             "seconds_since_success": None, "error_count": 0}]
+    assert compute_alarming(rows, TF_INTERVALS) == []
+
+
+def test_compute_alarming_error_channel_catches_never_succeeded_bug():
+    """The 136-stuck class: NEVER succeeded (since None) but errors accruing — the error
+    channel must catch it, which a lone time gate (since > 4×interval) would miss."""
+    rows = [{"exchange": "bybit", "symbol": "AAPL/USDT:USDT", "timeframe": "5m",
+             "seconds_since_success": None, "error_count": 57}]
+    alarming = compute_alarming(rows, TF_INTERVALS)
+    assert len(alarming) == 1
+    assert alarming[0]["symbol"] == "AAPL/USDT:USDT"
+
+
+def test_compute_alarming_time_channel_catches_gone_dark():
+    """A previously-working collector gone dark past 4×interval (3000 > 1200), no errors."""
+    rows = [{"exchange": "okx", "symbol": "ETH/USDT:USDT", "timeframe": "5m",
+             "seconds_since_success": 3000, "error_count": 0}]
+    assert len(compute_alarming(rows, TF_INTERVALS)) == 1
+
+
+def test_compute_alarming_time_gate_is_strict():
+    """Exactly at 4×interval (1200s for 5m) = not alarming (needs >)."""
+    rows = [{"exchange": "okx", "symbol": "ETH/USDT:USDT", "timeframe": "5m",
+             "seconds_since_success": 1200, "error_count": 0}]
+    assert compute_alarming(rows, TF_INTERVALS) == []
+
+
+def test_compute_alarming_skips_loop_pseudo_tfs():
+    """A dead funding/OI loop heartbeat is NOT counted here — it pages via the separate
+    presence alert; padding the candle count would dilute the +delta signal."""
+    rows = [{"exchange": "dydx", "symbol": "*", "timeframe": FUNDING_LOOP,
+             "seconds_since_success": 99999, "error_count": 99}]
+    assert compute_alarming(rows, LOOP_AWARE_INTERVALS) == []
+
+
+def test_compute_alarming_skips_unknown_timeframe():
+    rows = [{"exchange": "binance", "symbol": "BTC/USDT:USDT", "timeframe": "2m",
+             "seconds_since_success": 99999, "error_count": 5}]
+    assert compute_alarming(rows, TF_INTERVALS) == []
+
+
+def test_compute_alarming_benign_floor_is_empty():
+    """A whole cycle of only-benign staleness (cursor + new-listing floor) → 0 alarming."""
+    rows = [
+        {"exchange": "hyperliquid", "symbol": f"C{i}/USDC:USDC", "timeframe": "5m",
+         "seconds_since_success": 720, "error_count": 0} for i in range(60)
+    ] + [
+        {"exchange": "binance", "symbol": f"NEW{i}/USDT:USDT", "timeframe": "1d",
+         "seconds_since_success": None, "error_count": 0} for i in range(49)
+    ]
+    assert compute_alarming(rows, TF_INTERVALS) == []
+
+
+# --- evaluate_alarming (T-005): rolling-median baseline + sustained breach ---
+
+
+def test_evaluate_alarming_below_threshold_no_fire():
+    d = evaluate_alarming(10, deque([0, 0]), 25, 2, 0)
+    assert d.baseline == 0 and d.should_record is True and d.next_consecutive == 0 and d.should_fire is False
+
+
+def test_evaluate_alarming_single_cycle_breach_no_fire():
+    d = evaluate_alarming(50, deque([0, 0]), 25, 2, 0)
+    assert d.should_record is False and d.next_consecutive == 1 and d.should_fire is False
+
+
+def test_evaluate_alarming_two_consecutive_fires():
+    d = evaluate_alarming(50, deque([0, 0]), 25, 2, 1)
+    assert d.should_record is False and d.next_consecutive == 2 and d.should_fire is True
+
+
+def test_evaluate_alarming_breach_then_clear_resets():
+    d = evaluate_alarming(5, deque([0, 0]), 25, 2, 1)
+    assert d.should_record is True and d.next_consecutive == 0 and d.should_fire is False
+
+
+def test_evaluate_alarming_empty_history_baseline_zero():
+    d = evaluate_alarming(30, deque(), 25, 2, 0)
+    assert d.baseline == 0 and d.should_record is False  # breaching → not recorded into baseline
+
+
+def test_evaluate_alarming_median_over_benign_window():
+    """Median is outlier-robust: a window of mostly-0 with a couple small values still ~0."""
+    d = evaluate_alarming(30, deque([0, 0, 0, 2, 1]), 25, 2, 0)
+    assert d.baseline == 0 and d.should_record is False
+
+
+def _drive_alarming(counts, delta=25, sustain=2, poll_s=300):
+    """Mirror monitor_loop's record-only-quiescent rule; return the 1-based cycle index at
+    which it first fires, or None."""
+    history = deque(maxlen=max(1, 3600 // poll_s))
+    consec = 0
+    for i, count in enumerate(counts, start=1):
+        d = evaluate_alarming(count, history, delta, sustain, consec)
+        consec = d.next_consecutive
+        if d.should_fire:
+            return i
+        if d.should_record:
+            history.append(count)
+    return None
+
+
+def test_evaluate_alarming_cold_start_into_outage_fires():
+    """The codex cold-start regression: a steady high count from an EMPTY history must fire at
+    `sustain_cycles` — breaching counts must not enter the baseline and self-suppress."""
+    assert _drive_alarming([136, 136]) == 2
+
+
+def test_evaluate_alarming_transient_spike_does_not_fire():
+    """A single-cycle spike that clears the next cycle never reaches sustain."""
+    assert _drive_alarming([50, 0, 0]) is None
+
+
+def test_evaluate_alarming_benign_steady_state_quiet():
+    assert _drive_alarming([0, 1, 0, 2, 0, 1]) is None
+
+
+# --- format_alarming_alert (T-005) ---
+
+
+def test_format_alarming_alert_empty():
+    assert format_alarming_alert([], 0, 0, 25) == ""
+
+
+def test_format_alarming_alert_content():
+    rows = [{"exchange": "binance", "symbol": "AAPL/USDT:USDT", "timeframe": "5m",
+             "seconds_since_success": None, "error_count": 57}]
+    text = format_alarming_alert(rows, 30, 0, 25)
+    assert "30 alarming-stale" in text
+    assert "baseline ~0" in text
+    assert "+25" in text
+    assert "binance" in text and "AAPL/USDT:USDT" in text
+    assert "never" in text  # last_success NULL
+
+
+def test_format_alarming_alert_truncates_large_lists():
+    rows = [{"exchange": "binance", "symbol": f"SYM{i}/USDT:USDT", "timeframe": "5m",
+             "seconds_since_success": 3000, "error_count": 1} for i in range(500)]
+    text = format_alarming_alert(rows, 500, 0, 25)
+    assert "500 alarming-stale" in text
+    assert "plus 485 more" in text
+    assert len(text) < 2000
