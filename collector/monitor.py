@@ -6,12 +6,15 @@ Runs as always-on container: `python -m monitor`
 import json
 import logging
 import os
+import statistics
 import time
 import urllib.request
+from collections import deque, namedtuple
 from datetime import datetime, timezone
 
 from config import LOOP_INTERVALS, load_timeframe_intervals
 from dotenv import load_dotenv
+from status import LOOP_SENTINEL_SYMBOL
 
 log = logging.getLogger(__name__)
 
@@ -19,6 +22,10 @@ log = logging.getLogger(__name__)
 # Their sentinel collection_status rows are checked for staleness like any
 # collector, but carry no candle series — so gap detection skips them.
 LOOP_TIMEFRAMES = frozenset(LOOP_INTERVALS)
+
+# Result of one alarming-signal evaluation (named, not positional). `should_record` carries the
+# baseline-update invariant (record only non-breaching counts) so the caller doesn't re-derive it.
+AlarmingDecision = namedtuple("AlarmingDecision", ["baseline", "should_fire", "next_consecutive", "should_record"])
 
 # ---------------------------------------------------------------------------
 # Pure functions (testable)
@@ -47,6 +54,54 @@ def compute_staleness(status_rows, timeframe_intervals):
     return stale
 
 
+def compute_alarming(status_rows, timeframe_intervals):
+    """Candle collectors that are *alarming-stale* — the high-signal subset of staleness.
+
+    Two channels, deliberately NOT a plain staleness filter (see SPEC Decision):
+      - error channel (`error_count > 0`): catches the new-symbol stuck-collector class, whose
+        rows never succeeded (`last_success` NULL → `seconds_since_success` NULL) — a lone
+        time gate would miss them.
+      - time channel (`seconds_since_success > 4×interval`): a previously-working collector gone
+        dark, past a gate well above the within-cycle collection cursor.
+    Excludes the benign new-listing floor (no errors, never succeeded) and the sub-4×interval
+    cursor. Loop-heartbeat pseudo-TFs are skipped — they page via their own presence alert and a
+    single dead loop must not pad this count.
+    """
+    alarming = []
+    for row in status_rows:
+        tf = row["timeframe"]
+        if tf in LOOP_TIMEFRAMES:
+            continue
+        interval_s = timeframe_intervals.get(tf)
+        if interval_s is None:
+            continue
+        since = row.get("seconds_since_success")
+        if row.get("error_count", 0) > 0 or (since is not None and since > 4 * interval_s):
+            alarming.append(row)
+    return alarming
+
+
+def evaluate_alarming(count, history, delta_threshold, sustain_cycles, prior_consecutive):
+    """Decide whether the alarming count constitutes an alert, and own the state-transition rules.
+
+    Baseline is the median of `history` — prior *quiescent* counts only. The `should_record`
+    field is the load-bearing invariant: a breaching count must NOT enter the baseline (else a
+    mid-outage restart self-suppresses — a steady high count from an empty history would raise its
+    own median past the gate before `sustain_cycles` completes). The caller records the count into
+    its rolling window iff `should_record`, and carries `next_consecutive` into the next cycle —
+    so the transition rules live here, not split across the call site.
+    """
+    baseline = statistics.median(history) if history else 0
+    is_breach = count > baseline + delta_threshold
+    next_consecutive = prior_consecutive + 1 if is_breach else 0
+    return AlarmingDecision(
+        baseline=baseline,
+        should_fire=next_consecutive >= sustain_cycles,
+        next_consecutive=next_consecutive,
+        should_record=not is_breach,
+    )
+
+
 def format_stale_alert(stale_pairs, max_rows=15):
     """Human-readable stale alert — summary header + first `max_rows` rows.
 
@@ -64,6 +119,23 @@ def format_stale_alert(stale_pairs, max_rows=15):
         lines.append(f"  • {p['exchange']}/{p['symbol']}/{p['timeframe']} — last success: {since_str}, errors: {errors}")
     if len(stale_pairs) > max_rows:
         lines.append(f"  … plus {len(stale_pairs) - max_rows} more (see /status for full list)")
+    return "\n".join(lines)
+
+
+def format_alarming_alert(alarming_rows, count, baseline, delta_threshold, max_rows=15):
+    """Human-readable alarming-collector alert — headline (count, baseline, gate) + first
+    `max_rows` rows. Same 2000-char Discord cap discipline as format_stale_alert.
+    """
+    if not alarming_rows:
+        return ""
+    lines = [f"🔴 {count} alarming-stale collector(s) (baseline ~{baseline:.0f}, threshold +{delta_threshold}):"]
+    for p in alarming_rows[:max_rows]:
+        since = p.get("seconds_since_success")
+        since_str = f"{since:.0f}s ago" if since is not None else "never"
+        errors = p.get("error_count", 0)
+        lines.append(f"  • {p['exchange']}/{p['symbol']}/{p['timeframe']} — last success: {since_str}, errors: {errors}")
+    if len(alarming_rows) > max_rows:
+        lines.append(f"  … plus {len(alarming_rows) - max_rows} more (see /status for full list)")
     return "\n".join(lines)
 
 
@@ -222,14 +294,17 @@ def ping_healthcheck(url):
         return False
 
 
-def check_staleness(conn, timeframe_intervals):
-    """Query collection_status and return the stale rows — candle collectors AND
-    funding/OI loop heartbeats (whose pseudo-TFs are in timeframe_intervals)."""
+def fetch_status_rows(conn):
+    """Fetch all active collection_status rows with derived seconds_since_success.
+
+    One fetch feeds both staleness (gap-skip + loop-liveness presence) and the alarming
+    subset — alarming is NOT a subset of staleness (its 4×interval gate is below the staleness
+    threshold for short TFs), so both compute over the same full row set.
+    """
     with conn.cursor() as cur:
         cur.execute(STALENESS_SQL)
         cols = [desc[0] for desc in cur.description]
-        rows = [dict(zip(cols, row)) for row in cur.fetchall()]
-    return compute_staleness(rows, timeframe_intervals)
+        return [dict(zip(cols, row)) for row in cur.fetchall()]
 
 
 def detect_gaps(conn, exchange, timeframe, interval_s, lookback_count=10):
@@ -277,7 +352,7 @@ _TF_SCAN_INTERVALS = {
 
 
 def monitor_loop(dsn, timeframe_intervals, webhook_url, poll_s=300, cooldown_s=3600,
-                 healthcheck_url="", heartbeat_hour_utc=0):
+                 healthcheck_url="", heartbeat_hour_utc=0, delta_threshold=25, sustain_cycles=2):
     """Main monitor loop. Checks staleness + gaps on each cycle.
 
     Also hits healthcheck_url every cycle (dead-man's switch) and posts a
@@ -288,6 +363,10 @@ def monitor_loop(dsn, timeframe_intervals, webhook_url, poll_s=300, cooldown_s=3
     cooldowns = {}
     last_gap_scan = {}  # {timeframe: last_scan_epoch}
     last_heartbeat_date = None  # date of last heartbeat send
+    # Rolling-1h baseline of the alarming count (quiescent counts only) + the run of
+    # consecutive breaches. In-memory like cooldowns — resets on restart, rebuilds over 1h.
+    alarming_history = deque(maxlen=max(1, 3600 // poll_s))
+    alarming_consecutive = 0
 
     while True:
         try:
@@ -298,18 +377,40 @@ def monitor_loop(dsn, timeframe_intervals, webhook_url, poll_s=300, cooldown_s=3
             continue
 
         try:
-            # --- Staleness check ---
-            stale = check_staleness(conn, timeframe_intervals)
-            if stale:
-                log.warning("Stale collectors: %d", len(stale))
-                alert_text = format_stale_alert(stale)
-                if should_alert("staleness", cooldowns, cooldown_s):
-                    if send_webhook(webhook_url, alert_text):
-                        log.info("Stale alert sent")
-                    else:
-                        log.warning("Stale alert delivery failed")
-            else:
-                log.info("All collectors healthy")
+            # --- Staleness + alarming (one fetch, two signals) ---
+            rows = fetch_status_rows(conn)
+            stale = compute_staleness(rows, timeframe_intervals)
+
+            # Signal A — funding/OI loop-heartbeat presence: any stale sentinel row pages.
+            # Kept separate from the candle count-delta below: a single dead loop is one row and
+            # could never trip +delta_threshold, so folding it in would regress T-004.
+            loop_stale = [s for s in stale if s["symbol"] == LOOP_SENTINEL_SYMBOL]
+            if loop_stale and should_alert("loop_staleness", cooldowns, cooldown_s):
+                if send_webhook(webhook_url, format_stale_alert(loop_stale)):
+                    log.warning("Loop-liveness alert sent: %d stale loop(s)", len(loop_stale))
+                else:
+                    log.warning("Loop-liveness alert delivery failed")
+
+            # Signal B — candle alarming-mass: alert on a rolling-1h-median delta sustained N
+            # cycles. The raw stale count swings benignly (HL 5m cursor + new-listing floor), so
+            # it is logged for visibility but never pages on its own.
+            alarming = compute_alarming(rows, timeframe_intervals)
+            decision = evaluate_alarming(
+                len(alarming), alarming_history, delta_threshold, sustain_cycles, alarming_consecutive
+            )
+            alarming_consecutive = decision.next_consecutive
+            log.info(
+                "Collectors: %d stale (raw), %d alarming (baseline ~%.0f, +%d gate)",
+                len(stale), len(alarming), decision.baseline, delta_threshold,
+            )
+            if decision.should_fire and should_alert("alarming", cooldowns, cooldown_s):
+                alert_text = format_alarming_alert(alarming, len(alarming), decision.baseline, delta_threshold)
+                if send_webhook(webhook_url, alert_text):
+                    log.warning("Alarming alert sent: %d collectors", len(alarming))
+                else:
+                    log.warning("Alarming alert delivery failed")
+            if decision.should_record:
+                alarming_history.append(len(alarming))
 
             # --- Gap detection (tiered) ---
             stale_keys = {(s["exchange"], s["timeframe"]) for s in stale}
@@ -389,20 +490,22 @@ def run():
     cooldown_s = int(os.environ.get("ALERT_COOLDOWN_S", "3600"))
     healthcheck_url = os.environ.get("HEALTHCHECK_PING_URL", "")
     heartbeat_hour_utc = int(os.environ.get("HEARTBEAT_HOUR_UTC", "0"))
+    delta_threshold = int(os.environ.get("ALARMING_DELTA_THRESHOLD", "25"))
+    sustain_cycles = int(os.environ.get("ALARMING_SUSTAIN_CYCLES", "2"))
 
     # Candle TFs + funding/OI loop heartbeat pseudo-TFs — so compute_staleness
     # flags a silently-dead funding/OI loop via the same staleness path.
     timeframe_intervals = {**load_timeframe_intervals(), **LOOP_INTERVALS}
 
     log.info(
-        "Monitor starting: poll=%ds cooldown=%ds webhook=%s healthcheck=%s heartbeat=%02d:00 UTC",
+        "Monitor starting: poll=%ds cooldown=%ds webhook=%s healthcheck=%s heartbeat=%02d:00 UTC alarming=+%d×%d cycles",
         poll_s, cooldown_s,
         "configured" if webhook_url else "none",
         "configured" if healthcheck_url else "none",
-        heartbeat_hour_utc,
+        heartbeat_hour_utc, delta_threshold, sustain_cycles,
     )
     monitor_loop(dsn, timeframe_intervals, webhook_url, poll_s, cooldown_s,
-                 healthcheck_url, heartbeat_hour_utc)
+                 healthcheck_url, heartbeat_hour_utc, delta_threshold, sustain_cycles)
 
 
 if __name__ == "__main__":
