@@ -16,6 +16,7 @@ from monitor import (
     format_alarming_alert,
     format_gap_alert,
     format_stale_alert,
+    gap_scan_due,
     should_alert,
     should_send_heartbeat,
 )
@@ -186,6 +187,30 @@ def test_format_gap_alert():
 
 def test_format_gap_alert_empty():
     assert format_gap_alert("binance", "5m", []) == ""
+
+
+# --- gap_scan_due (per-(exchange, timeframe) tiered scheduling) ---
+
+
+def test_gap_scan_due_unseen_key():
+    assert gap_scan_due({}, ("binance", "5m"), 300, now=1000) is True
+
+
+def test_gap_scan_due_within_interval():
+    last = {("binance", "5m"): 1000}
+    assert gap_scan_due(last, ("binance", "5m"), 300, now=1100) is False
+
+
+def test_gap_scan_due_after_interval():
+    last = {("binance", "5m"): 1000}
+    assert gap_scan_due(last, ("binance", "5m"), 300, now=1400) is True
+
+
+def test_gap_scan_due_distinct_exchanges_do_not_suppress():
+    """Regression: binance having just scanned 5m must NOT suppress bybit's 5m scan —
+    the keying is per (exchange, timeframe), not timeframe alone."""
+    last = {("binance", "5m"): 1000}
+    assert gap_scan_due(last, ("bybit", "5m"), 300, now=1100) is True
 
 
 # --- should_alert (dedup) ---
