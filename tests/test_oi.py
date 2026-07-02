@@ -24,16 +24,21 @@ def test_to_float_numeric_and_string():
     assert oi._to_float(0) == 0.0
 
 
-def test_to_float_missing_and_bad():
+def test_to_float_absent_is_none():
+    # Legitimately absent → None (stored as SQL NULL); HL omits fields on illiquid assets.
     assert oi._to_float(None) is None
     assert oi._to_float("") is None
-    assert oi._to_float("abc") is None
 
 
-def test_to_float_nan_is_none():
-    # NaN maps to None — the SQL-NULL contract (export converts NULL→NaN).
-    assert oi._to_float(float("nan")) is None
-    assert oi._to_float("NaN") is None
+def test_to_float_malformed_raises():
+    # Present-but-garbage → _CtxParseError (caller drops the asset), NOT a silent None.
+    import pytest
+    with pytest.raises(oi._CtxParseError):
+        oi._to_float("abc", "openInterest")
+    with pytest.raises(oi._CtxParseError):
+        oi._to_float(float("nan"), "markPx")
+    with pytest.raises(oi._CtxParseError):
+        oi._to_float("NaN", "funding")
 
 
 def _full_ctx():
@@ -203,6 +208,21 @@ def test_build_hl_snapshots_length_mismatch_raises():
     import pytest
     with pytest.raises(ValueError, match="length mismatch"):
         oi._build_hl_snapshots([{"name": "BTC"}, {"name": "ETH"}], [_full_ctx()], {}, "hyperliquid", 1.0)
+
+
+def test_build_hl_snapshots_drops_malformed_asset():
+    # ETH has a garbage openInterest → dropped; BTC (well-formed) still lands.
+    universe = [{"name": "BTC"}, {"name": "ETH"}]
+    bad = _full_ctx()
+    bad["openInterest"] = "not-a-number"
+    ctxs = [_full_ctx(), bad]
+    asset_to_pair = {
+        "BTC": {"asset_id": "BTC", "symbol": "BTC/USDC:USDC"},
+        "ETH": {"asset_id": "ETH", "symbol": "ETH/USDC:USDC"},
+    }
+    oi_rows, ctx_rows = oi._build_hl_snapshots(universe, ctxs, asset_to_pair, "hyperliquid", 1.0)
+    assert [r["asset_id"] for r in oi_rows] == ["BTC"]  # ETH dropped, not stored as NULL
+    assert [r["asset_id"] for r in ctx_rows] == ["BTC"]
 
 
 def _fixture_universe_ctxs():
