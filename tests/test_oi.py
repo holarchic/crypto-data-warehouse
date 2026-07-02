@@ -39,6 +39,16 @@ def test_to_float_malformed_raises():
         oi._to_float(float("nan"), "markPx")
     with pytest.raises(oi._CtxParseError):
         oi._to_float("NaN", "funding")
+    with pytest.raises(oi._CtxParseError):
+        oi._to_float(True, "openInterest")  # bool is not a real HL numeric
+    with pytest.raises(oi._CtxParseError):
+        oi._to_float(float("inf"), "markPx")  # non-finite
+
+
+def test_parse_hl_ctx_impact_pxs_non_list_raises():
+    import pytest
+    with pytest.raises(oi._CtxParseError, match="impactPxs"):
+        oi._parse_hl_ctx({"openInterest": "1.0", "impactPxs": {"bid": 1}})
 
 
 def _full_ctx():
