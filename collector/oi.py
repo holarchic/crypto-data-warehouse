@@ -64,16 +64,20 @@ def _to_float(x, field=None):
       garbage never lands as a normal snapshot, and cannot be confused with an omitted
       field. Matches the seed producer (fetch_hl_asset_ctxs.py) skipping malformed rows.
 
-    0.0 is preserved — zero OI/funding is valid, so no `or`-coalescing.
+    0.0 is preserved — zero OI/funding is valid, so no `or`-coalescing. `bool` and
+    non-finite (NaN/±inf) values are rejected: a bool is not a real HL numeric, and
+    inf/NaN are corrupt magnitudes.
     """
     if x is None or x == "":
         return None
+    if isinstance(x, bool):  # bool is an int subclass — float(True)==1.0 would sneak through
+        raise _CtxParseError(f"{field or '?'}={x!r} is bool, not a number")
     try:
         v = float(x)
     except (TypeError, ValueError):
         raise _CtxParseError(f"{field or '?'}={x!r} not numeric") from None
-    if math.isnan(v):
-        raise _CtxParseError(f"{field or '?'} is NaN")
+    if not math.isfinite(v):  # NaN or ±inf
+        raise _CtxParseError(f"{field or '?'} not finite ({v})")
     return v
 
 
@@ -265,11 +269,17 @@ def _fetch_hl_meta_and_ctxs():
 
 
 def _parse_hl_ctx(ctx: dict) -> dict:
-    """Parse one HL asset ctx into the 10 seed floats. All via `_to_float` (missing/
-    NaN → None). `impactPxs` is a 2-element [bid, ask] list, but may be null or short
-    on illiquid assets → length-guarded.
+    """Parse one HL asset ctx into the 10 seed floats (parse-or-drop contract):
+    legitimately-absent fields → None (SQL NULL); a present-but-malformed field →
+    `_CtxParseError` (the caller drops the asset). `impactPxs` is a `[bid, ask]` list,
+    but may be null or short on illiquid assets → None-guarded; a present non-list
+    `impactPxs` is malformed → `_CtxParseError`.
     """
-    ip = ctx.get("impactPxs") or []
+    ip = ctx.get("impactPxs")
+    if ip is None:
+        ip = []
+    elif not isinstance(ip, list):
+        raise _CtxParseError(f"impactPxs not a list ({type(ip).__name__})")
     return {
         "funding": _to_float(ctx.get("funding"), "funding"),
         "open_interest": _to_float(ctx.get("openInterest"), "openInterest"),
