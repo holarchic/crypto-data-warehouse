@@ -16,6 +16,7 @@ import logging
 import math
 import time
 import urllib.request
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from backoff import RETRIABLE_EXCEPTIONS
 from config import OI_LOOP, ExchangeConfig
@@ -512,31 +513,59 @@ def _binance_dense_set(funding_rates, active, now, window_s, prev_next_ft, settl
     return dense
 
 
-def _binance_dense_fetch(exchange, exchange_name, rate_limiter, dense_pairs, funding_rates, now_ts, thread_name):
-    """Instantaneous OI (main weight pool) for each dense symbol; USD = oi × markPx (from
-    the same premiumIndex bulk). Per-symbol error tolerance — one bad symbol never aborts."""
+def _dense_row(oi_data, pair, exchange_name, funding_rates, now_ts):
+    """Build one dense OI row from a fetch_open_interest result, or None if empty.
+    Pure — runs in a worker thread, mutates nothing shared (reads read-only funding_rates)."""
+    if oi_data is None:
+        return None
+    oi_amt = oi_data.get("openInterestAmount")
+    mark = (funding_rates.get(pair["symbol"]) or {}).get("markPrice")
+    oi_usd = oi_amt * mark if oi_amt is not None and mark is not None else None
+    return {
+        "exchange": exchange_name, "asset_id": pair["asset_id"], "symbol": pair["symbol"],
+        "timestamp": now_ts, "open_interest": oi_amt, "oi_value_usd": oi_usd,
+    }
+
+
+def _binance_dense_fetch(exchange, exchange_name, rate_limiter, dense_pairs, funding_rates,
+                         now_ts, thread_name, concurrency):
+    """Instantaneous OI (main weight pool) for each dense symbol; USD = oi × markPx.
+
+    Binance has no bulk instantaneous OI, so this is N per-symbol calls. At a mass settlement
+    (~541 symbols) a sequential loop overruns the 60 s tick (~140 s), diluting dense cadence
+    to ~3 min — so the fetches run on a bounded `ThreadPoolExecutor` (concurrency=K). Each
+    worker fetches+parses and RETURNS its row; only this (main) thread appends to `rows`, so
+    `rows` has a single writer. Per-symbol errors are isolated at `fut.result()`. Concurrent
+    public GETs on the shared ccxt `exchange` reuse the established timeframe-thread pattern
+    (not a requests.Session thread-safety guarantee — `oi_dense_concurrency=1` is the rollback
+    on any transport/header anomaly). Weight total is unchanged, only compressed in time; the
+    header-synced limiter caps in-flight weight (no fairness → candle freshness is the gate)."""
+    if not dense_pairs:
+        return []
+
+    def _fetch_one(pair):
+        # weight/header sync via paced_call; the limiter is lock-guarded and safe to call
+        # concurrently. Its header read is best-effort under concurrency (safety-margin-absorbed).
+        oi_data = paced_call(
+            rate_limiter, exchange, BINANCE_OI_WEIGHT, exchange.fetch_open_interest, pair["symbol"],
+        )
+        return _dense_row(oi_data, pair, exchange_name, funding_rates, now_ts)
+
     rows = []
-    for pair in dense_pairs:
-        sym = pair["symbol"]
-        try:
-            oi_data = paced_call(
-                rate_limiter, exchange, BINANCE_OI_WEIGHT, exchange.fetch_open_interest, sym,
-            )
-        except RETRIABLE_EXCEPTIONS as exc:
-            log.warning("[%s] Retriable error on dense %s: %s", thread_name, sym, exc)
-            continue
-        except Exception as exc:
-            log.warning("[%s] Error on dense %s: %s", thread_name, sym, exc)
-            continue
-        if oi_data is None:
-            continue
-        oi_amt = oi_data.get("openInterestAmount")
-        mark = (funding_rates.get(sym) or {}).get("markPrice")
-        oi_usd = oi_amt * mark if oi_amt is not None and mark is not None else None
-        rows.append({
-            "exchange": exchange_name, "asset_id": pair["asset_id"], "symbol": sym,
-            "timestamp": now_ts, "open_interest": oi_amt, "oi_value_usd": oi_usd,
-        })
+    with ThreadPoolExecutor(max_workers=max(1, concurrency)) as pool:
+        futures = {pool.submit(_fetch_one, p): p for p in dense_pairs}
+        for fut in as_completed(futures):
+            sym = futures[fut]["symbol"]
+            try:
+                row = fut.result()
+            except RETRIABLE_EXCEPTIONS as exc:
+                log.warning("[%s] Retriable error on dense %s: %s", thread_name, sym, exc)
+                continue
+            except Exception as exc:
+                log.warning("[%s] Error on dense %s: %s", thread_name, sym, exc)
+                continue
+            if row is not None:
+                rows.append(row)
     return rows
 
 
@@ -660,6 +689,7 @@ def _oi_loop_binance(exchange, config: ExchangeConfig, dsn: str, rate_limiter: R
         )
         dense_rows = _binance_dense_fetch(
             exchange, config.name, rate_limiter, dense, funding_rates, now, thread_name,
+            config.oi_dense_concurrency,
         )
         try:
             dense_inserted = _insert_oi(conn, dense_rows)

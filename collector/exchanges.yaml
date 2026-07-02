@@ -67,6 +67,7 @@ exchanges:
     oi_poll_interval_s: 60
     oi_settlement_window_s: 900
     oi_baseline_interval_s: 1800
+    oi_dense_concurrency: 6          # parallel per-symbol dense fetch (mass settlement ~541 syms)
     supported_timeframes:
       - 5m
       - 15m
