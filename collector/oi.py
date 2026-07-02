@@ -48,31 +48,32 @@ OI_POLL_BUFFER_S = 30
 HL_OI_POLL_INTERVAL_S = 60  # HyperLiquid: 1-min (T-007.1, matches the Grade-B seed cadence)
 
 
+class _CtxParseError(ValueError):
+    """A present HL ctx field was non-numeric / NaN — the asset's snapshot is
+    untrustworthy, so the caller drops that asset for the cycle (parse-or-drop)."""
+
+
 def _to_float(x, field=None):
-    """Parse a HL ctx field to float, or None.
+    """Parse a HL ctx field, distinguishing absent from malformed (parse, don't validate):
 
-    Two distinct None cases, deliberately different:
-    - **Legitimately absent** (None / "") → None, quietly. HL omits premium/midPx/
-      impactPxs on illiquid assets; that is normal, not corruption.
-    - **Present but unparseable / NaN** → None, but log a WARNING — this signals HL
-      schema drift or a corrupt payload, which would otherwise vanish into a silent
-      NULL. We do NOT abort the whole cycle on one bad field (the seed producer,
-      fetch_hl_asset_ctxs.py, skips malformed rows too): a bulk all-asset feed must
-      not blind every asset's OI during a cascade over one asset's bad field.
+    - **Legitimately absent** (None / "") → None. HL omits premium/midPx/impactPxs on
+      illiquid assets; that is normal — stored as SQL NULL (the parquet export converts
+      NULL→NaN to match the seed).
+    - **Present but non-numeric / NaN** → raise `_CtxParseError`. This is HL schema drift
+      or a corrupt payload; the caller (`_build_hl_snapshots`) drops that asset's rows so
+      garbage never lands as a normal snapshot, and cannot be confused with an omitted
+      field. Matches the seed producer (fetch_hl_asset_ctxs.py) skipping malformed rows.
 
-    NaN → None enforces the SQL-NULL contract (the parquet export converts NULL→NaN;
-    a stored NaN would break it). 0.0 is preserved — zero OI/funding is valid.
+    0.0 is preserved — zero OI/funding is valid, so no `or`-coalescing.
     """
     if x is None or x == "":
         return None
     try:
         v = float(x)
     except (TypeError, ValueError):
-        log.warning("[oi] HL ctx field %s unparseable (%r) → NULL", field or "?", x)
-        return None
+        raise _CtxParseError(f"{field or '?'}={x!r} not numeric") from None
     if math.isnan(v):
-        log.warning("[oi] HL ctx field %s is NaN → NULL", field or "?")
-        return None
+        raise _CtxParseError(f"{field or '?'} is NaN")
     return v
 
 
@@ -297,12 +298,20 @@ def _build_hl_snapshots(universe, asset_ctxs, asset_to_pair, exchange, now_ts):
 
     oi_rows = []
     ctx_rows = []
+    dropped = []
     for meta, ctx in zip(universe, asset_ctxs):
         pair = asset_to_pair.get(meta.get("name", ""))
         if pair is None:
             continue
 
-        bundle = _parse_hl_ctx(ctx)
+        # Parse-or-drop: a malformed present field means the whole snapshot is
+        # untrustworthy → skip this asset (don't land garbage as a normal row).
+        try:
+            bundle = _parse_hl_ctx(ctx)
+        except _CtxParseError as exc:
+            dropped.append(f"{meta.get('name', '?')}({exc})")
+            continue
+
         oi_val = bundle["open_interest"]
         mark_val = bundle["mark_px"]
         oi_value_usd = oi_val * mark_val if oi_val is not None and mark_val is not None else None
@@ -321,6 +330,9 @@ def _build_hl_snapshots(universe, asset_ctxs, asset_to_pair, exchange, now_ts):
             "timestamp": now_ts,
             **bundle,
         })
+
+    if dropped:  # one log at the cycle boundary, not per-field in the hot loop
+        log.warning("[oi] Dropped %d HL asset(s) with malformed ctx: %s", len(dropped), dropped[:10])
     return oi_rows, ctx_rows
 
 
