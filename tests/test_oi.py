@@ -288,7 +288,8 @@ def _drive_one_cycle(monkeypatch, conn, universe, ctxs, pairs):
 
     monkeypatch.setattr(oi, "_sleep_until_next", stop)
     monkeypatch.setattr(oi.time, "time", lambda: 1_700_000_000.0)
-    cfg = SimpleNamespace(name="hyperliquid", market_type="perp", ccxt_class="hyperliquid")
+    cfg = SimpleNamespace(name="hyperliquid", market_type="perp", ccxt_class="hyperliquid",
+                          oi_poll_interval_s=60)
     try:
         oi._oi_loop_hyperliquid(cfg, "dsn")
     except _StopLoop:
@@ -346,3 +347,61 @@ def test_zip_mismatch_aborts_cycle(monkeypatch):
     assert conn.executed == []
     assert conn.commits == 0
     assert hb["n"] == 1  # heartbeat (liveness) still fired
+
+
+# --- Slice D: Bybit/OKX bulk parse (T-007.2) ---------------------------------
+
+
+def _bulk_active():
+    return {
+        "BTC/USDT:USDT": {"asset_id": "BTC", "symbol": "BTC/USDT:USDT"},
+        "ETH/USDT:USDT": {"asset_id": "ETH", "symbol": "ETH/USDT:USDT"},
+    }
+
+
+def test_parse_bulk_oi_bybit_reads_info_and_skips_inactive():
+    # OI is only in ticker["info"], not the unified ticker. USD is native.
+    tickers = {
+        "BTC/USDT:USDT": {"info": {"openInterest": "1000.5", "openInterestValue": "60000000"}},
+        "ETH/USDT:USDT": {"info": {"openInterest": "50.0", "openInterestValue": "150000"}},
+        "DOGE/USDT:USDT": {"info": {"openInterest": "9", "openInterestValue": "9"}},  # inactive
+    }
+    rows, dropped = oi._parse_bulk_oi_bybit(tickers, _bulk_active(), "bybit", 42.0)
+    assert dropped == []
+    by = {r["asset_id"]: r for r in rows}
+    assert set(by) == {"BTC", "ETH"}  # DOGE not active → skipped
+    assert by["BTC"]["open_interest"] == 1000.5
+    assert by["BTC"]["oi_value_usd"] == 60000000.0
+    assert by["BTC"]["timestamp"] == 42.0
+
+
+def test_parse_bulk_oi_bybit_absent_usd_is_none_malformed_dropped():
+    tickers = {
+        "BTC/USDT:USDT": {"info": {"openInterest": "5.0"}},              # no USD → None
+        "ETH/USDT:USDT": {"info": {"openInterest": "not-a-number"}},     # malformed → drop
+    }
+    rows, dropped = oi._parse_bulk_oi_bybit(tickers, _bulk_active(), "bybit", 1.0)
+    assert [r["asset_id"] for r in rows] == ["BTC"]
+    assert rows[0]["oi_value_usd"] is None
+    assert len(dropped) == 1 and "ETH" in dropped[0]
+
+
+def test_parse_bulk_oi_okx_usd_from_price_map():
+    # OKX bulk has no oiUsd → compute from price map (amount × last).
+    ois = {
+        "BTC/USDT:USDT": {"openInterestAmount": 100.0, "openInterestValue": None},
+        "ETH/USDT:USDT": {"openInterestAmount": 20.0, "openInterestValue": None},
+    }
+    price_map = {"BTC/USDT:USDT": 60000.0}  # ETH price missing → USD None
+    rows = oi._parse_bulk_oi_okx(ois, price_map, _bulk_active(), "okx", 7.0)
+    by = {r["asset_id"]: r for r in rows}
+    assert by["BTC"]["oi_value_usd"] == 100.0 * 60000.0
+    assert by["ETH"]["oi_value_usd"] is None
+    assert by["ETH"]["open_interest"] == 20.0
+
+
+def test_parse_bulk_oi_okx_native_value_preferred():
+    # If ccxt ever populates openInterestValue, use it (don't recompute).
+    ois = {"BTC/USDT:USDT": {"openInterestAmount": 100.0, "openInterestValue": 123.0}}
+    rows = oi._parse_bulk_oi_okx(ois, {"BTC/USDT:USDT": 999.0}, _bulk_active(), "okx", 1.0)
+    assert rows[0]["oi_value_usd"] == 123.0
