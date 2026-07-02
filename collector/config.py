@@ -49,6 +49,10 @@ class ExchangeConfig:
     oi_poll_interval_s: int = 300
     oi_settlement_window_s: int = 900
     oi_baseline_interval_s: int = 1800
+    # Binance-dense-only (T-007.4): concurrent workers for the per-symbol dense fetch, so a
+    # mass settlement (~541 symbols) stays under the tick instead of ~140s sequential. Set 1
+    # to fall back to sequential (rollback for any shared-session anomaly).
+    oi_dense_concurrency: int = 6
 
 
 def _load_yaml():
@@ -81,6 +85,7 @@ def _parse_exchange(exchange_name: str, ex: dict, tf_defs: dict) -> ExchangeConf
         oi_poll_interval_s=ex.get("oi_poll_interval_s", 300),
         oi_settlement_window_s=ex.get("oi_settlement_window_s", 900),
         oi_baseline_interval_s=ex.get("oi_baseline_interval_s", 1800),
+        oi_dense_concurrency=ex.get("oi_dense_concurrency", 6),
     )
 
 

@@ -71,8 +71,12 @@ class WeightRateLimiter:
     - On `update_from_response`: read server's used-weight header (case
       insensitive), set `_used` to it, release the per-request reservation.
 
-    The server header is authoritative — it reflects the IP's actual budget use
-    across this and any other process sharing the IP, so it can't drift.
+    The server header is the source of truth for cross-process budget use — it
+    reflects the IP's actual usage across this and any other process sharing the
+    IP. Under concurrent callers on one exchange instance the read is best-effort
+    (`last_response_headers` is an exchange-global slot, so a release may sync
+    `_used` from a peer's or a failed call's headers); this is usually conservative
+    for a short burst, and the `safety` margin absorbs the slack.
     """
 
     DEFAULT_HEADER = "x-mbx-used-weight-1m"

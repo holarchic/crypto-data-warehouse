@@ -58,10 +58,11 @@ def test_oi_cadence_knobs_per_exchange():
     assert load_config("binance").oi_poll_interval_s == 60
     assert load_config("bybit").oi_poll_interval_s == 30
     assert load_config("okx").oi_poll_interval_s == 30
-    # Binance ±15m window + ~30m baseline refresh.
+    # Binance ±15m window + ~30m baseline refresh + dense parallelism.
     binance = load_config("binance")
     assert binance.oi_settlement_window_s == 900
     assert binance.oi_baseline_interval_s == 1800
+    assert binance.oi_dense_concurrency == 6
 
 
 def test_oi_cadence_defaults_for_non_oi_exchange():
@@ -70,6 +71,7 @@ def test_oi_cadence_defaults_for_non_oi_exchange():
     assert cfg.oi_poll_interval_s == 300
     assert cfg.oi_settlement_window_s == 900
     assert cfg.oi_baseline_interval_s == 1800
+    assert cfg.oi_dense_concurrency == 6
 
 
 # --- load_discovery_config ---

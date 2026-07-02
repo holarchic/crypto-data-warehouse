@@ -481,10 +481,11 @@ def test_baseline_batch_size():
 
 
 class _FakeExchange:
-    def __init__(self, hist=None, oi_by_symbol=None, raise_hist=None):
+    def __init__(self, hist=None, oi_by_symbol=None, raise_hist=None, raise_oi=None):
         self._hist = hist or {}
         self._oi = oi_by_symbol or {}
         self._raise_hist = raise_hist
+        self._raise_oi = raise_oi or set()
         self.last_response_headers = None
 
     def fetch_open_interest_history(self, symbol, timeframe, since, limit):
@@ -493,12 +494,18 @@ class _FakeExchange:
         return self._hist.get(symbol, [])
 
     def fetch_open_interest(self, symbol):
+        if symbol in self._raise_oi:
+            raise RuntimeError("oi boom")
         return self._oi.get(symbol)
 
 
 def _patch_paced_and_sleep(monkeypatch):
     monkeypatch.setattr(oi, "paced_call", lambda rl, ex, w, fn, *a, **k: fn(*a, **k))
     monkeypatch.setattr(oi.time, "sleep", lambda s: None)
+    # conftest stubs `backoff`, so oi.RETRIABLE_EXCEPTIONS is a MagicMock (uncatchable).
+    # Install a real tuple so `except RETRIABLE_EXCEPTIONS` is valid; a raised RuntimeError
+    # then falls to the generic `except Exception` skip path.
+    monkeypatch.setattr(oi, "RETRIABLE_EXCEPTIONS", (ConnectionError,))
 
 
 def test_baseline_sweep_advances_cursor_after_commit(monkeypatch):
@@ -559,10 +566,44 @@ def test_dense_fetch_usd_from_markpx_and_skips_errors(monkeypatch):
         {"asset_id": "ETH", "symbol": "ETH/USDT:USDT"},
     ]
     fr = {"BTC/USDT:USDT": _fr(NOW, mark=60000.0), "ETH/USDT:USDT": _fr(NOW)}  # ETH has no mark
-    rows = oi._binance_dense_fetch(ex, "binance", None, dense_pairs, fr, NOW, "binance/oi")
+    rows = oi._binance_dense_fetch(ex, "binance", None, dense_pairs, fr, NOW, "binance/oi", 4)
     by = {r["asset_id"]: r for r in rows}
     assert by["BTC"]["oi_value_usd"] == 100.0 * 60000.0
     assert by["ETH"]["oi_value_usd"] is None  # no markPrice → None (not a crash)
+
+
+def test_dense_fetch_error_isolation_under_pool(monkeypatch):
+    # One symbol's fetch raises → skipped; every other symbol still lands, regardless of
+    # completion order (per-symbol isolation at fut.result()).
+    _patch_paced_and_sleep(monkeypatch)
+    syms = [f"C{i}/USDT:USDT" for i in range(20)]
+    ex = _FakeExchange(
+        oi_by_symbol={s: {"openInterestAmount": float(i)} for i, s in enumerate(syms)},
+        raise_oi={"C7/USDT:USDT"},
+    )
+    dense_pairs = [{"asset_id": f"C{i}", "symbol": s} for i, s in enumerate(syms)]
+    fr = {s: _fr(NOW, mark=2.0) for s in syms}
+    rows = oi._binance_dense_fetch(ex, "binance", None, dense_pairs, fr, NOW, "binance/oi", 6)
+    landed = {r["symbol"] for r in rows}
+    assert "C7/USDT:USDT" not in landed          # the failing symbol skipped
+    assert landed == set(syms) - {"C7/USDT:USDT"}  # all 19 others landed
+
+
+def test_dense_fetch_concurrency_1_matches_sequential(monkeypatch):
+    # concurrency=1 serializes → completion order == submission order == the old sequential
+    # loop (exact behavioral rollback).
+    _patch_paced_and_sleep(monkeypatch)
+    syms = [f"C{i}/USDT:USDT" for i in range(5)]
+    ex = _FakeExchange(oi_by_symbol={s: {"openInterestAmount": float(i)} for i, s in enumerate(syms)})
+    dense_pairs = [{"asset_id": f"C{i}", "symbol": s} for i, s in enumerate(syms)]
+    fr = {s: _fr(NOW, mark=1.0) for s in syms}
+    rows = oi._binance_dense_fetch(ex, "binance", None, dense_pairs, fr, NOW, "binance/oi", 1)
+    assert [r["symbol"] for r in rows] == syms  # order preserved at concurrency=1
+
+
+def test_dense_fetch_empty_set_returns_empty(monkeypatch):
+    _patch_paced_and_sleep(monkeypatch)
+    assert oi._binance_dense_fetch(_FakeExchange(), "binance", None, [], {}, NOW, "binance/oi", 6) == []
 
 
 def test_oi_loop_raises_on_unknown_oi_venue():
@@ -601,7 +642,8 @@ def test_binance_loop_skips_baseline_when_seed_fails(monkeypatch):
     monkeypatch.setattr(oi, "_sleep_until_next", stop)
     ex = SimpleNamespace(fetch_funding_rates=lambda: {}, last_response_headers=None)
     cfg = SimpleNamespace(name="binance", market_type="perp", ccxt_class="binanceusdm",
-                          oi_poll_interval_s=60, oi_settlement_window_s=900, oi_baseline_interval_s=1800)
+                          oi_poll_interval_s=60, oi_settlement_window_s=900,
+                          oi_baseline_interval_s=1800, oi_dense_concurrency=6)
     try:
         oi._oi_loop_binance(ex, cfg, "dsn", None)
     except _StopLoop:
