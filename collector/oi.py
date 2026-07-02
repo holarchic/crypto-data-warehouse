@@ -310,16 +310,22 @@ def _build_hl_snapshots(universe, asset_ctxs, asset_to_pair, exchange, now_ts):
     ctx_rows = []
     dropped = []
     for meta, ctx in zip(universe, asset_ctxs):
-        pair = asset_to_pair.get(meta.get("name", ""))
-        if pair is None:
-            continue
-
-        # Parse-or-drop: a malformed present field means the whole snapshot is
-        # untrustworthy → skip this asset (don't land garbage as a normal row).
+        # Parse-or-drop: any malformed present datum (bad field, wrong-container
+        # impactPxs, or a non-dict meta/ctx) means the snapshot is untrustworthy →
+        # skip this asset. Row-container drift is drained here per-asset too, so it
+        # can't escape as a raw exception that aborts the whole cycle.
         try:
+            if not isinstance(meta, dict) or not isinstance(ctx, dict):
+                raise _CtxParseError(
+                    f"non-dict meta/ctx ({type(meta).__name__}/{type(ctx).__name__})"
+                )
+            pair = asset_to_pair.get(meta.get("name", ""))
+            if pair is None:
+                continue  # not an active pair — not malformed, just not collected
             bundle = _parse_hl_ctx(ctx)
         except _CtxParseError as exc:
-            dropped.append(f"{meta.get('name', '?')}({exc})")
+            name = meta.get("name", "?") if isinstance(meta, dict) else "?"
+            dropped.append(f"{name}({exc})")
             continue
 
         oi_val = bundle["open_interest"]
