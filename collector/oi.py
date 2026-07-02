@@ -20,6 +20,9 @@ import urllib.request
 from backoff import RETRIABLE_EXCEPTIONS
 from config import OI_LOOP, ExchangeConfig
 from rate_limiter import (
+    BINANCE_FUNDING_BULK_WEIGHT,
+    BINANCE_OI_HIST_SPACING_S,
+    BINANCE_OI_HIST_WEIGHT,
     BINANCE_OI_WEIGHT,
     BINANCE_TICKERS_BULK_WEIGHT,
     RateLimiter,
@@ -50,8 +53,22 @@ INSERT_HL_CTX_SQL = """
     ON CONFLICT DO NOTHING
 """
 
-OI_POLL_INTERVAL_S = 300  # 5-min default (Binance baseline path; overridden per-exchange)
+# Binance baseline cursor seed: the last *baseline* (5-min-aligned) OI timestamp per
+# symbol. open_interest mixes dense (arbitrary `now`) rows with 5-min baseline rows, so
+# raw MAX(timestamp) would seed from a newer dense ts and permanently skip missing 5-min
+# points on restart. Baseline rows land on exact 5-min marks (epoch % 300 == 0, zero
+# sub-second); dense rows carry sub-second fractions, so ::numeric %% 300 = 0 isolates
+# baseline rows only. (%% is a literal % in a psycopg param string.)
+SEED_BASELINE_CURSOR_SQL = """
+    SELECT symbol, EXTRACT(EPOCH FROM MAX(timestamp)) AS ts
+    FROM open_interest
+    WHERE exchange = %(exchange)s
+      AND EXTRACT(EPOCH FROM timestamp)::numeric %% 300 = 0
+    GROUP BY symbol
+"""
+
 OI_POLL_BUFFER_S = 30
+BASELINE_HIST_LIMIT = 500  # openInterestHist max page; since-based, so paged catch-up
 
 
 class _CtxParseError(ValueError):
@@ -132,11 +149,6 @@ def _sleep_until_next(interval_s, buffer_s):
     time.sleep(sleep_s)
 
 
-def _sleep_until_next_5m():
-    """Sleep until next 5-minute boundary + buffer (ccxt OI path)."""
-    _sleep_until_next(OI_POLL_INTERVAL_S, OI_POLL_BUFFER_S)
-
-
 def _heartbeat(conn, config: ExchangeConfig, thread_name: str):
     """Write the per-loop liveness heartbeat, guarded so a write hiccup can't kill
     the loop (it reconnects next cycle via the `if conn.closed` guard).
@@ -154,12 +166,13 @@ def _heartbeat(conn, config: ExchangeConfig, thread_name: str):
 
 
 # ---------------------------------------------------------------------------
-# Strategy A — ccxt per-symbol (Binance, Bybit, OKX)
+# Shared helper
 # ---------------------------------------------------------------------------
 
 
 def _fetch_price_map(exchange, rate_limiter):
-    """Bulk fetch_tickers() → {symbol: last_price}. One API call."""
+    """Bulk fetch_tickers() → {symbol: last_price}. One API call. Used by the OKX bulk
+    path (its `/public/open-interest` omits USD) to compute oi_value_usd."""
     try:
         tickers = paced_call(
             rate_limiter, exchange, BINANCE_TICKERS_BULK_WEIGHT,
@@ -169,90 +182,6 @@ def _fetch_price_map(exchange, rate_limiter):
     except Exception as exc:
         log.warning("[oi] fetch_tickers failed (oi_value_usd will be None): %s", exc)
         return {}
-
-
-def _oi_loop_ccxt(exchange, config: ExchangeConfig, dsn: str, rate_limiter: RateLimiter):
-    """Per-symbol fetch_open_interest() for ccxt exchanges."""
-    thread_name = f"{config.name}/oi"
-    conn = connect_db(dsn)
-
-    while True:
-        # Reconnect if needed
-        if conn.closed:
-            try:
-                conn = connect_db(dsn)
-            except RuntimeError:
-                log.error("[%s] DB reconnect failed, will retry next cycle", thread_name)
-                time.sleep(30)
-                continue
-
-        # Get active pairs
-        try:
-            pairs = _get_active_pairs(conn, config.name)
-        except Exception:
-            log.exception("[%s] Failed to query active pairs", thread_name)
-            conn.rollback()
-            _sleep_until_next_5m()
-            continue
-
-        if not pairs:
-            log.info("[%s] No active pairs, sleeping", thread_name)
-            _heartbeat(conn, config, thread_name)
-            _sleep_until_next_5m()
-            continue
-
-        # Bulk price map for computing oi_value_usd when ccxt doesn't return it
-        price_map = _fetch_price_map(exchange, rate_limiter)
-
-        rows = []
-        for pair in pairs:
-            try:
-                oi_data = paced_call(
-                    rate_limiter, exchange, BINANCE_OI_WEIGHT,
-                    exchange.fetch_open_interest, pair["symbol"],
-                )
-
-                if oi_data is None:
-                    continue
-
-                ts = oi_data.get("timestamp")
-                if ts is not None:
-                    ts = ts / 1000
-                else:
-                    ts = time.time()
-
-                oi_amount = oi_data.get("openInterestAmount")
-                oi_value = oi_data.get("openInterestValue")
-
-                # Compute oi_value_usd from price map if ccxt didn't return it
-                if oi_value is None and oi_amount is not None:
-                    price = price_map.get(pair["symbol"])
-                    if price is not None:
-                        oi_value = oi_amount * price
-
-                rows.append({
-                    "exchange": config.name,
-                    "asset_id": pair["asset_id"],
-                    "symbol": pair["symbol"],
-                    "timestamp": ts,
-                    "open_interest": oi_amount,
-                    "oi_value_usd": oi_value,
-                })
-            except RETRIABLE_EXCEPTIONS as exc:
-                log.warning("[%s] Retriable error on %s: %s", thread_name, pair["symbol"], exc)
-                if conn.closed:
-                    break
-                conn.rollback()
-            except Exception as exc:
-                log.warning("[%s] Error on %s: %s", thread_name, pair["symbol"], exc)
-                if not conn.closed:
-                    conn.rollback()
-
-        inserted = _insert_oi(conn, rows)
-        log.info("[%s] Poll: %d OI snapshots inserted (%d pairs)", thread_name, inserted, len(pairs))
-
-        _heartbeat(conn, config, thread_name)
-        _sleep_until_next_5m()
 
 
 # ---------------------------------------------------------------------------
@@ -522,6 +451,227 @@ def _oi_loop_bulk(exchange, config: ExchangeConfig, dsn: str, rate_limiter: Rate
 
 
 # ---------------------------------------------------------------------------
+# Strategy D — Binance two-source (baseline off-pool + dense main-pool)
+# ---------------------------------------------------------------------------
+
+
+def _seed_baseline_cursor(conn, exchange_name):
+    """Seed {symbol: last_baseline_ts_seconds} from the DB so a restart backfills the
+    gap. Isolates 5-min-aligned baseline rows from dense rows (see SEED_BASELINE_CURSOR_SQL).
+    Returns {} on empty DB (each symbol then starts from openInterestHist's default window)."""
+    with conn.cursor() as cur:
+        cur.execute(SEED_BASELINE_CURSOR_SQL, {"exchange": exchange_name})
+        return {sym: float(ts) for sym, ts in cur.fetchall() if ts is not None}
+
+
+def _baseline_batch_size(n_pairs, tick_s, interval_s):
+    """Symbols per tick so a full baseline sweep completes within `interval_s`:
+    ceil(n · tick / interval), at least 1. (Gap-freedom comes from `since`, not this rate.)"""
+    ticks_per_interval = max(1, interval_s // tick_s)
+    return max(1, math.ceil(n_pairs / ticks_per_interval))
+
+
+def _binance_dense_set(funding_rates, active, now, window_s, prev_next_ft, settlement_at):
+    """Partition active symbols into the dense (near-settlement) set, mutating the
+    cross-tick state dicts. A symbol is dense if it is within `window_s` BEFORE its next
+    settlement (`0 ≤ nextFundingTime − now ≤ window`) OR within `window_s` AFTER a
+    settlement just detected by `nextFundingTime` jumping vs the prior tick (the funding
+    interval isn't in the bulk premiumIndex, so change-detection stands in for it).
+    Restart blind spot: `prev_next_ft` empty ⇒ no post-window until the first jump."""
+    dense = []
+    for sym, pair in active.items():
+        fr = funding_rates.get(sym)
+        if fr is None:
+            continue
+        nft_ms = fr.get("fundingTimestamp")
+        if nft_ms is None:
+            continue
+        prev = prev_next_ft.get(sym)
+        if prev is not None and nft_ms != prev:
+            settlement_at[sym] = now  # nextFundingTime rolled ⇒ a settlement just occurred
+        prev_next_ft[sym] = nft_ms
+        time_to = nft_ms / 1000 - now
+        pre = 0 <= time_to <= window_s
+        sa = settlement_at.get(sym)
+        post = sa is not None and (now - sa) <= window_s
+        if pre or post:
+            dense.append(pair)
+    return dense
+
+
+def _binance_dense_fetch(exchange, exchange_name, rate_limiter, dense_pairs, funding_rates, now_ts, thread_name):
+    """Instantaneous OI (main weight pool) for each dense symbol; USD = oi × markPx (from
+    the same premiumIndex bulk). Per-symbol error tolerance — one bad symbol never aborts."""
+    rows = []
+    for pair in dense_pairs:
+        sym = pair["symbol"]
+        try:
+            oi_data = paced_call(
+                rate_limiter, exchange, BINANCE_OI_WEIGHT, exchange.fetch_open_interest, sym,
+            )
+        except RETRIABLE_EXCEPTIONS as exc:
+            log.warning("[%s] Retriable error on dense %s: %s", thread_name, sym, exc)
+            continue
+        except Exception as exc:
+            log.warning("[%s] Error on dense %s: %s", thread_name, sym, exc)
+            continue
+        if oi_data is None:
+            continue
+        oi_amt = oi_data.get("openInterestAmount")
+        mark = (funding_rates.get(sym) or {}).get("markPrice")
+        oi_usd = oi_amt * mark if oi_amt is not None and mark is not None else None
+        rows.append({
+            "exchange": exchange_name, "asset_id": pair["asset_id"], "symbol": sym,
+            "timestamp": now_ts, "open_interest": oi_amt, "oi_value_usd": oi_usd,
+        })
+    return rows
+
+
+def _binance_baseline_sweep(exchange, exchange_name, rate_limiter, conn, due_pairs,
+                            baseline_cursor, baseline_last_fetch, now, thread_name):
+    """openInterestHist (separate /futures/data bucket) per due symbol, `since`-based so a
+    gap backfills from the last stored baseline point. Self-paced by BINANCE_OI_HIST_SPACING_S
+    (weight 0 ⇒ no limiter pacing). Cursor advances to the max ts returned ONLY after a
+    successful commit — a fetch/insert failure leaves the cursor unadvanced (no gap)."""
+    inserted_total = 0
+    for pair in due_pairs:
+        sym = pair["symbol"]
+        cursor = baseline_cursor.get(sym)
+        since_ms = int(cursor * 1000) + 1 if cursor else None
+        try:
+            hist = paced_call(
+                rate_limiter, exchange, BINANCE_OI_HIST_WEIGHT,
+                exchange.fetch_open_interest_history, sym, "5m", since_ms, BASELINE_HIST_LIMIT,
+            )
+        except Exception as exc:
+            log.warning("[%s] Baseline fetch failed on %s: %s", thread_name, sym, exc)
+            time.sleep(BINANCE_OI_HIST_SPACING_S)
+            continue  # cursor unadvanced → retried next sweep, no gap
+
+        rows = []
+        max_ts = cursor or 0.0
+        for h in hist:
+            ts_ms = h.get("timestamp")
+            if ts_ms is None:
+                continue
+            ts_s = ts_ms / 1000
+            rows.append({
+                "exchange": exchange_name, "asset_id": pair["asset_id"], "symbol": sym,
+                "timestamp": ts_s, "open_interest": h.get("openInterestAmount"),
+                "oi_value_usd": h.get("openInterestValue"),
+            })
+            max_ts = max(max_ts, ts_s)
+
+        try:
+            inserted_total += _insert_oi(conn, rows)
+        except Exception as exc:
+            log.warning("[%s] Baseline insert failed on %s: %s", thread_name, sym, exc)
+            if not conn.closed:
+                conn.rollback()
+            time.sleep(BINANCE_OI_HIST_SPACING_S)
+            continue  # cursor unadvanced → no gap
+
+        baseline_last_fetch[sym] = now  # advance due-clock only after success
+        if rows:
+            baseline_cursor[sym] = max_ts  # advance cursor only after commit
+        time.sleep(BINANCE_OI_HIST_SPACING_S)
+    return inserted_total
+
+
+def _oi_loop_binance(exchange, config: ExchangeConfig, dsn: str, rate_limiter: RateLimiter):
+    """Binance two-source OI: a 5-min baseline via openInterestHist (separate weight
+    bucket) + sub-5-min dense openInterest for symbols within ±window of settlement."""
+    thread_name = f"{config.name}/oi"
+    conn = connect_db(dsn)
+    prev_next_ft: dict = {}      # symbol → last-seen nextFundingTime (ms), for change-detection
+    settlement_at: dict = {}     # symbol → monotonic-clock `now` of last detected settlement
+    baseline_cursor: dict = {}   # symbol → last baseline data ts (seconds)
+    baseline_last_fetch: dict = {}  # symbol → `now` of last baseline sweep (due-clock)
+    seeded = False
+
+    while True:
+        if conn.closed:
+            try:
+                conn = connect_db(dsn)
+            except RuntimeError:
+                log.error("[%s] DB reconnect failed, will retry next cycle", thread_name)
+                time.sleep(30)
+                continue
+
+        try:
+            pairs = _get_active_pairs(conn, config.name)
+        except Exception:
+            log.exception("[%s] Failed to query active pairs", thread_name)
+            conn.rollback()
+            _sleep_until_next(config.oi_poll_interval_s, OI_POLL_BUFFER_S)
+            continue
+
+        if not pairs:
+            log.info("[%s] No active pairs, sleeping", thread_name)
+            _heartbeat(conn, config, thread_name)
+            _sleep_until_next(config.oi_poll_interval_s, OI_POLL_BUFFER_S)
+            continue
+
+        if not seeded:
+            try:
+                baseline_cursor = _seed_baseline_cursor(conn, config.name)
+                log.info("[%s] Seeded baseline cursor for %d symbols", thread_name, len(baseline_cursor))
+            except Exception:
+                log.exception("[%s] Baseline cursor seed failed (start from default window)", thread_name)
+                if not conn.closed:
+                    conn.rollback()
+            seeded = True
+
+        active = {p["symbol"]: p for p in pairs}
+        now = time.time()
+        cycle_start = time.monotonic()
+
+        try:
+            funding_rates = paced_call(
+                rate_limiter, exchange, BINANCE_FUNDING_BULK_WEIGHT, exchange.fetch_funding_rates,
+            )
+        except Exception as exc:
+            log.warning("[%s] premiumIndex bulk failed, skipping cycle: %s", thread_name, exc)
+            if not conn.closed:
+                conn.rollback()
+            _heartbeat(conn, config, thread_name)
+            _sleep_until_next(config.oi_poll_interval_s, OI_POLL_BUFFER_S)
+            continue
+
+        dense = _binance_dense_set(
+            funding_rates, active, now, config.oi_settlement_window_s, prev_next_ft, settlement_at,
+        )
+        dense_rows = _binance_dense_fetch(
+            exchange, config.name, rate_limiter, dense, funding_rates, now, thread_name,
+        )
+        try:
+            dense_inserted = _insert_oi(conn, dense_rows)
+        except Exception as exc:
+            log.warning("[%s] Dense insert failed: %s", thread_name, exc)
+            if not conn.closed:
+                conn.rollback()
+            dense_inserted = 0
+
+        batch = _baseline_batch_size(len(pairs), config.oi_poll_interval_s, config.oi_baseline_interval_s)
+        due = [
+            p for p in pairs
+            if now - baseline_last_fetch.get(p["symbol"], 0) >= config.oi_baseline_interval_s
+        ][:batch]
+        base_inserted = _binance_baseline_sweep(
+            exchange, config.name, rate_limiter, conn, due,
+            baseline_cursor, baseline_last_fetch, now, thread_name,
+        )
+
+        cycle_s = time.monotonic() - cycle_start
+        log.info(
+            "[%s] Poll: dense=%d (set=%d) baseline=%d (due=%d) cycle_duration_s=%.1f",
+            thread_name, dense_inserted, len(dense), base_inserted, len(due), cycle_s,
+        )
+        _heartbeat(conn, config, thread_name)
+        _sleep_until_next(config.oi_poll_interval_s, OI_POLL_BUFFER_S)
+
+
+# ---------------------------------------------------------------------------
 # Entry point — dispatches to the right strategy
 # ---------------------------------------------------------------------------
 
@@ -533,5 +683,5 @@ def oi_loop(exchange, config: ExchangeConfig, dsn: str, rate_limiter: RateLimite
         _oi_loop_hyperliquid(config, dsn)
     elif config.name in ("bybit", "okx"):
         _oi_loop_bulk(exchange, config, dsn, rate_limiter)
-    else:  # binance (per-symbol two-source lands in chunk 3; interim per-symbol 5-min)
-        _oi_loop_ccxt(exchange, config, dsn, rate_limiter)
+    else:  # binance
+        _oi_loop_binance(exchange, config, dsn, rate_limiter)

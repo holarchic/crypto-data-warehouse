@@ -405,3 +405,157 @@ def test_parse_bulk_oi_okx_native_value_preferred():
     ois = {"BTC/USDT:USDT": {"openInterestAmount": 100.0, "openInterestValue": 123.0}}
     rows = oi._parse_bulk_oi_okx(ois, {"BTC/USDT:USDT": 999.0}, _bulk_active(), "okx", 1.0)
     assert rows[0]["oi_value_usd"] == 123.0
+
+
+# --- Slice E: Binance two-source (T-007.2) -----------------------------------
+
+NOW = 1_700_000_000.0
+WINDOW = 900
+
+
+def _fr(next_funding_s, mark=None):
+    """A ccxt funding-rate record: fundingTimestamp (ms), optional markPrice."""
+    r = {"fundingTimestamp": int(next_funding_s * 1000)}
+    if mark is not None:
+        r["markPrice"] = mark
+    return r
+
+
+def _binance_active():
+    return {
+        "BTC/USDT:USDT": {"asset_id": "BTC", "symbol": "BTC/USDT:USDT"},
+        "ETH/USDT:USDT": {"asset_id": "ETH", "symbol": "ETH/USDT:USDT"},
+        "XRP/USDT:USDT": {"asset_id": "XRP", "symbol": "XRP/USDT:USDT"},
+    }
+
+
+def test_dense_set_pre_window_and_out_of_window():
+    active = _binance_active()
+    fr = {
+        "BTC/USDT:USDT": _fr(NOW + 600),    # 10 min out → in ±15m pre-window
+        "ETH/USDT:USDT": _fr(NOW + WINDOW),  # exactly 15m → boundary, included (<=)
+        "XRP/USDT:USDT": _fr(NOW + 5000),   # far out → not dense
+    }
+    prev, sett = {}, {}
+    dense = oi._binance_dense_set(fr, active, NOW, WINDOW, prev, sett)
+    assert {p["asset_id"] for p in dense} == {"BTC", "ETH"}
+    # state populated for all seen symbols (enables next-tick change-detection)
+    assert set(prev) == set(active)
+
+
+def test_dense_set_post_window_via_change_detection():
+    active = {"BTC/USDT:USDT": {"asset_id": "BTC", "symbol": "BTC/USDT:USDT"}}
+    # nextFundingTime far future (pre-window false), but it JUST changed vs prior tick →
+    # a settlement occurred → post-window keeps it dense.
+    prev = {"BTC/USDT:USDT": int((NOW - 100) * 1000)}  # old next-funding
+    sett = {}
+    fr = {"BTC/USDT:USDT": _fr(NOW + 28800)}  # rolled to +8h
+    dense = oi._binance_dense_set(fr, active, NOW, WINDOW, prev, sett)
+    assert [p["asset_id"] for p in dense] == ["BTC"]
+    assert sett["BTC/USDT:USDT"] == NOW  # settlement stamped
+
+
+def test_dense_set_first_tick_no_post_window():
+    # Empty prev (restart): a far-future settlement is NOT dense (post can't fire yet).
+    active = {"BTC/USDT:USDT": {"asset_id": "BTC", "symbol": "BTC/USDT:USDT"}}
+    fr = {"BTC/USDT:USDT": _fr(NOW + 28800)}
+    dense = oi._binance_dense_set(fr, active, NOW, WINDOW, {}, {})
+    assert dense == []
+
+
+def test_baseline_batch_size():
+    assert oi._baseline_batch_size(700, 60, 1800) == 24   # ceil(700/30)
+    assert oi._baseline_batch_size(5, 60, 1800) == 1       # small set → 1
+    assert oi._baseline_batch_size(700, 120, 60) == 700    # tick>interval → 1 tick sweep
+
+
+class _FakeExchange:
+    def __init__(self, hist=None, oi_by_symbol=None, raise_hist=None):
+        self._hist = hist or {}
+        self._oi = oi_by_symbol or {}
+        self._raise_hist = raise_hist
+        self.last_response_headers = None
+
+    def fetch_open_interest_history(self, symbol, timeframe, since, limit):
+        if self._raise_hist and symbol in self._raise_hist:
+            raise RuntimeError("hist boom")
+        return self._hist.get(symbol, [])
+
+    def fetch_open_interest(self, symbol):
+        return self._oi.get(symbol)
+
+
+def _patch_paced_and_sleep(monkeypatch):
+    monkeypatch.setattr(oi, "paced_call", lambda rl, ex, w, fn, *a, **k: fn(*a, **k))
+    monkeypatch.setattr(oi.time, "sleep", lambda s: None)
+
+
+def test_baseline_sweep_advances_cursor_after_commit(monkeypatch):
+    _patch_paced_and_sleep(monkeypatch)
+    ex = _FakeExchange(hist={"BTC/USDT:USDT": [
+        {"timestamp": 1_700_000_300_000, "openInterestAmount": 10.0, "openInterestValue": 100.0},
+        {"timestamp": 1_700_000_600_000, "openInterestAmount": 11.0, "openInterestValue": 110.0},
+    ]})
+    conn = FakeConn()
+    cursor, last_fetch = {}, {}
+    due = [{"asset_id": "BTC", "symbol": "BTC/USDT:USDT"}]
+    n = oi._binance_baseline_sweep(ex, "binance", None, conn, due, cursor, last_fetch, NOW, "binance/oi")
+    assert n == 2
+    assert cursor["BTC/USDT:USDT"] == 1_700_000_600.0  # advanced to max ts (seconds)
+    assert last_fetch["BTC/USDT:USDT"] == NOW
+    # native USD carried through (openInterestValue), rows hit open_interest
+    oi_rows = _rows_for(conn, "INTO open_interest")
+    assert oi_rows[0]["oi_value_usd"] == 100.0
+
+
+def test_baseline_sweep_since_from_cursor(monkeypatch):
+    _patch_paced_and_sleep(monkeypatch)
+    seen = {}
+
+    class _Ex(_FakeExchange):
+        def fetch_open_interest_history(self, symbol, timeframe, since, limit):
+            seen["since"] = since
+            return []
+
+    conn = FakeConn()
+    cursor = {"BTC/USDT:USDT": 1_700_000_600.0}
+    oi._binance_baseline_sweep(_Ex(), "binance", None, conn, [{"asset_id": "BTC", "symbol": "BTC/USDT:USDT"}],
+                               cursor, {}, NOW, "binance/oi")
+    assert seen["since"] == 1_700_000_600_000 + 1  # cursor(s)→ms + 1
+
+
+def test_baseline_sweep_fetch_error_leaves_cursor_unadvanced(monkeypatch):
+    _patch_paced_and_sleep(monkeypatch)
+    ex = _FakeExchange(raise_hist={"BTC/USDT:USDT"})
+    conn = FakeConn()
+    cursor = {"BTC/USDT:USDT": 500.0}
+    last_fetch = {}
+    n = oi._binance_baseline_sweep(ex, "binance", None, conn, [{"asset_id": "BTC", "symbol": "BTC/USDT:USDT"}],
+                                   cursor, last_fetch, NOW, "binance/oi")
+    assert n == 0
+    assert cursor["BTC/USDT:USDT"] == 500.0        # unchanged → no gap
+    assert "BTC/USDT:USDT" not in last_fetch        # stays due → retried next sweep
+
+
+def test_dense_fetch_usd_from_markpx_and_skips_errors(monkeypatch):
+    _patch_paced_and_sleep(monkeypatch)
+    ex = _FakeExchange(oi_by_symbol={
+        "BTC/USDT:USDT": {"openInterestAmount": 100.0},
+        "ETH/USDT:USDT": {"openInterestAmount": 50.0},
+    })
+    dense_pairs = [
+        {"asset_id": "BTC", "symbol": "BTC/USDT:USDT"},
+        {"asset_id": "ETH", "symbol": "ETH/USDT:USDT"},
+    ]
+    fr = {"BTC/USDT:USDT": _fr(NOW, mark=60000.0), "ETH/USDT:USDT": _fr(NOW)}  # ETH has no mark
+    rows = oi._binance_dense_fetch(ex, "binance", None, dense_pairs, fr, NOW, "binance/oi")
+    by = {r["asset_id"]: r for r in rows}
+    assert by["BTC"]["oi_value_usd"] == 100.0 * 60000.0
+    assert by["ETH"]["oi_value_usd"] is None  # no markPrice → None (not a crash)
+
+
+def test_seed_baseline_cursor_sql_isolates_aligned_rows():
+    # Regression guard (codex-r2 HIGH): the seed query must filter to 5-min-aligned rows
+    # so dense now-rows can't poison the cursor.
+    assert "% 300 = 0" in oi.SEED_BASELINE_CURSOR_SQL.replace("%%", "%")
+    assert "EXTRACT(EPOCH FROM timestamp)::numeric" in oi.SEED_BASELINE_CURSOR_SQL
