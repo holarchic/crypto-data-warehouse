@@ -593,7 +593,7 @@ def _oi_loop_binance(exchange, config: ExchangeConfig, dsn: str, rate_limiter: R
     thread_name = f"{config.name}/oi"
     conn = connect_db(dsn)
     prev_next_ft: dict = {}      # symbol → last-seen nextFundingTime (ms), for change-detection
-    settlement_at: dict = {}     # symbol → monotonic-clock `now` of last detected settlement
+    settlement_at: dict = {}     # symbol → wall-clock time.time() of last detected settlement
     baseline_cursor: dict = {}   # symbol → last baseline data ts (seconds)
     baseline_last_fetch: dict = {}  # symbol → `now` of last baseline sweep (due-clock)
     seeded = False
@@ -665,15 +665,20 @@ def _oi_loop_binance(exchange, config: ExchangeConfig, dsn: str, rate_limiter: R
                 conn.rollback()
             dense_inserted = 0
 
-        batch = _baseline_batch_size(len(pairs), config.oi_poll_interval_s, config.oi_baseline_interval_s)
-        due = [
-            p for p in pairs
-            if now - baseline_last_fetch.get(p["symbol"], 0) >= config.oi_baseline_interval_s
-        ][:batch]
-        base_inserted = _binance_baseline_sweep(
-            exchange, config.name, rate_limiter, conn, due,
-            baseline_cursor, baseline_last_fetch, now, thread_name,
-        )
+        # Baseline runs ONLY once the cursor is seeded — otherwise a since=None sweep would
+        # advance the cursor from a "latest" fetch and skip the restart gap (claim 4). Dense
+        # above is cursor-independent, so it still runs while a failed seed retries.
+        base_inserted, due = 0, []
+        if seeded:
+            batch = _baseline_batch_size(len(pairs), config.oi_poll_interval_s, config.oi_baseline_interval_s)
+            due = [
+                p for p in pairs
+                if now - baseline_last_fetch.get(p["symbol"], 0) >= config.oi_baseline_interval_s
+            ][:batch]
+            base_inserted = _binance_baseline_sweep(
+                exchange, config.name, rate_limiter, conn, due,
+                baseline_cursor, baseline_last_fetch, now, thread_name,
+            )
 
         cycle_s = time.monotonic() - cycle_start
         log.info(
@@ -696,5 +701,7 @@ def oi_loop(exchange, config: ExchangeConfig, dsn: str, rate_limiter: RateLimite
         _oi_loop_hyperliquid(config, dsn)
     elif config.name in ("bybit", "okx"):
         _oi_loop_bulk(exchange, config, dsn, rate_limiter)
-    else:  # binance
+    elif config.name == "binance":
         _oi_loop_binance(exchange, config, dsn, rate_limiter)
+    else:  # fail fast — a new has_oi venue must declare its strategy, not inherit Binance's
+        raise ValueError(f"No OI strategy for exchange '{config.name}' (has_oi with no loop)")

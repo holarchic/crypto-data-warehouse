@@ -554,6 +554,51 @@ def test_dense_fetch_usd_from_markpx_and_skips_errors(monkeypatch):
     assert by["ETH"]["oi_value_usd"] is None  # no markPrice → None (not a crash)
 
 
+def test_oi_loop_raises_on_unknown_oi_venue():
+    from types import SimpleNamespace
+
+    import pytest
+    cfg = SimpleNamespace(name="kraken", ccxt_class="kraken")
+    with pytest.raises(ValueError, match="No OI strategy"):
+        oi.oi_loop(object(), cfg, "dsn", None)
+
+
+def test_binance_loop_skips_baseline_when_seed_fails(monkeypatch):
+    # Seed failure ⇒ seeded stays False ⇒ baseline sweep must NOT run this cycle (a
+    # since=None sweep would skip the restart gap); dense still runs.
+    from types import SimpleNamespace
+    conn = FakeConn()
+    pairs = [{"asset_id": "BTC", "symbol": "BTC/USDT:USDT"}]
+    monkeypatch.setattr(oi, "connect_db", lambda dsn: conn)
+    monkeypatch.setattr(oi, "_get_active_pairs", lambda c, name: pairs)
+
+    def _seed_boom(*a):
+        raise RuntimeError("seed boom")
+
+    monkeypatch.setattr(oi, "_seed_baseline_cursor", _seed_boom)
+    monkeypatch.setattr(oi, "paced_call", lambda rl, ex, w, fn, *a, **k: fn(*a, **k))
+    monkeypatch.setattr(oi, "_binance_dense_set", lambda *a: [])
+    monkeypatch.setattr(oi, "_binance_dense_fetch", lambda *a: [])
+    swept = {"n": 0}
+    monkeypatch.setattr(oi, "_binance_baseline_sweep", lambda *a: swept.__setitem__("n", swept["n"] + 1) or 0)
+    hb = {"n": 0}
+    monkeypatch.setattr(oi, "_heartbeat", lambda *a: hb.__setitem__("n", hb["n"] + 1))
+
+    def stop(*a):
+        raise _StopLoop
+
+    monkeypatch.setattr(oi, "_sleep_until_next", stop)
+    ex = SimpleNamespace(fetch_funding_rates=lambda: {}, last_response_headers=None)
+    cfg = SimpleNamespace(name="binance", market_type="perp", ccxt_class="binanceusdm",
+                          oi_poll_interval_s=60, oi_settlement_window_s=900, oi_baseline_interval_s=1800)
+    try:
+        oi._oi_loop_binance(ex, cfg, "dsn", None)
+    except _StopLoop:
+        pass
+    assert swept["n"] == 0   # baseline sweep skipped (seed failed)
+    assert hb["n"] == 1      # liveness heartbeat still fired
+
+
 def test_prune_binance_state_drops_inactive_symbols():
     prev = {"BTC/USDT:USDT": 1, "GONE/USDT:USDT": 2}
     cursor = {"BTC/USDT:USDT": 5.0, "GONE/USDT:USDT": 6.0}
