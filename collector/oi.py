@@ -1,7 +1,14 @@
-"""Open interest collection — one thread per exchange.
+"""Open interest collection — one thread per exchange, three strategies.
 
-Cadence is per-strategy: HyperLiquid polls every 1 minute (bulk metaAndAssetCtxs,
-which also feeds the hl_asset_ctxs context bundle); ccxt exchanges every 5 minutes.
+- **HyperLiquid** (`_oi_loop_hyperliquid`): one bulk `metaAndAssetCtxs` POST/cycle at
+  `oi_poll_interval_s` (1-min), dual-writing OI + the `hl_asset_ctxs` context bundle.
+- **Bybit/OKX** (`_oi_loop_bulk`): one bulk call/cycle (Bybit `fetch_tickers` → OI+USD;
+  OKX `fetch_open_interests` + a price map for USD), flat `oi_poll_interval_s` (30s).
+- **Binance** (`_oi_loop_binance`): the only per-symbol-expensive venue — a 5-min
+  baseline via `openInterestHist` (separate weight bucket) plus sub-5-min dense
+  `openInterest` for symbols within ±`oi_settlement_window_s` of their own settlement.
+
+All cadences come from `ExchangeConfig` (see `exchanges.yaml`), not module constants.
 """
 
 import json
@@ -43,9 +50,8 @@ INSERT_HL_CTX_SQL = """
     ON CONFLICT DO NOTHING
 """
 
-OI_POLL_INTERVAL_S = 300  # 5 minutes (ccxt exchanges)
+OI_POLL_INTERVAL_S = 300  # 5-min default (Binance baseline path; overridden per-exchange)
 OI_POLL_BUFFER_S = 30
-HL_OI_POLL_INTERVAL_S = 60  # HyperLiquid: 1-min (T-007.1, matches the Grade-B seed cadence)
 
 
 class _CtxParseError(ValueError):
@@ -373,13 +379,13 @@ def _oi_loop_hyperliquid(config: ExchangeConfig, dsn: str):
         except Exception:
             log.exception("[%s] Failed to query active pairs", thread_name)
             conn.rollback()
-            _sleep_until_next(HL_OI_POLL_INTERVAL_S, OI_POLL_BUFFER_S)
+            _sleep_until_next(config.oi_poll_interval_s, OI_POLL_BUFFER_S)
             continue
 
         if not pairs:
             log.info("[%s] No active pairs, sleeping", thread_name)
             _heartbeat(conn, config, thread_name)
-            _sleep_until_next(HL_OI_POLL_INTERVAL_S, OI_POLL_BUFFER_S)
+            _sleep_until_next(config.oi_poll_interval_s, OI_POLL_BUFFER_S)
             continue
 
         # Build asset_id → pair lookup
@@ -404,7 +410,115 @@ def _oi_loop_hyperliquid(config: ExchangeConfig, dsn: str):
                 conn.rollback()
 
         _heartbeat(conn, config, thread_name)
-        _sleep_until_next(HL_OI_POLL_INTERVAL_S, OI_POLL_BUFFER_S)
+        _sleep_until_next(config.oi_poll_interval_s, OI_POLL_BUFFER_S)
+
+
+# ---------------------------------------------------------------------------
+# Strategy C — bulk (Bybit, OKX): one bulk call/cycle, flat cadence
+# ---------------------------------------------------------------------------
+
+
+def _parse_bulk_oi_bybit(tickers, active, exchange_name, now_ts):
+    """Bybit `fetch_tickers` → OI rows. OI is NOT on the ccxt unified ticker — it lives
+    in `ticker["info"]` (`openInterest` contracts + `openInterestValue` USD). Parse-or-
+    drop: an absent field → None (NULL); a present-but-malformed one drops that symbol."""
+    rows, dropped = [], []
+    for sym, pair in active.items():
+        t = tickers.get(sym)
+        if t is None:
+            continue
+        info = t.get("info") or {}
+        try:
+            oi_amt = _to_float(info.get("openInterest"), "openInterest")
+            oi_usd = _to_float(info.get("openInterestValue"), "openInterestValue")
+        except _CtxParseError as exc:
+            dropped.append(f"{sym}({exc})")
+            continue
+        rows.append({
+            "exchange": exchange_name, "asset_id": pair["asset_id"], "symbol": sym,
+            "timestamp": now_ts, "open_interest": oi_amt, "oi_value_usd": oi_usd,
+        })
+    return rows, dropped
+
+
+def _parse_bulk_oi_okx(ois, price_map, active, exchange_name, now_ts):
+    """OKX `fetch_open_interests` → OI rows. The bulk `/public/open-interest` returns
+    `oi`+`oiCcy` but NO `oiUsd`, so USD is computed from the price map (openInterestAmount
+    × last), preserving the prior per-symbol path's semantics. Values are already
+    ccxt-parsed numbers, so no `_to_float`."""
+    rows = []
+    for sym, pair in active.items():
+        oi_struct = ois.get(sym)
+        if oi_struct is None:
+            continue
+        oi_amt = oi_struct.get("openInterestAmount")
+        oi_usd = oi_struct.get("openInterestValue")
+        if oi_usd is None and oi_amt is not None:
+            price = price_map.get(sym)
+            if price is not None:
+                oi_usd = oi_amt * price
+        rows.append({
+            "exchange": exchange_name, "asset_id": pair["asset_id"], "symbol": sym,
+            "timestamp": now_ts, "open_interest": oi_amt, "oi_value_usd": oi_usd,
+        })
+    return rows
+
+
+def _oi_loop_bulk(exchange, config: ExchangeConfig, dsn: str, rate_limiter: RateLimiter):
+    """Bulk OI for Bybit/OKX — one bulk call/cycle, flat `oi_poll_interval_s`."""
+    thread_name = f"{config.name}/oi"
+    conn = connect_db(dsn)
+
+    while True:
+        if conn.closed:
+            try:
+                conn = connect_db(dsn)
+            except RuntimeError:
+                log.error("[%s] DB reconnect failed, will retry next cycle", thread_name)
+                time.sleep(30)
+                continue
+
+        try:
+            pairs = _get_active_pairs(conn, config.name)
+        except Exception:
+            log.exception("[%s] Failed to query active pairs", thread_name)
+            conn.rollback()
+            _sleep_until_next(config.oi_poll_interval_s, OI_POLL_BUFFER_S)
+            continue
+
+        if not pairs:
+            log.info("[%s] No active pairs, sleeping", thread_name)
+            _heartbeat(conn, config, thread_name)
+            _sleep_until_next(config.oi_poll_interval_s, OI_POLL_BUFFER_S)
+            continue
+
+        active = {p["symbol"]: p for p in pairs}
+        now_ts = time.time()
+        dropped = []
+        try:
+            if config.name == "bybit":
+                tickers = paced_call(
+                    rate_limiter, exchange, BINANCE_TICKERS_BULK_WEIGHT, exchange.fetch_tickers,
+                )
+                rows, dropped = _parse_bulk_oi_bybit(tickers, active, config.name, now_ts)
+            else:  # okx
+                ois = paced_call(
+                    rate_limiter, exchange, BINANCE_OI_WEIGHT, exchange.fetch_open_interests,
+                )
+                price_map = _fetch_price_map(exchange, rate_limiter)
+                rows = _parse_bulk_oi_okx(ois, price_map, active, config.name, now_ts)
+            inserted = _insert_oi(conn, rows)
+            if dropped:
+                log.warning("[%s] Dropped %d symbol(s) with malformed OI: %s",
+                            thread_name, len(dropped), dropped[:10])
+            log.info("[%s] Poll: %d OI snapshots inserted (%d pairs)", thread_name, inserted, len(pairs))
+        except Exception as exc:
+            log.warning("[%s] Error in bulk OI cycle: %s", thread_name, exc)
+            if not conn.closed:
+                conn.rollback()
+
+        _heartbeat(conn, config, thread_name)
+        _sleep_until_next(config.oi_poll_interval_s, OI_POLL_BUFFER_S)
 
 
 # ---------------------------------------------------------------------------
@@ -413,8 +527,11 @@ def _oi_loop_hyperliquid(config: ExchangeConfig, dsn: str):
 
 
 def oi_loop(exchange, config: ExchangeConfig, dsn: str, rate_limiter: RateLimiter):
-    """OI collection loop. Dispatches to native HL bulk or ccxt per-symbol."""
+    """OI collection loop. Dispatches by exchange: HL native bulk, Bybit/OKX bulk,
+    Binance two-source; every `has_oi` exchange maps to exactly one strategy."""
     if config.ccxt_class == "hyperliquid":
         _oi_loop_hyperliquid(config, dsn)
-    else:
+    elif config.name in ("bybit", "okx"):
+        _oi_loop_bulk(exchange, config, dsn, rate_limiter)
+    else:  # binance (per-symbol two-source lands in chunk 3; interim per-symbol 5-min)
         _oi_loop_ccxt(exchange, config, dsn, rate_limiter)
