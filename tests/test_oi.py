@@ -589,16 +589,18 @@ def test_dense_fetch_error_isolation_under_pool(monkeypatch):
     assert landed == set(syms) - {"C7/USDT:USDT"}  # all 19 others landed
 
 
-def test_dense_fetch_concurrency_1_matches_sequential(monkeypatch):
-    # concurrency=1 serializes → completion order == submission order == the old sequential
-    # loop (exact behavioral rollback).
+def test_dense_fetch_concurrency_1_same_row_set(monkeypatch):
+    # concurrency=1 serializes ccxt access (the rollback for shared-session anomalies: only
+    # one fetch in flight at a time). It yields the same row SET as the parallel path — insert
+    # order is immaterial (rows are PK-distinct, ON CONFLICT DO NOTHING), so as_completed's
+    # non-guaranteed order across already-finished futures doesn't matter.
     _patch_paced_and_sleep(monkeypatch)
     syms = [f"C{i}/USDT:USDT" for i in range(5)]
     ex = _FakeExchange(oi_by_symbol={s: {"openInterestAmount": float(i)} for i, s in enumerate(syms)})
     dense_pairs = [{"asset_id": f"C{i}", "symbol": s} for i, s in enumerate(syms)]
     fr = {s: _fr(NOW, mark=1.0) for s in syms}
     rows = oi._binance_dense_fetch(ex, "binance", None, dense_pairs, fr, NOW, "binance/oi", 1)
-    assert [r["symbol"] for r in rows] == syms  # order preserved at concurrency=1
+    assert {r["symbol"] for r in rows} == set(syms)
 
 
 def test_dense_fetch_empty_set_returns_empty(monkeypatch):
