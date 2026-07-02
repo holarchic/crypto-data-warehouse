@@ -141,7 +141,11 @@ def _insert_hl_snapshot(conn, oi_rows, ctx_rows):
 
 
 def _sleep_until_next(interval_s, buffer_s):
-    """Sleep until the next `interval_s` boundary + buffer."""
+    """Sleep until the next `interval_s` boundary + buffer. The buffer is clamped to half
+    the interval so it can never push the target a full interval past the boundary — at a
+    sub-minute cadence (Bybit/OKX 30s) a raw 30s buffer would land on the *next* boundary
+    and silently double the poll period to ~60s."""
+    buffer_s = min(buffer_s, interval_s // 2)
     now = time.time()
     next_boundary = (now // interval_s + 1) * interval_s + buffer_s
     sleep_s = next_boundary - now

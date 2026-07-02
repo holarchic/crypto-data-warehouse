@@ -115,6 +115,17 @@ def test_sleep_until_next_computes_boundary(monkeypatch):
     assert slept["s"] == 25.0
 
 
+def test_sleep_until_next_clamps_buffer_to_half_interval(monkeypatch):
+    # 30s interval + 30s buffer would target the NEXT boundary (doubling the period);
+    # the clamp caps buffer at interval//2=15 → ~30s cadence, not ~60s.
+    slept = {}
+    monkeypatch.setattr(oi.time, "time", lambda: 1000.0)
+    monkeypatch.setattr(oi.time, "sleep", lambda s: slept.setdefault("s", s))
+    oi._sleep_until_next(30, 30)
+    # next 30s boundary after 1000 is 1020, +min(30,15)=15 → 1035 → sleep 35s (< a full 60s)
+    assert slept["s"] == 35.0
+
+
 # --- Slice B: insert/commit/rollback discipline via a fake conn ---------------
 
 
