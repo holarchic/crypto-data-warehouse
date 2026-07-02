@@ -235,6 +235,20 @@ def test_build_hl_snapshots_drops_malformed_asset():
     assert [r["asset_id"] for r in ctx_rows] == ["BTC"]
 
 
+def test_build_hl_snapshots_non_dict_row_dropped_not_aborted():
+    # A non-dict ctx (row-container drift) drops that asset per-asset — it does NOT
+    # escape as a raw exception that would abort the whole cycle. BTC still lands.
+    universe = [{"name": "BTC"}, {"name": "ETH"}]
+    ctxs = [_full_ctx(), ["not", "a", "dict"]]
+    asset_to_pair = {
+        "BTC": {"asset_id": "BTC", "symbol": "BTC/USDC:USDC"},
+        "ETH": {"asset_id": "ETH", "symbol": "ETH/USDC:USDC"},
+    }
+    oi_rows, ctx_rows = oi._build_hl_snapshots(universe, ctxs, asset_to_pair, "hyperliquid", 1.0)
+    assert [r["asset_id"] for r in oi_rows] == ["BTC"]
+    assert [r["asset_id"] for r in ctx_rows] == ["BTC"]
+
+
 def _fixture_universe_ctxs():
     """One well-formed cycle: BTC full, ETH missing premium/mid, ILLIQ null impact + no markPx."""
     universe = [{"name": "BTC"}, {"name": "ETH"}, {"name": "ILLIQ"}]
