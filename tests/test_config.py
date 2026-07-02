@@ -50,6 +50,28 @@ def test_load_all_configs_timeframes_populated():
         assert len(cfg.timeframes) > 0, f"{cfg.name} has no timeframes"
 
 
+# --- OI cadence knobs (T-007.2) ---
+
+def test_oi_cadence_knobs_per_exchange():
+    # HL + Binance dense-tick 60s; Bybit/OKX bulk 30s.
+    assert load_config("hyperliquid").oi_poll_interval_s == 60
+    assert load_config("binance").oi_poll_interval_s == 60
+    assert load_config("bybit").oi_poll_interval_s == 30
+    assert load_config("okx").oi_poll_interval_s == 30
+    # Binance ±15m window + ~30m baseline refresh.
+    binance = load_config("binance")
+    assert binance.oi_settlement_window_s == 900
+    assert binance.oi_baseline_interval_s == 1800
+
+
+def test_oi_cadence_defaults_for_non_oi_exchange():
+    # coinbase declares no OI knobs → dataclass defaults (5-min), inert.
+    cfg = load_config("coinbase")
+    assert cfg.oi_poll_interval_s == 300
+    assert cfg.oi_settlement_window_s == 900
+    assert cfg.oi_baseline_interval_s == 1800
+
+
 # --- load_discovery_config ---
 
 def test_load_discovery_config_has_threshold():

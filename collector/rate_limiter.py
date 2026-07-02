@@ -148,6 +148,12 @@ BINANCE_FUNDING_HISTORY_WEIGHT = 1  # fetch_funding_rate_history
 BINANCE_FUNDING_BULK_WEIGHT = 1     # fetch_funding_rates (premiumIndex bulk)
 BINANCE_OI_WEIGHT = 1               # fetch_open_interest
 BINANCE_TICKERS_BULK_WEIGHT = 40    # fetch_tickers (ticker/24hr, all symbols)
+# fetch_open_interest_history (openInterestHist) is on the separate /futures/data IP
+# bucket, NOT the main X-MBX-USED-WEIGHT-1M pool → weight 0 here. Because weight 0 also
+# means the WeightRateLimiter applies no pacing, the OI baseline sweep self-paces its
+# calls with BINANCE_OI_HIST_SPACING_S against that bucket's (undocumented) cap.
+BINANCE_OI_HIST_WEIGHT = 0
+BINANCE_OI_HIST_SPACING_S = 0.15
 
 
 def binance_kline_weight(limit: int) -> int:
