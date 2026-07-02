@@ -50,3 +50,51 @@ def test_init_sql_has_retention_policies():
     sql = _read(INIT_SQL)
     for table in TABLES_WITH_RETENTION:
         assert f"add_retention_policy('{table}'" in sql, f"init.sql missing retention policy for {table}"
+
+
+# --- hl_asset_ctxs (migration 005) — HyperLiquid context bundle table --------
+
+MIGRATION_005 = pathlib.Path(__file__).parent.parent / "db" / "migrations" / "005-hl-asset-ctxs.sql"
+
+HL_CTX_CLAUSES = [
+    "CREATE TABLE IF NOT EXISTS hl_asset_ctxs",
+    "create_hypertable('hl_asset_ctxs'",
+    "chunk_time_interval => INTERVAL '1 week'",
+    "idx_hl_asset_ctxs_asset_ts",
+    "add_compression_policy('hl_asset_ctxs'",
+    "add_retention_policy('hl_asset_ctxs'",
+]
+
+# The 10 seed floats + keys, in the backtester seed's column order.
+HL_CTX_COLUMNS = [
+    "funding", "open_interest", "prev_day_px", "day_ntl_vlm", "premium",
+    "oracle_px", "mark_px", "mid_px", "impact_bid_px", "impact_ask_px",
+]
+
+
+def test_migration_005_exists():
+    assert MIGRATION_005.exists(), "005-hl-asset-ctxs.sql not found"
+
+
+def test_migration_005_has_all_clauses():
+    sql = _read(MIGRATION_005)
+    for clause in HL_CTX_CLAUSES:
+        assert clause in sql, f"005 missing: {clause}"
+
+
+def test_init_sql_has_hl_asset_ctxs():
+    """Fresh installs (init.sql) must also create the table with all clauses."""
+    sql = _read(INIT_SQL)
+    for clause in HL_CTX_CLAUSES:
+        assert clause in sql, f"init.sql missing hl_asset_ctxs clause: {clause}"
+
+
+def test_hl_asset_ctxs_columns_match_seed_order():
+    """Column names/order must match the backtester Grade-B seed (hl-asset-ctxs.parquet)."""
+    for path in (MIGRATION_005, INIT_SQL):
+        sql = _read(path)
+        idx = sql.index("CREATE TABLE IF NOT EXISTS hl_asset_ctxs")
+        block = sql[idx:idx + 800]
+        positions = [block.find(col) for col in HL_CTX_COLUMNS]
+        assert all(p > 0 for p in positions), f"{path.name}: missing a seed column"
+        assert positions == sorted(positions), f"{path.name}: seed columns out of order"

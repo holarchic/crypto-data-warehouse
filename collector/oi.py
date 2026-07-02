@@ -2,6 +2,7 @@
 
 import json
 import logging
+import math
 import time
 import urllib.request
 
@@ -26,8 +27,37 @@ INSERT_OI_SQL = """
     ON CONFLICT DO NOTHING
 """
 
-OI_POLL_INTERVAL_S = 300  # 5 minutes
+# HyperLiquid asset_ctxs bundle: the full metaAndAssetCtxs per-asset context. Column
+# order mirrors the backtester Grade-B seed (hl-asset-ctxs.parquet) 1:1.
+INSERT_HL_CTX_SQL = """
+    INSERT INTO hl_asset_ctxs (asset_id, symbol, timestamp, funding, open_interest,
+            prev_day_px, day_ntl_vlm, premium, oracle_px, mark_px, mid_px,
+            impact_bid_px, impact_ask_px)
+    VALUES (%(asset_id)s, %(symbol)s, to_timestamp(%(timestamp)s), %(funding)s,
+            %(open_interest)s, %(prev_day_px)s, %(day_ntl_vlm)s, %(premium)s,
+            %(oracle_px)s, %(mark_px)s, %(mid_px)s, %(impact_bid_px)s, %(impact_ask_px)s)
+    ON CONFLICT DO NOTHING
+"""
+
+OI_POLL_INTERVAL_S = 300  # 5 minutes (ccxt exchanges)
 OI_POLL_BUFFER_S = 30
+HL_OI_POLL_INTERVAL_S = 60  # HyperLiquid: 1-min (T-007.1, matches the Grade-B seed cadence)
+
+
+def _to_float(x):
+    """Parse a HL ctx field to float, or None. None/""/non-numeric/NaN → None.
+
+    NaN is mapped to None deliberately: the SQL-NULL contract (missing ctx values
+    stored as NULL; the parquet export converts NULL→NaN). A stored NaN would break
+    that. 0.0 is preserved — zero OI/funding is valid, so no `or`-coalescing.
+    """
+    if x is None or x == "":
+        return None
+    try:
+        v = float(x)
+    except (TypeError, ValueError):
+        return None
+    return None if math.isnan(v) else v
 
 
 def _get_active_pairs(conn, exchange_name):
@@ -35,8 +65,12 @@ def _get_active_pairs(conn, exchange_name):
     return query_active_pairs(conn, exchange_name, "5m")
 
 
-def _insert_oi(conn, rows):
-    """Insert OI rows. Returns count of inserted rows."""
+def _insert_oi(conn, rows, commit=True):
+    """Insert OI rows. Returns count of inserted rows.
+
+    `commit=False` lets the HL loop batch this with the hl_asset_ctxs insert under one
+    transaction (single commit), so the two tables never diverge on a mid-cycle failure.
+    """
     if not rows:
         return 0
     inserted = 0
@@ -44,17 +78,40 @@ def _insert_oi(conn, rows):
         for row in rows:
             cur.execute(INSERT_OI_SQL, row)
             inserted += cur.rowcount
-    conn.commit()
+    if commit:
+        conn.commit()
     return inserted
 
 
-def _sleep_until_next_5m():
-    """Sleep until next 5-minute boundary + buffer."""
+def _insert_hl_ctxs(conn, rows, commit=True):
+    """Insert HL asset_ctxs bundle rows. Returns count of inserted rows.
+
+    `commit=False` is used by the HL loop to share one transaction with the OI insert.
+    """
+    if not rows:
+        return 0
+    inserted = 0
+    with conn.cursor() as cur:
+        for row in rows:
+            cur.execute(INSERT_HL_CTX_SQL, row)
+            inserted += cur.rowcount
+    if commit:
+        conn.commit()
+    return inserted
+
+
+def _sleep_until_next(interval_s, buffer_s):
+    """Sleep until the next `interval_s` boundary + buffer."""
     now = time.time()
-    next_boundary = (now // OI_POLL_INTERVAL_S + 1) * OI_POLL_INTERVAL_S + OI_POLL_BUFFER_S
+    next_boundary = (now // interval_s + 1) * interval_s + buffer_s
     sleep_s = next_boundary - now
-    log.info("[oi] Sleeping %.0fs until next 5m boundary", sleep_s)
+    log.info("[oi] Sleeping %.0fs until next %ds boundary", sleep_s, interval_s)
     time.sleep(sleep_s)
+
+
+def _sleep_until_next_5m():
+    """Sleep until next 5-minute boundary + buffer (ccxt OI path)."""
+    _sleep_until_next(OI_POLL_INTERVAL_S, OI_POLL_BUFFER_S)
 
 
 def _heartbeat(conn, config: ExchangeConfig, thread_name: str):
@@ -194,6 +251,26 @@ def _fetch_hl_meta_and_ctxs():
     return universe, asset_ctxs
 
 
+def _parse_hl_ctx(ctx: dict) -> dict:
+    """Parse one HL asset ctx into the 10 seed floats. All via `_to_float` (missing/
+    NaN → None). `impactPxs` is a 2-element [bid, ask] list, but may be null or short
+    on illiquid assets → length-guarded.
+    """
+    ip = ctx.get("impactPxs") or []
+    return {
+        "funding": _to_float(ctx.get("funding")),
+        "open_interest": _to_float(ctx.get("openInterest")),
+        "prev_day_px": _to_float(ctx.get("prevDayPx")),
+        "day_ntl_vlm": _to_float(ctx.get("dayNtlVlm")),
+        "premium": _to_float(ctx.get("premium")),
+        "oracle_px": _to_float(ctx.get("oraclePx")),
+        "mark_px": _to_float(ctx.get("markPx")),
+        "mid_px": _to_float(ctx.get("midPx")),
+        "impact_bid_px": _to_float(ip[0]) if len(ip) > 0 else None,
+        "impact_ask_px": _to_float(ip[1]) if len(ip) > 1 else None,
+    }
+
+
 def _oi_loop_hyperliquid(config: ExchangeConfig, dsn: str):
     """Native bulk OI for HyperLiquid — 1 API call → all pairs."""
     thread_name = f"{config.name}/oi"
@@ -215,13 +292,13 @@ def _oi_loop_hyperliquid(config: ExchangeConfig, dsn: str):
         except Exception:
             log.exception("[%s] Failed to query active pairs", thread_name)
             conn.rollback()
-            _sleep_until_next_5m()
+            _sleep_until_next(HL_OI_POLL_INTERVAL_S, OI_POLL_BUFFER_S)
             continue
 
         if not pairs:
             log.info("[%s] No active pairs, sleeping", thread_name)
             _heartbeat(conn, config, thread_name)
-            _sleep_until_next_5m()
+            _sleep_until_next(HL_OI_POLL_INTERVAL_S, OI_POLL_BUFFER_S)
             continue
 
         # Build asset_id → pair lookup
@@ -230,30 +307,58 @@ def _oi_loop_hyperliquid(config: ExchangeConfig, dsn: str):
         try:
             universe, asset_ctxs = _fetch_hl_meta_and_ctxs()
             now_ts = time.time()
-            rows = []
 
-            for meta, ctx in zip(universe, asset_ctxs):
-                asset_name = meta.get("name", "")
-                if asset_name not in asset_to_pair:
-                    continue
+            # universe[i] describes asset_ctxs[i] (positional; no row-level join key).
+            # A length mismatch means the HL response shape drifted — abort the cycle
+            # (commit nothing) rather than silently zip-truncating the tail assets.
+            if len(universe) != len(asset_ctxs):
+                log.warning(
+                    "[%s] HL response length mismatch (universe=%d ctxs=%d) — skipping cycle",
+                    thread_name, len(universe), len(asset_ctxs),
+                )
+            else:
+                oi_rows = []
+                ctx_rows = []
+                for meta, ctx in zip(universe, asset_ctxs):
+                    asset_name = meta.get("name", "")
+                    if asset_name not in asset_to_pair:
+                        continue
 
-                pair = asset_to_pair[asset_name]
-                oi_str = ctx.get("openInterest", "0")
-                mark_str = ctx.get("markPx", "0")
-                oi_val = float(oi_str)
-                mark_val = float(mark_str)
+                    pair = asset_to_pair[asset_name]
+                    bundle = _parse_hl_ctx(ctx)
+                    oi_val = bundle["open_interest"]
+                    mark_val = bundle["mark_px"]
+                    oi_value_usd = (
+                        oi_val * mark_val
+                        if oi_val is not None and mark_val is not None
+                        else None
+                    )
 
-                rows.append({
-                    "exchange": config.name,
-                    "asset_id": pair["asset_id"],
-                    "symbol": pair["symbol"],
-                    "timestamp": now_ts,
-                    "open_interest": oi_val,
-                    "oi_value_usd": oi_val * mark_val,
-                })
+                    oi_rows.append({
+                        "exchange": config.name,
+                        "asset_id": pair["asset_id"],
+                        "symbol": pair["symbol"],
+                        "timestamp": now_ts,
+                        "open_interest": oi_val,
+                        "oi_value_usd": oi_value_usd,
+                    })
+                    ctx_rows.append({
+                        "asset_id": pair["asset_id"],
+                        "symbol": pair["symbol"],
+                        "timestamp": now_ts,
+                        **bundle,
+                    })
 
-            inserted = _insert_oi(conn, rows)
-            log.info("[%s] Poll: %d OI snapshots inserted (%d active pairs)", thread_name, inserted, len(pairs))
+                # Dual-write both tables under ONE transaction: insert without
+                # committing, then a single commit — so a failure on the second insert
+                # rolls back the first (the two tables never diverge for a cycle).
+                oi_inserted = _insert_oi(conn, oi_rows, commit=False)
+                ctx_inserted = _insert_hl_ctxs(conn, ctx_rows, commit=False)
+                conn.commit()
+                log.info(
+                    "[%s] Poll: %d OI + %d ctx rows inserted (%d active pairs)",
+                    thread_name, oi_inserted, ctx_inserted, len(pairs),
+                )
 
         except Exception as exc:
             log.warning("[%s] Error fetching HL OI: %s", thread_name, exc)
@@ -261,7 +366,7 @@ def _oi_loop_hyperliquid(config: ExchangeConfig, dsn: str):
                 conn.rollback()
 
         _heartbeat(conn, config, thread_name)
-        _sleep_until_next_5m()
+        _sleep_until_next(HL_OI_POLL_INTERVAL_S, OI_POLL_BUFFER_S)
 
 
 # ---------------------------------------------------------------------------
