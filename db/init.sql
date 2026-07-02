@@ -71,7 +71,7 @@ CREATE TABLE IF NOT EXISTS open_interest (
 );
 
 SELECT create_hypertable('open_interest', 'timestamp',
-    chunk_time_interval => INTERVAL '1 month',
+    chunk_time_interval => INTERVAL '1 week',
     if_not_exists => TRUE);
 
 CREATE INDEX IF NOT EXISTS idx_open_interest_asset_ts

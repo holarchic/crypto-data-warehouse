@@ -32,6 +32,7 @@ exchanges:
     enabled: true
     has_funding: true
     has_oi: true
+    oi_poll_interval_s: 60          # HL OI 1-min (T-007.1; bulk metaAndAssetCtxs)
     supported_timeframes:
       - 5m
       - 15m
@@ -60,6 +61,12 @@ exchanges:
     enabled: true
     has_funding: true
     has_oi: true
+    # OI two-source (T-007.2): dense-tick 60s (sized to halve peak OI weight at a mass
+    # settlement — the dense burst shares this exchange's weight limiter with candles);
+    # ±15m settlement window; per-symbol openInterestHist baseline refresh ~30m.
+    oi_poll_interval_s: 60
+    oi_settlement_window_s: 900
+    oi_baseline_interval_s: 1800
     supported_timeframes:
       - 5m
       - 15m
@@ -80,6 +87,7 @@ exchanges:
     enabled: true
     has_funding: true
     has_oi: true
+    oi_poll_interval_s: 30          # bulk fetch_tickers (OI+USD), 1 call/cycle → flat 30s
     supported_timeframes:
       - 5m
       - 15m
@@ -99,6 +107,7 @@ exchanges:
     enabled: true
     has_funding: true
     has_oi: true
+    oi_poll_interval_s: 30          # bulk fetch_open_interests (+ price map for USD), flat 30s
     options:
       defaultType: swap
     supported_timeframes:

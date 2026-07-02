@@ -42,6 +42,13 @@ class ExchangeConfig:
     rate_limit_weight_budget: int | None = None
     rate_limit_window_s: int = 60
     rate_limit_safety: int = 400
+    # OI cadence knobs (T-007.2). oi_poll_interval_s is the loop tick for every OI
+    # strategy (HL bulk, Bybit/OKX bulk, Binance dense). oi_settlement_window_s and
+    # oi_baseline_interval_s are Binance-only (± dense window half-width; per-symbol
+    # openInterestHist baseline refresh target). Defaults keep non-OI exchanges inert.
+    oi_poll_interval_s: int = 300
+    oi_settlement_window_s: int = 900
+    oi_baseline_interval_s: int = 1800
 
 
 def _load_yaml():
@@ -71,6 +78,9 @@ def _parse_exchange(exchange_name: str, ex: dict, tf_defs: dict) -> ExchangeConf
         rate_limit_weight_budget=ex.get("rate_limit_weight_budget"),
         rate_limit_window_s=ex.get("rate_limit_window_s", 60),
         rate_limit_safety=ex.get("rate_limit_safety", 400),
+        oi_poll_interval_s=ex.get("oi_poll_interval_s", 300),
+        oi_settlement_window_s=ex.get("oi_settlement_window_s", 900),
+        oi_baseline_interval_s=ex.get("oi_baseline_interval_s", 1800),
     )
 
 
