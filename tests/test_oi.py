@@ -141,23 +141,68 @@ class FakeConn:
         self.rollbacks += 1
 
 
-def test_insert_hl_ctxs_commit_flag():
-    rows = [{
-        "asset_id": "BTC", "symbol": "BTC/USDC:USDC", "timestamp": 1.0,
-        "funding": 0.1, "open_interest": 2.0, "prev_day_px": 3.0, "day_ntl_vlm": 4.0,
-        "premium": 5.0, "oracle_px": 6.0, "mark_px": 7.0, "mid_px": 8.0,
-        "impact_bid_px": 9.0, "impact_ask_px": 10.0,
-    }]
+def test_insert_hl_snapshot_one_commit():
+    oi_rows = [{"exchange": "hyperliquid", "asset_id": "BTC", "symbol": "BTC/USDC:USDC",
+                "timestamp": 1.0, "open_interest": 2.0, "oi_value_usd": 20.0}]
+    ctx_rows = [{"asset_id": "BTC", "symbol": "BTC/USDC:USDC", "timestamp": 1.0,
+                 "funding": 0.1, "open_interest": 2.0, "prev_day_px": 3.0, "day_ntl_vlm": 4.0,
+                 "premium": 5.0, "oracle_px": 6.0, "mark_px": 10.0, "mid_px": 8.0,
+                 "impact_bid_px": 9.0, "impact_ask_px": 10.0}]
     conn = FakeConn()
-    assert oi._insert_hl_ctxs(conn, rows, commit=True) == 1
-    assert conn.commits == 1
-    assert "ON CONFLICT DO NOTHING" in conn.executed[0][0]
+    oi_n, ctx_n = oi._insert_hl_snapshot(conn, oi_rows, ctx_rows)
+    assert (oi_n, ctx_n) == (1, 1)
+    assert conn.commits == 1  # exactly one commit owns both inserts
+    sqls = [sql for sql, _ in conn.executed]
+    assert any("INTO open_interest" in s for s in sqls)
+    assert any("INTO hl_asset_ctxs" in s and "ON CONFLICT DO NOTHING" in s for s in sqls)
 
-    conn2 = FakeConn()
-    oi._insert_hl_ctxs(conn2, rows, commit=False)
-    assert conn2.commits == 0  # caller commits
 
-    assert oi._insert_hl_ctxs(FakeConn(), [], commit=True) == 0
+def test_insert_hl_snapshot_ctx_failure_no_commit():
+    # ctx insert raises → the single commit is never reached (caller rolls back).
+    conn = FakeConn(raise_on="INTO hl_asset_ctxs")
+    oi_rows = [{"exchange": "hyperliquid", "asset_id": "BTC", "symbol": "S",
+                "timestamp": 1.0, "open_interest": 2.0, "oi_value_usd": None}]
+    ctx_rows = [{"asset_id": "BTC", "symbol": "S", "timestamp": 1.0, "funding": None,
+                 "open_interest": 2.0, "prev_day_px": None, "day_ntl_vlm": None,
+                 "premium": None, "oracle_px": None, "mark_px": None, "mid_px": None,
+                 "impact_bid_px": None, "impact_ask_px": None}]
+    try:
+        oi._insert_hl_snapshot(conn, oi_rows, ctx_rows)
+    except RuntimeError:
+        pass
+    assert conn.commits == 0
+
+
+def test_build_hl_snapshots_assembly_and_derivation():
+    universe, ctxs = _fixture_universe_ctxs()
+    asset_to_pair = {p["asset_id"]: p for p in _pairs()}
+    oi_rows, ctx_rows = oi._build_hl_snapshots(universe, ctxs, asset_to_pair, "hyperliquid", 42.0)
+    assert len(oi_rows) == 3 and len(ctx_rows) == 3
+    oi_by = {r["asset_id"]: r for r in oi_rows}
+    ctx_by = {r["asset_id"]: r for r in ctx_rows}
+    # BTC both present → oi*mark; ILLIQ no markPx → None
+    assert oi_by["BTC"]["oi_value_usd"] == 12345.6 * 61010.0
+    assert oi_by["ILLIQ"]["oi_value_usd"] is None
+    assert ctx_by["ILLIQ"]["mark_px"] is None
+    # shared open_interest + timestamp across the two tables
+    for aid in ("BTC", "ETH", "ILLIQ"):
+        assert oi_by[aid]["open_interest"] == ctx_by[aid]["open_interest"]
+        assert oi_by[aid]["timestamp"] == ctx_by[aid]["timestamp"] == 42.0
+
+
+def test_build_hl_snapshots_skips_unknown_assets():
+    universe = [{"name": "BTC"}, {"name": "UNLISTED"}]
+    ctxs = [_full_ctx(), _full_ctx()]
+    asset_to_pair = {"BTC": {"asset_id": "BTC", "symbol": "BTC/USDC:USDC"}}
+    oi_rows, ctx_rows = oi._build_hl_snapshots(universe, ctxs, asset_to_pair, "hyperliquid", 1.0)
+    assert [r["asset_id"] for r in oi_rows] == ["BTC"]
+    assert len(ctx_rows) == 1
+
+
+def test_build_hl_snapshots_length_mismatch_raises():
+    import pytest
+    with pytest.raises(ValueError, match="length mismatch"):
+        oi._build_hl_snapshots([{"name": "BTC"}, {"name": "ETH"}], [_full_ctx()], {}, "hyperliquid", 1.0)
 
 
 def _fixture_universe_ctxs():
