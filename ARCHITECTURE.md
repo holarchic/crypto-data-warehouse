@@ -10,6 +10,8 @@ Fetches OHLCV candles, funding rates, and open interest from exchanges. Writes d
 
 The funding and OI threads upsert a per-loop **liveness heartbeat** each cycle (`status.upsert_loop_heartbeat`): a sentinel `collection_status` row with `symbol = "*"` and a pseudo-timeframe from `config.LOOP_INTERVALS` (`funding` / `oi`). These threads write no per-pair candle status, so without the heartbeat a silently-dead funding/OI thread produces no staleness footprint; the monitor flags the sentinel row when it goes stale.
 
+The OI loop (`oi.py`) has two strategies. ccxt exchanges (binance/bybit/okx) poll per-symbol every 5 min. HyperLiquid polls every **1 min** via one bulk `metaAndAssetCtxs` POST — matching the backtester's Grade-B seed cadence — and **dual-writes**: OI to `open_interest` plus the full per-asset context bundle (funding/premium/oracle/mark/mid/impact/prev-day/day-volume) to `hl_asset_ctxs`, both under one transaction (`_insert_hl_snapshot`) so the two tables never diverge on a mid-cycle failure. `_build_hl_snapshots` owns the response boundary: it validates the positional `universe[i]`↔`asset_ctxs[i]` contract (length mismatch → abort the cycle) and applies a **parse-or-drop** rule per asset (`_to_float`/`_parse_hl_ctx` raise `_CtxParseError` on a present-but-malformed field, wrong-container `impactPxs`, or non-dict row → that asset is skipped and logged; legitimately-absent fields → SQL NULL).
+
 ### monitor (collector/monitor.py)
 
 Separate always-on container (`python -m monitor`). One `collection_status` fetch per cycle (`fetch_status_rows`) feeds two independent alert signals plus gap detection:
@@ -96,3 +98,17 @@ PK: `(exchange, symbol, timestamp)` — 1-month chunks.
 | timestamp | TIMESTAMPTZ NOT NULL | Snapshot time |
 | open_interest | DOUBLE PRECISION | Base currency units |
 | oi_value_usd | DOUBLE PRECISION | USD notional value |
+
+### `hl_asset_ctxs` hypertable
+
+HyperLiquid-only per-asset context bundle (full `metaAndAssetCtxs`), 1-min cadence,
+1-week chunks. Columns mirror the backtester Grade-B seed (`hl-asset-ctxs.parquet`) 1:1 so
+the forward tape is a schema-faithful continuation. PK: `(asset_id, timestamp)`.
+
+| Column | Type | Notes |
+|--------|------|-------|
+| asset_id | TEXT NOT NULL | HL universe name = seed `coin` |
+| symbol | TEXT NOT NULL | ccxt-normalized |
+| timestamp | TIMESTAMPTZ NOT NULL | Poll time, UTC (= seed `time_ms`) |
+| funding, open_interest, prev_day_px, day_ntl_vlm, premium | DOUBLE PRECISION | |
+| oracle_px, mark_px, mid_px, impact_bid_px, impact_ask_px | DOUBLE PRECISION | nullable; missing → NULL |
