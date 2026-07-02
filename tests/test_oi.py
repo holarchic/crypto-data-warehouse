@@ -554,6 +554,14 @@ def test_dense_fetch_usd_from_markpx_and_skips_errors(monkeypatch):
     assert by["ETH"]["oi_value_usd"] is None  # no markPrice → None (not a crash)
 
 
+def test_prune_binance_state_drops_inactive_symbols():
+    prev = {"BTC/USDT:USDT": 1, "GONE/USDT:USDT": 2}
+    cursor = {"BTC/USDT:USDT": 5.0, "GONE/USDT:USDT": 6.0}
+    oi._prune_binance_state({"BTC/USDT:USDT"}, prev, cursor)
+    assert set(prev) == {"BTC/USDT:USDT"}
+    assert set(cursor) == {"BTC/USDT:USDT"}
+
+
 def test_seed_baseline_cursor_sql_isolates_aligned_rows():
     # Regression guard (codex-r2 HIGH): the seed query must filter to 5-min-aligned rows
     # so dense now-rows can't poison the cursor.

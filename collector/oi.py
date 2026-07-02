@@ -464,6 +464,15 @@ def _seed_baseline_cursor(conn, exchange_name):
         return {sym: float(ts) for sym, ts in cur.fetchall() if ts is not None}
 
 
+def _prune_binance_state(active_keys, *state_dicts):
+    """Drop entries for symbols no longer active from each cross-tick state dict, so the
+    maps stay bounded to the active set under listing churn (not symbols-ever-seen)."""
+    live = set(active_keys)
+    for d in state_dicts:
+        for sym in [s for s in d if s not in live]:
+            del d[sym]
+
+
 def _baseline_batch_size(n_pairs, tick_s, interval_s):
     """Symbols per tick so a full baseline sweep completes within `interval_s`:
     ceil(n · tick / interval), at least 1. (Gap-freedom comes from `since`, not this rate.)"""
@@ -616,13 +625,17 @@ def _oi_loop_binance(exchange, config: ExchangeConfig, dsn: str, rate_limiter: R
             try:
                 baseline_cursor = _seed_baseline_cursor(conn, config.name)
                 log.info("[%s] Seeded baseline cursor for %d symbols", thread_name, len(baseline_cursor))
+                seeded = True  # only after success — a failed seed retries next cycle so
+                # DB-backed restart backfill is not silently downgraded to since=None
             except Exception:
-                log.exception("[%s] Baseline cursor seed failed (start from default window)", thread_name)
+                log.exception("[%s] Baseline cursor seed failed, retrying next cycle", thread_name)
                 if not conn.closed:
                     conn.rollback()
-            seeded = True
 
         active = {p["symbol"]: p for p in pairs}
+        # Prune cross-tick state to currently-active symbols so the maps track the active
+        # set, not every symbol ever seen (listing churn would otherwise grow them unbounded).
+        _prune_binance_state(active.keys(), prev_next_ft, settlement_at, baseline_cursor, baseline_last_fetch)
         now = time.time()
         cycle_start = time.monotonic()
 
