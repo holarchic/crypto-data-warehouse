@@ -14,6 +14,7 @@ All cadences come from `ExchangeConfig` (see `exchanges.yaml`), not module const
 import json
 import logging
 import math
+import queue
 import time
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -31,7 +32,7 @@ from rate_limiter import (
 )
 from status import query_active_pairs, upsert_loop_heartbeat
 
-from db import connect_db
+from db import connect_db, create_exchange, maybe_reload_markets
 
 log = logging.getLogger(__name__)
 
@@ -528,32 +529,101 @@ def _dense_row(oi_data, pair, exchange_name, funding_rates, now_ts):
 
 
 def _binance_dense_fetch(exchange, exchange_name, rate_limiter, dense_pairs, funding_rates,
-                         now_ts, thread_name, concurrency):
-    """Instantaneous OI (main weight pool) for each dense symbol; USD = oi × markPx.
-
-    Binance has no bulk instantaneous OI, so this is N per-symbol calls. At a mass settlement
-    (~541 symbols) a sequential loop overruns the 60 s tick (~140 s), diluting dense cadence
-    to ~3 min — so the fetches run on a bounded `ThreadPoolExecutor` (concurrency=K). Each
-    worker fetches+parses and RETURNS its row; only this (main) thread appends to `rows`, so
-    `rows` has a single writer. Per-symbol errors are isolated at `fut.result()`. Concurrent
-    public GETs on the shared ccxt `exchange` reuse the established timeframe-thread pattern
-    (not a requests.Session thread-safety guarantee — `oi_dense_concurrency=1` is the rollback
-    on any transport/header anomaly). Weight total is unchanged, only compressed in time; the
-    header-synced limiter caps in-flight weight (no fairness → candle freshness is the gate)."""
-    if not dense_pairs:
-        return []
-
-    def _fetch_one(pair):
-        # weight/header sync via paced_call; the limiter is lock-guarded and safe to call
-        # concurrently. Its header read is best-effort under concurrency (safety-margin-absorbed).
-        oi_data = paced_call(
-            rate_limiter, exchange, BINANCE_OI_WEIGHT, exchange.fetch_open_interest, pair["symbol"],
-        )
-        return _dense_row(oi_data, pair, exchange_name, funding_rates, now_ts)
-
+                         now_ts, thread_name):
+    """Sequential instantaneous OI for each dense symbol on `exchange` (main weight pool);
+    USD = oi × markPx. The zero-concurrency path — used at `oi_dense_concurrency<=1` or while a
+    `_DenseFetchPool` hasn't been built yet. Per-symbol errors isolate (one bad symbol never
+    aborts). At a mass settlement (~541 symbols) this overruns the 60 s tick (~140 s), which is
+    exactly why `_DenseFetchPool` parallelizes it — but with isolated per-worker sessions."""
     rows = []
-    with ThreadPoolExecutor(max_workers=max(1, concurrency)) as pool:
-        futures = {pool.submit(_fetch_one, p): p for p in dense_pairs}
+    for pair in dense_pairs:
+        sym = pair["symbol"]
+        try:
+            oi_data = paced_call(
+                rate_limiter, exchange, BINANCE_OI_WEIGHT, exchange.fetch_open_interest, sym,
+            )
+        except RETRIABLE_EXCEPTIONS as exc:
+            log.warning("[%s] Retriable error on dense %s: %s", thread_name, sym, exc)
+            continue
+        except Exception as exc:
+            log.warning("[%s] Error on dense %s: %s", thread_name, sym, exc)
+            continue
+        row = _dense_row(oi_data, pair, exchange_name, funding_rates, now_ts)
+        if row is not None:
+            rows.append(row)
+    return rows
+
+
+def _close_exchange(exchange):
+    """Best-effort release of a ccxt exchange's HTTP session (used on partial pool-init)."""
+    try:
+        exchange.close()
+    except Exception:
+        pass
+
+
+class _DenseFetchPool:
+    """Parallel Binance dense fetch with ISOLATED per-worker sessions. K worker threads each
+    borrow their OWN ccxt exchange from a checkout queue, so a concurrent dense fetch never
+    shares a `requests.Session` or `last_response_headers` across threads — no shared-session
+    thread-safety bet, no limiter header race (the read is request-local per exchange). The
+    global `WeightRateLimiter` still gates every call (the weight budget is per-IP). Built once
+    and reused; refreshes its exchanges' markets on the same age-gated schedule as the main
+    exchange so newly-listed symbols don't fail on stale pooled markets.
+
+    Row ownership stays single-writer: workers return rows, only the main thread appends.
+    Invariant: `max_workers == concurrency == len(exchanges)`, so a checkout never blocks and an
+    exchange is only ever touched by one thread at a time (`get_nowait` fails fast if broken)."""
+
+    def __init__(self, config: ExchangeConfig, concurrency: int, exchange_factory=create_exchange):
+        self._exchanges = []
+        try:
+            for _ in range(concurrency):
+                self._exchanges.append(exchange_factory(config))
+        except Exception:
+            for ex in self._exchanges:  # partial init → don't leak the sessions already opened
+                _close_exchange(ex)
+            raise
+        self._available = queue.Queue()
+        for ex in self._exchanges:
+            self._available.put(ex)
+        self._pool = ThreadPoolExecutor(max_workers=concurrency, thread_name_prefix=f"{config.name}-dense")
+
+    def _refresh_markets(self, thread_name):
+        # Called before any task is submitted, so all exchanges are idle in the queue. Age-gated
+        # per exchange; a reload failure logs and leaves that exchange stale (never aborts).
+        for ex in self._exchanges:
+            try:
+                maybe_reload_markets(ex)
+            except Exception as exc:
+                log.warning("[%s] Dense pool market reload failed (using stale): %s", thread_name, exc)
+
+    def _fetch_one(self, pair, rate_limiter, funding_rates, now_ts, exchange_name):
+        ex = self._available.get_nowait()  # fail fast if the K==workers invariant ever breaks
+        try:
+            oi_data = paced_call(
+                rate_limiter, ex, BINANCE_OI_WEIGHT, ex.fetch_open_interest, pair["symbol"],
+            )
+            return _dense_row(oi_data, pair, exchange_name, funding_rates, now_ts)
+        finally:
+            self._available.put(ex)
+
+    def close(self):
+        """Shut the pool down and release its exchange sessions. The daemon OI loop keeps the
+        pool for the process lifetime; this exists for lifecycle completeness / tests."""
+        self._pool.shutdown(wait=False)
+        for ex in self._exchanges:
+            _close_exchange(ex)
+
+    def fetch(self, dense_pairs, rate_limiter, funding_rates, now_ts, exchange_name, thread_name):
+        if not dense_pairs:
+            return []
+        self._refresh_markets(thread_name)
+        rows = []
+        futures = {
+            self._pool.submit(self._fetch_one, p, rate_limiter, funding_rates, now_ts, exchange_name): p
+            for p in dense_pairs
+        }
         for fut in as_completed(futures):
             sym = futures[fut]["symbol"]
             try:
@@ -566,7 +636,7 @@ def _binance_dense_fetch(exchange, exchange_name, rate_limiter, dense_pairs, fun
                 continue
             if row is not None:
                 rows.append(row)
-    return rows
+        return rows
 
 
 def _binance_baseline_sweep(exchange, exchange_name, rate_limiter, conn, due_pairs,
@@ -630,8 +700,20 @@ def _oi_loop_binance(exchange, config: ExchangeConfig, dsn: str, rate_limiter: R
     baseline_cursor: dict = {}   # symbol → last baseline data ts (seconds)
     baseline_last_fetch: dict = {}  # symbol → `now` of last baseline sweep (due-clock)
     seeded = False
+    dense_pool = None  # built lazily below when oi_dense_concurrency > 1; retried on failure
 
     while True:
+        # Lazy-build the isolated-session dense pool; retry each cycle on failure so a transient
+        # init miss self-heals instead of disabling parallelism until restart (degraded =
+        # sequential dense on the main exchange, which still collects, just slower).
+        if dense_pool is None and config.oi_dense_concurrency > 1:
+            try:
+                dense_pool = _DenseFetchPool(config, config.oi_dense_concurrency)
+                log.info("[%s] Dense pool ready: %d worker exchanges", thread_name, config.oi_dense_concurrency)
+            except Exception:
+                log.exception("[%s] Dense pool init failed; DEGRADED to sequential dense this cycle", thread_name)
+
+
         if conn.closed:
             try:
                 conn = connect_db(dsn)
@@ -687,10 +769,12 @@ def _oi_loop_binance(exchange, config: ExchangeConfig, dsn: str, rate_limiter: R
         dense = _binance_dense_set(
             funding_rates, active, now, config.oi_settlement_window_s, prev_next_ft, settlement_at,
         )
-        dense_rows = _binance_dense_fetch(
-            exchange, config.name, rate_limiter, dense, funding_rates, now, thread_name,
-            config.oi_dense_concurrency,
-        )
+        if dense_pool is not None:
+            dense_rows = dense_pool.fetch(dense, rate_limiter, funding_rates, now, config.name, thread_name)
+        else:
+            dense_rows = _binance_dense_fetch(
+                exchange, config.name, rate_limiter, dense, funding_rates, now, thread_name,
+            )
         try:
             dense_inserted = _insert_oi(conn, dense_rows)
         except Exception as exc:

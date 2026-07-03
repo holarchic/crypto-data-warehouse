@@ -555,7 +555,9 @@ def test_baseline_sweep_fetch_error_leaves_cursor_unadvanced(monkeypatch):
     assert "BTC/USDT:USDT" not in last_fetch        # stays due → retried next sweep
 
 
-def test_dense_fetch_usd_from_markpx_and_skips_errors(monkeypatch):
+def test_dense_fetch_sequential_usd_and_skips(monkeypatch):
+    # Sequential path (oi_dense_concurrency<=1 / pre-pool fallback): USD from markPx; ETH has no
+    # mark → None (not a crash).
     _patch_paced_and_sleep(monkeypatch)
     ex = _FakeExchange(oi_by_symbol={
         "BTC/USDT:USDT": {"openInterestAmount": 100.0},
@@ -565,47 +567,134 @@ def test_dense_fetch_usd_from_markpx_and_skips_errors(monkeypatch):
         {"asset_id": "BTC", "symbol": "BTC/USDT:USDT"},
         {"asset_id": "ETH", "symbol": "ETH/USDT:USDT"},
     ]
-    fr = {"BTC/USDT:USDT": _fr(NOW, mark=60000.0), "ETH/USDT:USDT": _fr(NOW)}  # ETH has no mark
-    rows = oi._binance_dense_fetch(ex, "binance", None, dense_pairs, fr, NOW, "binance/oi", 4)
+    fr = {"BTC/USDT:USDT": _fr(NOW, mark=60000.0), "ETH/USDT:USDT": _fr(NOW)}
+    rows = oi._binance_dense_fetch(ex, "binance", None, dense_pairs, fr, NOW, "binance/oi")
     by = {r["asset_id"]: r for r in rows}
     assert by["BTC"]["oi_value_usd"] == 100.0 * 60000.0
-    assert by["ETH"]["oi_value_usd"] is None  # no markPrice → None (not a crash)
+    assert by["ETH"]["oi_value_usd"] is None
 
 
-def test_dense_fetch_error_isolation_under_pool(monkeypatch):
-    # One symbol's fetch raises → skipped; every other symbol still lands, regardless of
-    # completion order (per-symbol isolation at fut.result()).
+def test_dense_fetch_sequential_error_isolation_and_empty(monkeypatch):
     _patch_paced_and_sleep(monkeypatch)
-    syms = [f"C{i}/USDT:USDT" for i in range(20)]
-    ex = _FakeExchange(
-        oi_by_symbol={s: {"openInterestAmount": float(i)} for i, s in enumerate(syms)},
-        raise_oi={"C7/USDT:USDT"},
+    ex = _FakeExchange(oi_by_symbol={"A/USDT:USDT": {"openInterestAmount": 1.0}},
+                       raise_oi={"B/USDT:USDT"})
+    pairs = [{"asset_id": "A", "symbol": "A/USDT:USDT"}, {"asset_id": "B", "symbol": "B/USDT:USDT"}]
+    rows = oi._binance_dense_fetch(ex, "binance", None, pairs, {}, NOW, "binance/oi")
+    assert [r["symbol"] for r in rows] == ["A/USDT:USDT"]  # B raised → skipped, A lands
+    assert oi._binance_dense_fetch(ex, "binance", None, [], {}, NOW, "binance/oi") == []
+
+
+# --- _DenseFetchPool: isolated per-worker sessions ---------------------------
+
+
+class _PoolFakeExchange:
+    """A per-worker fake exchange. Records close()/reload; flags if the SAME instance is entered
+    concurrently (the checkout queue must prevent that)."""
+
+    def __init__(self, oi_by_symbol, raise_oi, shared):
+        self._oi = oi_by_symbol
+        self._raise = raise_oi
+        self._shared = shared           # shared dict across the K exchanges for assertions
+        self._in_use = False
+        self.closed = False
+
+    def fetch_open_interest(self, symbol):
+        if self._in_use:               # two threads in one exchange → checkout invariant broken
+            self._shared["concurrent_reuse"] = True
+        self._in_use = True
+        try:
+            import time as _t
+            _t.sleep(0.002)            # widen the window so a real violation would be caught
+            if symbol in self._raise:
+                raise RuntimeError("oi boom")
+            return self._oi.get(symbol)
+        finally:
+            self._in_use = False
+
+    def load_markets(self, reload=False):
+        self._shared["reloads"] = self._shared.get("reloads", 0) + 1
+
+    def close(self):
+        self.closed = True
+
+
+def _pool_factory(oi_by_symbol, raise_oi=frozenset(), shared=None, fail_after=None):
+    made = []
+
+    def factory(_config):
+        if fail_after is not None and len(made) >= fail_after:
+            raise RuntimeError("factory boom")
+        ex = _PoolFakeExchange(oi_by_symbol, raise_oi, shared if shared is not None else {})
+        made.append(ex)
+        return ex
+
+    factory.made = made
+    return factory
+
+
+def _mk_pool(monkeypatch, factory, concurrency=4):
+    _patch_paced_and_sleep(monkeypatch)
+    cfg = _cfg_binance()
+    return oi._DenseFetchPool(cfg, concurrency, exchange_factory=factory)
+
+
+def _cfg_binance():
+    from types import SimpleNamespace
+    return SimpleNamespace(name="binance")
+
+
+def test_dense_pool_fetches_all_no_concurrent_reuse(monkeypatch):
+    shared = {}
+    syms = [f"C{i}/USDT:USDT" for i in range(30)]
+    factory = _pool_factory({s: {"openInterestAmount": float(i)} for i, s in enumerate(syms)}, shared=shared)
+    pool = _mk_pool(monkeypatch, factory, concurrency=4)
+    try:
+        pairs = [{"asset_id": f"C{i}", "symbol": s} for i, s in enumerate(syms)]
+        fr = {s: _fr(NOW, mark=2.0) for s in syms}
+        rows = pool.fetch(pairs, None, fr, NOW, "binance", "binance/oi")
+        assert {r["symbol"] for r in rows} == set(syms)           # every symbol landed
+        assert shared.get("concurrent_reuse") is not True         # no exchange used by 2 threads
+        assert len(factory.made) == 4                             # K dedicated exchanges
+    finally:
+        pool.close()
+
+
+def test_dense_pool_error_isolation_and_market_refresh(monkeypatch):
+    shared = {}
+    syms = [f"C{i}/USDT:USDT" for i in range(12)]
+    factory = _pool_factory(
+        {s: {"openInterestAmount": float(i)} for i, s in enumerate(syms)},
+        raise_oi={"C3/USDT:USDT"}, shared=shared,
     )
-    dense_pairs = [{"asset_id": f"C{i}", "symbol": s} for i, s in enumerate(syms)]
-    fr = {s: _fr(NOW, mark=2.0) for s in syms}
-    rows = oi._binance_dense_fetch(ex, "binance", None, dense_pairs, fr, NOW, "binance/oi", 6)
-    landed = {r["symbol"] for r in rows}
-    assert "C7/USDT:USDT" not in landed          # the failing symbol skipped
-    assert landed == set(syms) - {"C7/USDT:USDT"}  # all 19 others landed
+    pool = _mk_pool(monkeypatch, factory, concurrency=3)
+    try:
+        pairs = [{"asset_id": f"C{i}", "symbol": s} for i, s in enumerate(syms)]
+        # market refresh runs before submit — force reload by pretending markets are ancient.
+        monkeypatch.setattr(oi, "maybe_reload_markets", lambda ex: ex.load_markets(reload=True))
+        rows = pool.fetch(pairs, None, {s: _fr(NOW, mark=1.0) for s in syms}, NOW, "binance", "binance/oi")
+        assert "C3/USDT:USDT" not in {r["symbol"] for r in rows}  # failing symbol skipped
+        assert len(rows) == 11                                    # the other 11 landed
+        assert shared.get("reloads") == 3                         # refreshed all 3 pooled exchanges
+    finally:
+        pool.close()
 
 
-def test_dense_fetch_concurrency_1_same_row_set(monkeypatch):
-    # concurrency=1 serializes ccxt access (the rollback for shared-session anomalies: only
-    # one fetch in flight at a time). It yields the same row SET as the parallel path — insert
-    # order is immaterial (rows are PK-distinct, ON CONFLICT DO NOTHING), so as_completed's
-    # non-guaranteed order across already-finished futures doesn't matter.
+def test_dense_pool_empty_set(monkeypatch):
+    pool = _mk_pool(monkeypatch, _pool_factory({}), concurrency=2)
+    try:
+        assert pool.fetch([], None, {}, NOW, "binance", "binance/oi") == []
+    finally:
+        pool.close()
+
+
+def test_dense_pool_partial_init_closes_built_exchanges(monkeypatch):
+    # Factory fails on the 3rd exchange → the 2 already built are close()d, pool not published.
+    import pytest
+    factory = _pool_factory({}, fail_after=2)
     _patch_paced_and_sleep(monkeypatch)
-    syms = [f"C{i}/USDT:USDT" for i in range(5)]
-    ex = _FakeExchange(oi_by_symbol={s: {"openInterestAmount": float(i)} for i, s in enumerate(syms)})
-    dense_pairs = [{"asset_id": f"C{i}", "symbol": s} for i, s in enumerate(syms)]
-    fr = {s: _fr(NOW, mark=1.0) for s in syms}
-    rows = oi._binance_dense_fetch(ex, "binance", None, dense_pairs, fr, NOW, "binance/oi", 1)
-    assert {r["symbol"] for r in rows} == set(syms)
-
-
-def test_dense_fetch_empty_set_returns_empty(monkeypatch):
-    _patch_paced_and_sleep(monkeypatch)
-    assert oi._binance_dense_fetch(_FakeExchange(), "binance", None, [], {}, NOW, "binance/oi", 6) == []
+    with pytest.raises(RuntimeError, match="factory boom"):
+        oi._DenseFetchPool(_cfg_binance(), 6, exchange_factory=factory)
+    assert len(factory.made) == 2 and all(ex.closed for ex in factory.made)
 
 
 def test_oi_loop_raises_on_unknown_oi_venue():
@@ -645,7 +734,7 @@ def test_binance_loop_skips_baseline_when_seed_fails(monkeypatch):
     ex = SimpleNamespace(fetch_funding_rates=lambda: {}, last_response_headers=None)
     cfg = SimpleNamespace(name="binance", market_type="perp", ccxt_class="binanceusdm",
                           oi_poll_interval_s=60, oi_settlement_window_s=900,
-                          oi_baseline_interval_s=1800, oi_dense_concurrency=6)
+                          oi_baseline_interval_s=1800, oi_dense_concurrency=1)  # sequential path
     try:
         oi._oi_loop_binance(ex, cfg, "dsn", None)
     except _StopLoop:
