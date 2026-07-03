@@ -21,6 +21,14 @@ def test_load_config_coinbase_no_funding():
     assert cfg.market_type == "spot"
 
 
+def test_has_liquidation_ws_flag():
+    # T-009.2: binance + bybit stream liquidations; others (incl. HL) do not (default False).
+    assert load_config("binance").has_liquidation_ws is True
+    assert load_config("bybit").has_liquidation_ws is True
+    assert load_config("hyperliquid").has_liquidation_ws is False
+    assert load_config("coinbase").has_liquidation_ws is False
+
+
 def test_load_config_unknown_exchange_raises():
     with pytest.raises(ValueError, match="Unknown exchange"):
         load_config("doesnotexist")
