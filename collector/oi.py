@@ -699,6 +699,20 @@ def _oi_loop_binance(exchange, config: ExchangeConfig, dsn: str, rate_limiter: R
     """Binance two-source OI: a 5-min baseline via openInterestHist (separate weight
     bucket) + sub-5-min dense openInterest for symbols within ±window of settlement."""
     thread_name = f"{config.name}/oi"
+
+    # Operator-invariant check (T-007.4): the priority reserve must cover the dense in-flight
+    # footprint (oi_dense_concurrency × per-call weight), else dense workers can block on the
+    # reserve boundary at a mass settlement and re-dilute the cadence. Warn once at startup; a
+    # too-small reserve degrades gracefully (it doesn't break), so don't abort. 0 = lane off.
+    reserve = config.rate_limit_priority_reserve
+    needed = config.oi_dense_concurrency * BINANCE_OI_WEIGHT
+    if 0 < reserve < needed:
+        log.warning(
+            "[%s] rate_limit_priority_reserve=%d < oi_dense_concurrency×weight=%d — dense may "
+            "block on the reserve at a mass settlement; raise rate_limit_priority_reserve",
+            thread_name, reserve, needed,
+        )
+
     conn = connect_db(dsn)
     prev_next_ft: dict = {}      # symbol → last-seen nextFundingTime (ms), for change-detection
     settlement_at: dict = {}     # symbol → wall-clock time.time() of last detected settlement

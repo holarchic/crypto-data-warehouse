@@ -780,7 +780,8 @@ def test_binance_loop_skips_baseline_when_seed_fails(monkeypatch):
     ex = SimpleNamespace(fetch_funding_rates=fetch_funding_rates, last_response_headers=None)
     cfg = SimpleNamespace(name="binance", market_type="perp", ccxt_class="binanceusdm",
                           oi_poll_interval_s=60, oi_settlement_window_s=900,
-                          oi_baseline_interval_s=1800, oi_dense_concurrency=1)  # sequential path
+                          oi_baseline_interval_s=1800, oi_dense_concurrency=1,
+                          rate_limit_priority_reserve=0)  # sequential path, lane off
     try:
         oi._oi_loop_binance(ex, cfg, "dsn", None)
     except _StopLoop:
@@ -789,6 +790,31 @@ def test_binance_loop_skips_baseline_when_seed_fails(monkeypatch):
     assert hb["n"] == 1      # liveness heartbeat still fired
     # The premiumIndex trigger rides the priority weight lane (T-007.4).
     assert ("fetch_funding_rates", True) in paced_calls
+
+
+def test_binance_loop_warns_on_undersized_reserve(monkeypatch, caplog):
+    # T-007.4 operator invariant: reserve < oi_dense_concurrency × weight → warn at startup.
+    import logging
+    from types import SimpleNamespace
+    conn = FakeConn()
+    monkeypatch.setattr(oi, "connect_db", lambda dsn: conn)
+    monkeypatch.setattr(oi, "_get_active_pairs", lambda c, name: [])  # no pairs → fast exit
+    monkeypatch.setattr(oi, "_heartbeat", lambda *a: None)
+
+    def stop(*a):
+        raise _StopLoop
+
+    monkeypatch.setattr(oi, "_sleep_until_next", stop)
+    cfg = SimpleNamespace(name="binance", market_type="perp", ccxt_class="binanceusdm",
+                          oi_poll_interval_s=60, oi_settlement_window_s=900,
+                          oi_baseline_interval_s=1800, oi_dense_concurrency=6,
+                          rate_limit_priority_reserve=2)  # 2 < 6×1 → warn
+    with caplog.at_level(logging.WARNING):
+        try:
+            oi._oi_loop_binance(None, cfg, "dsn", None)
+        except _StopLoop:
+            pass
+    assert any("block on the reserve" in r.message for r in caplog.records)
 
 
 def test_prune_binance_state_drops_inactive_symbols():

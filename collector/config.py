@@ -49,11 +49,12 @@ class ExchangeConfig:
     rate_limit_weight_budget: int | None = None
     rate_limit_window_s: int = 60
     rate_limit_safety: int = 400
-    # Weight reserved for priority callers (the Binance dense-OI lane, T-007.4). Non-priority
-    # callers (candles/funding/baseline) self-limit to `budget - safety - reserve`; priority
+    # Weight reserved for priority callers (the Binance dense-OI lane, T-007.4). Positive-weight
+    # non-priority callers (candles, funding) self-limit to `budget - safety - reserve`; priority
     # callers (dense `fetch_open_interest` + its premiumIndex trigger) draw up to `budget -
-    # safety`, so the dense burst never blocks on the candle-kline burst. 0 = lane off (the
-    # single-cap rollback). Operator invariant: reserve >= oi_dense_concurrency * OI weight.
+    # safety`, so the dense burst never blocks on the candle-kline burst. (The openInterestHist
+    # baseline is weight 0 and bypasses the cap entirely — separate /futures/data bucket.) 0 =
+    # lane off (single-cap rollback). Operator invariant: reserve >= oi_dense_concurrency × OI weight.
     rate_limit_priority_reserve: int = 0
     # OI cadence knobs (T-007.2). oi_poll_interval_s is the loop tick for every OI
     # strategy (HL bulk, Bybit/OKX bulk, Binance dense). oi_settlement_window_s and
