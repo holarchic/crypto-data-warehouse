@@ -1,4 +1,4 @@
-ccxt>=4.5.0
+ccxt>=4.5.63
 cryptography>=44.0.0
 psycopg>=3.2
 python-dotenv>=1.0.0
