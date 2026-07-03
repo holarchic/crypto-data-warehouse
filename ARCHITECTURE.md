@@ -18,6 +18,18 @@ The OI loop (`oi.py`) dispatches each `has_oi` exchange to one of **three strate
 
 **Shared-limiter coupling:** the Binance dense burst shares this container's `WeightRateLimiter` (unprioritised) with candle collection; the baseline is kept off the main pool and the dense tick is 60 s to bound peak OI weight — candle freshness is prod-gated (see SPEC failure mode).
 
+### collector/ws.py — streaming engine (infrastructure; not yet launched)
+
+`ws_loop` is a generic threaded WebSocket engine driven by a `WSFeedSpec` injection record, so it carries **zero venue branches** — the four planned feeds (Binance/Bybit × liquidations/mark) reuse one engine. Venue behavior (URL, topic mapping, sub/unsub frames, message parser, batch insert, app-ping, proactive-reconnect) is entirely spec-injected. The engine owns:
+
+- **Connection lifecycle** via `websocket-client` (`create_connection` + an explicit recv loop with a 1 s socket timeout so ping/heartbeat/resubscribe timers are serviced even on a silent feed). A `recv` timeout is quiet; `recv()==""` with `not connected` is a graceful server close.
+- **Reconnect/backoff** on a WS-local retriable set (`WS_RETRIABLE` — `backoff.RETRIABLE_EXCEPTIONS` is ccxt/psycopg-shaped and would never catch a WS drop), reusing only `backoff_sleep`. The in-session DB reconnect (`_ensure_conn`) is **single-shot/non-blocking** so a Postgres blip never freezes the recv loop. Only a *proactive* reconnect skips backoff; a *server-initiated* close backs off (no tight-spin).
+- **Subscription management** — initial subscribe + diff-based resubscribe when discovery changes the active-pair set; venue callables own their own arg-cap batching. The subscribed set is cached in `_WSRuntime.topics` and reused on a reconnect that lands during a DB outage (so a per-symbol feed isn't dropped to zero).
+- **Batch insert** (`spec.insert_batch`, flushed by size or ~1 s) with the buffer owned by `ws_loop` so it survives a reconnect, bounded at `WS_MAX_BUFFER` (drop oldest) on a sustained DB outage.
+- **Connection-timer liveness heartbeat** (`liq_ws` pseudo-TF, same sentinel path as funding/oi) — fires while the socket is up, *not* per event, since a quiet feed is healthy.
+
+`_run_session` (one connection) is factored from `ws_loop` (the reconnect wrapper) for testability; `connect_fn`/`clock` are injected. **Not launched in `run()`** — real venue specs/parsers, the `liquidations` table, and the `run()` wiring land in T-009.2/.4.
+
 ### monitor (collector/monitor.py)
 
 Separate always-on container (`python -m monitor`). One `collection_status` fetch per cycle (`fetch_status_rows`) feeds two independent alert signals plus gap detection:
