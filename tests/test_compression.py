@@ -119,3 +119,64 @@ def test_init_sql_open_interest_chunk_is_one_week():
     idx = sql.index("create_hypertable('open_interest'")
     block = sql[idx:idx + 200]
     assert "chunk_time_interval => INTERVAL '1 week'" in block, "init.sql open_interest not 1-week chunks"
+
+
+# --- liquidations (migration 008) — all-venue liquidation events ------------
+# Empirically validated on timescaledb pg16 (dedup + compression). Guard migration ≡
+# init.sql at the text level so the two never drift (T-009.4).
+
+MIGRATION_008 = pathlib.Path(__file__).parent.parent / "db" / "migrations" / "008-liquidations.sql"
+
+LIQ_CLAUSES = [
+    "CREATE TABLE IF NOT EXISTS liquidations",
+    "create_hypertable('liquidations'",
+    "chunk_time_interval => INTERVAL '1 week'",
+    "CREATE UNIQUE INDEX IF NOT EXISTS idx_liquidations_dedup",
+    "timescaledb.compress_segmentby = 'venue, asset_id'",
+    "timescaledb.compress_orderby = 'timestamp DESC'",
+    "add_compression_policy('liquidations'",
+    "add_retention_policy('liquidations'",
+]
+
+# The HL seed's 13 columns + venue/grade/liquidated_side, in DDL order.
+LIQ_COLUMNS = [
+    "timestamp", "venue", "grade", "asset_id", "liquidated_side", "side", "dir",
+    "px", "sz", "mark_px", "closed_pnl", "method", "liquidated_user", "oid", "tid", "day",
+]
+
+
+def test_migration_008_exists():
+    assert MIGRATION_008.exists(), "008-liquidations.sql not found"
+
+
+def test_migration_008_has_all_clauses():
+    sql = _read(MIGRATION_008)
+    for clause in LIQ_CLAUSES:
+        assert clause in sql, f"008 missing: {clause}"
+
+
+def test_init_sql_has_liquidations():
+    """Fresh installs (init.sql) must create liquidations with every clause the migration has."""
+    sql = _read(INIT_SQL)
+    for clause in LIQ_CLAUSES:
+        assert clause in sql, f"init.sql missing liquidations clause: {clause}"
+
+
+def test_liquidations_columns_match_across_migration_and_init():
+    for path in (MIGRATION_008, INIT_SQL):
+        sql = _read(path)
+        idx = sql.index("CREATE TABLE IF NOT EXISTS liquidations")
+        block = sql[idx:idx + 900]
+        positions = [block.find(col) for col in LIQ_COLUMNS]
+        assert all(p > 0 for p in positions), f"{path.name}: missing a liquidations column"
+        assert positions == sorted(positions), f"{path.name}: liquidations columns out of order"
+
+
+def test_liquidations_dedup_index_preserves_oid_tid():
+    """The dedup key MUST be (venue, asset_id, timestamp, oid, tid). Dropping oid/tid would
+    collapse the HL tape's real same-ms clustered events (load-bearing claim). Pin it in both files."""
+    for path in (MIGRATION_008, INIT_SQL):
+        sql = _read(path)
+        idx = sql.index("idx_liquidations_dedup")
+        block = sql[idx:idx + 120]
+        assert "(venue, asset_id, timestamp, oid, tid)" in block, f"{path.name}: dedup index shape drifted"
