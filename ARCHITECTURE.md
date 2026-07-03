@@ -8,7 +8,7 @@ Fetches OHLCV candles, funding rates, and open interest from exchanges. Writes d
 
 `collect_loop` calls `maybe_reload_markets()` (in `db.py`) at the top of each cycle. The helper is age-gated (`MARKETS_RELOAD_INTERVAL_S`, default 86400s) and lock-guarded so the per-timeframe threads sharing one ccxt `exchange` reload at most once per interval. Without this, symbols added by daily discovery stay invisible to the long-running collector container.
 
-The funding and OI threads upsert a per-loop **liveness heartbeat** each cycle (`status.upsert_loop_heartbeat`): a sentinel `collection_status` row with `symbol = "*"` and a pseudo-timeframe from `config.LOOP_INTERVALS` (`funding` / `oi`). These threads write no per-pair candle status, so without the heartbeat a silently-dead funding/OI thread produces no staleness footprint; the monitor flags the sentinel row when it goes stale.
+The funding, OI, and liquidation-WS threads upsert a per-loop **liveness heartbeat** (`status.upsert_loop_heartbeat`): a sentinel `collection_status` row with `symbol = "*"` and a pseudo-timeframe from `config.LOOP_INTERVALS` (`funding` / `oi` / `liq_ws`). The poll loops fire it each cycle; the WS loop fires it on a ~60 s connection timer while the socket is up (a quiet feed is healthy). These threads write no per-pair candle status, so without the heartbeat a silently-dead loop produces no staleness footprint; the monitor flags the sentinel row when it goes stale.
 
 The OI loop (`oi.py`) dispatches each `has_oi` exchange to one of **three strategies** (`oi_loop`; an unrecognized OI venue raises rather than defaulting), all cadences from `ExchangeConfig` (`oi_poll_interval_s` / `oi_settlement_window_s` / `oi_baseline_interval_s`):
 
@@ -18,7 +18,7 @@ The OI loop (`oi.py`) dispatches each `has_oi` exchange to one of **three strate
 
 **Shared-limiter coupling:** the Binance dense burst shares this container's `WeightRateLimiter` with candle collection (the budget is per-IP). `build_rate_limiter(config)` is the single construction seam (weight vs interval limiter + reserve wiring). A **priority reserve lane** (`rate_limit_priority_reserve`) stops the dense burst blocking on the coincident candle-kline burst: the dense per-symbol `fetch_open_interest` + its `premiumIndex` trigger `acquire(priority=True)` and may draw up to `budget − safety`, while candles/funding self-limit to `budget − safety − reserve`; the reserve is always spendable by the ≤`oi_dense_concurrency` dense workers. Weight-0 calls (the `openInterestHist` baseline on the separate `/futures/data` bucket) bypass the cap entirely. An over-large reserve (≥ half the usable cap) is neutralized to 0 with a warning; `_oi_loop_binance` also warns if the reserve is under the dense in-flight footprint (`oi_dense_concurrency × weight`). The dense tick is 60 s to bound peak OI weight; candle freshness stays the prod re-verify gate (see SPEC failure mode).
 
-### collector/ws.py — streaming engine (infrastructure; not yet launched)
+### collector/ws.py — streaming engine (Binance + Bybit liquidations live)
 
 `ws_loop` is a generic threaded WebSocket engine driven by a `WSFeedSpec` injection record, so it carries **zero venue branches** — the four planned feeds (Binance/Bybit × liquidations/mark) reuse one engine. Venue behavior (URL, topic mapping, sub/unsub frames, message parser, batch insert, app-ping, proactive-reconnect) is entirely spec-injected. The engine owns:
 
@@ -28,13 +28,19 @@ The OI loop (`oi.py`) dispatches each `has_oi` exchange to one of **three strate
 - **Batch insert** (`spec.insert_batch`, flushed by size or ~1 s) with the buffer owned by `ws_loop` so it survives a reconnect, bounded at `WS_MAX_BUFFER` (drop oldest) on a sustained DB outage.
 - **Connection-timer liveness heartbeat** (`liq_ws` pseudo-TF, same sentinel path as funding/oi) — fires while the socket is up, *not* per event, since a quiet feed is healthy.
 
-`_run_session` (one connection) is factored from `ws_loop` (the reconnect wrapper) for testability; `connect_fn`/`clock` are injected. **Not launched in `run()`** — real venue specs/parsers, the `liquidations` table, and the `run()` wiring land in T-009.2/.4.
+`_run_session` (one connection) is factored from `ws_loop` (the reconnect wrapper) for testability; `connect_fn`/`clock` are injected. `run()` launches a `ws_loop` thread per `has_liquidation_ws` exchange (the same daemon-thread-per-loop model as the poll loops).
+
+### collector/liquidations.py — Binance + Bybit liquidation feed specs (Grade C)
+
+The venue data for `ws.py` (the engine stays venue-agnostic). Two `WSFeedSpec` builders + `build_liq_spec(venue)` (the resolver `run()` calls; raises on an unknown venue). Binance `!forceOrder@arr` is one all-market stream on the **routed `/market` path** (an unrouted `/ws` gets only Public data); Bybit `allLiquidation.{native}` is per-symbol, batched-subscribe, 20 s ping. **asset_id resolution:** `parse_message` receives only the raw frame, so each builder closes over a shared `native_to_asset` map that `topics_for_pairs` rebuilds (engine-called at subscribe + resub) and `parse_message` reads — no lock, because `_run_session` calls both sequentially on the one feed thread, subscribe before recv. Binance's all-market stream is filtered to cc's tracked pairs (untracked → no map entry → skipped). Side normalized to `liquidated_side ∈ {long, short}` across the venues' opposite conventions. Grade-C insert (`ON CONFLICT` inert via NULLS-DISTINCT — every event lands). One Bybit connection holds the universe under the 21 k-char args ceiling; a char-based guard warns before a growth breach (sharding deferred).
+
+**Collector concurrency invariant:** each loop (candle per-TF, funding, OI, WS) runs on its own daemon thread with its **own DB connection and direct writes** to disjoint tables — there is no single-writer queue, by design (one container per exchange, no cross-loop write contention). The WS engine conforms: it buffers events and batch-flushes on its own connection.
 
 ### monitor (collector/monitor.py)
 
 Separate always-on container (`python -m monitor`). One `collection_status` fetch per cycle (`fetch_status_rows`) feeds two independent alert signals plus gap detection:
 
-- **Loop-liveness** — presence-based: any stale funding/OI heartbeat sentinel row pages (own cooldown key). A single dead loop is one row, so it is kept off the count-delta signal below.
+- **Loop-liveness** — presence-based: any stale per-loop heartbeat sentinel row (funding/OI/liq_ws) pages (own cooldown key). A single dead loop is one row, so it is kept off the count-delta signal below.
 - **Candle alarming-mass** — `compute_alarming` counts collectors that are *alarming* (`error_count > 0`, or was-working-now-dark past `4×interval`; excludes the benign new-listing floor + the HL 5m within-cycle cursor). `evaluate_alarming` pages when that count exceeds its rolling-1h median by `ALARMING_DELTA_THRESHOLD` for `ALARMING_SUSTAIN_CYCLES` consecutive cycles, returning a named `AlarmingDecision` that owns the record-only-quiescent baseline invariant.
 - **Gap detection** (tiered by timeframe) + a daily heartbeat summary + a per-cycle healthcheck dead-man's-switch ping.
 
@@ -76,8 +82,8 @@ PK: `(exchange, market_type, symbol, timeframe, timestamp)`
 ### `collection_status`
 
 PK: `(exchange, market_type, symbol, timeframe)` — health tracking + discovery metadata per pair.
-Also holds per-loop **liveness heartbeats** for the funding/OI threads: sentinel rows with
-`symbol = "*"` and `timeframe ∈ {funding, oi}` (one per exchange/loop). Candle-facing readers
+Also holds per-loop **liveness heartbeats** for the funding/OI/liquidation-WS threads: sentinel rows with
+`symbol = "*"` and `timeframe ∈ {funding, oi, liq_ws}` (one per exchange/loop). Candle-facing readers
 (`query_active_pairs`, the `/candles/*` and `/status` API endpoints) exclude these by pseudo-timeframe;
 the monitor's staleness check is the only consumer that acts on them.
 
