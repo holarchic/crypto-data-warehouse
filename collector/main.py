@@ -6,6 +6,7 @@ from backoff import RETRIABLE_EXCEPTIONS
 from config import ExchangeConfig, TimeframeConfig, load_config
 from dotenv import load_dotenv
 from funding import funding_loop
+from liquidations import build_liq_spec
 from oi import oi_loop
 from rate_limiter import (
     RateLimiter,
@@ -14,6 +15,7 @@ from rate_limiter import (
     paced_call,
 )
 from status import query_active_pairs, upsert_status_error, upsert_status_success
+from ws import ws_loop
 
 from db import build_dsn, connect_db, create_exchange, maybe_reload_markets
 
@@ -268,6 +270,19 @@ def run():
             target=oi_loop,
             args=(exchange, config, dsn, rate_limiter),
             name=f"{config.name}-oi",
+            daemon=True,
+        )
+        t.start()
+        threads.append(t)
+        log.info("Started thread %s", t.name)
+
+    # Liquidation WS feed thread (T-009.2) — the venue's spec injected into the generic engine.
+    # `build_liq_spec` raises on a flag set for a venue with no builder (fail fast, not a silent skip).
+    if config.has_liquidation_ws:
+        t = threading.Thread(
+            target=ws_loop,
+            args=(build_liq_spec(config.name), config, dsn),
+            name=f"{config.name}-liq",
             daemon=True,
         )
         t.start()

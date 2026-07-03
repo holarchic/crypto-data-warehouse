@@ -241,3 +241,13 @@ def build_bybit_liq_spec() -> WSFeedSpec:
 
 # Venue → spec builder, for `main.run()` to launch the right feed behind `has_liquidation_ws`.
 LIQ_SPEC_BUILDERS = {"binance": build_binance_liq_spec, "bybit": build_bybit_liq_spec}
+
+
+def build_liq_spec(venue: str) -> WSFeedSpec:
+    """Resolve a venue's liquidation `WSFeedSpec`. Raises on an unknown venue — a
+    `has_liquidation_ws` flag with no builder is a config error, not a silent no-op. This is the
+    testable seam `main.run()` calls (the thread launch itself is a thin inline call)."""
+    try:
+        return LIQ_SPEC_BUILDERS[venue]()
+    except KeyError:
+        raise ValueError(f"no liquidation spec builder for venue '{venue}'") from None
