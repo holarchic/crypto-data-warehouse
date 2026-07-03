@@ -88,8 +88,10 @@ class WeightRateLimiter:
       (weight-only; `priority` does not affect release).
 
     `priority_reserve` is clamped ≥0 and neutralized to 0 (with a warning) if it
-    claims ≥ half the usable cap — an over-large reserve would collapse the
-    non-priority cap and deadlock candle/funding acquires.
+    claims ≥ half the usable cap — a conservative generic bound that keeps the
+    non-priority cap comfortably above any single caller's weight (an over-large
+    reserve would otherwise shrink it below a caller's weight and stall
+    candle/funding acquires); half-cap is the policy, not the literal deadlock point.
 
     The server header is the source of truth for cross-process budget use — it
     reflects the IP's actual usage across this and any other process sharing the
@@ -120,12 +122,14 @@ class WeightRateLimiter:
         self._used_at = time.monotonic()
         self._in_flight = 0
         # Weight held back from non-priority callers so a priority caller (the dense-OI lane)
-        # always has spendable headroom (see `acquire`). Guard: a reserve claiming half or more
-        # of the usable cap would collapse the non-priority cap and *deadlock* every candle/
-        # funding acquire (a hard stall, not a slow-down) — so neutralize an over-large reserve
-        # to 0 (fall back to single-cap behaviour, keep the collector alive) with a loud warning.
-        # Half-cap is a generic bound: it guarantees the non-priority cap stays > (budget-safety)/2,
-        # comfortably above any single caller's weight, without coupling the limiter to who calls it.
+        # always has spendable headroom (see `acquire`). Guard against an over-large reserve: the
+        # actual failure is the non-priority cap (`budget - safety - reserve`) falling to/below a
+        # caller's weight — at the extreme, a reserve >= the usable cap collapses it to <=0 and
+        # stalls every candle/funding acquire. Rather than couple the limiter to caller weights,
+        # reject any reserve claiming >= HALF the usable cap: a conservative, generic bound that
+        # keeps the non-priority cap > (budget-safety)/2 — comfortably above any single caller's
+        # weight — and neutralizes an over-large reserve to 0 (single-cap fallback, collector stays
+        # alive) with a loud warning. Half-cap is the policy bound, not the literal deadlock point.
         usable = budget - safety
         if priority_reserve * 2 >= usable:
             log.warning(
