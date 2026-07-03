@@ -49,6 +49,12 @@ class ExchangeConfig:
     rate_limit_weight_budget: int | None = None
     rate_limit_window_s: int = 60
     rate_limit_safety: int = 400
+    # Weight reserved for priority callers (the Binance dense-OI lane, T-007.4). Non-priority
+    # callers (candles/funding/baseline) self-limit to `budget - safety - reserve`; priority
+    # callers (dense `fetch_open_interest` + its premiumIndex trigger) draw up to `budget -
+    # safety`, so the dense burst never blocks on the candle-kline burst. 0 = lane off (the
+    # single-cap rollback). Operator invariant: reserve >= oi_dense_concurrency * OI weight.
+    rate_limit_priority_reserve: int = 0
     # OI cadence knobs (T-007.2). oi_poll_interval_s is the loop tick for every OI
     # strategy (HL bulk, Bybit/OKX bulk, Binance dense). oi_settlement_window_s and
     # oi_baseline_interval_s are Binance-only (± dense window half-width; per-symbol
@@ -89,6 +95,7 @@ def _parse_exchange(exchange_name: str, ex: dict, tf_defs: dict) -> ExchangeConf
         rate_limit_weight_budget=ex.get("rate_limit_weight_budget"),
         rate_limit_window_s=ex.get("rate_limit_window_s", 60),
         rate_limit_safety=ex.get("rate_limit_safety", 400),
+        rate_limit_priority_reserve=ex.get("rate_limit_priority_reserve", 0),
         oi_poll_interval_s=ex.get("oi_poll_interval_s", 300),
         oi_settlement_window_s=ex.get("oi_settlement_window_s", 900),
         oi_baseline_interval_s=ex.get("oi_baseline_interval_s", 1800),
