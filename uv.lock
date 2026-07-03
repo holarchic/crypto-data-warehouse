@@ -203,7 +203,7 @@ dev = [
 
 [package.metadata]
 requires-dist = [
-    { name = "ccxt", specifier = ">=4.5.0" },
+    { name = "ccxt", specifier = ">=4.5.63" },
     { name = "cryptography", specifier = ">=44.0.0" },
     { name = "fastapi", specifier = ">=0.115.0" },
     { name = "psycopg", specifier = ">=3.2" },

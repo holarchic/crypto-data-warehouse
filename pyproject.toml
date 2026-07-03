@@ -7,7 +7,7 @@ requires-python = ">=3.12"
 # hook) resolves the same imports the tests exercise; keep the floors in sync with
 # those two files.
 dependencies = [
-    "ccxt>=4.5.0",
+    "ccxt>=4.5.63",  # 4.5.47 crashed on okx load_markets (keysort None id); 4.5.63 fixes it
     "cryptography>=44.0.0",
     "psycopg>=3.2",
     "psycopg_pool>=3.2",
