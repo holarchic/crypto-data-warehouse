@@ -4,9 +4,9 @@ import logging
 
 log = logging.getLogger(__name__)
 
-# Sentinel symbol for the per-loop liveness heartbeat rows (funding/OI threads).
-# One row per (exchange, loop), keyed (exchange, market_type, "*", loop-pseudo-tf).
-# Never a real ccxt symbol, so it can't collide with a candle pair.
+# Sentinel symbol for the per-loop liveness heartbeat rows (funding/OI poll loops and
+# the streaming WS loop). One row per (exchange, loop), keyed (exchange, market_type,
+# "*", loop-pseudo-tf). Never a real ccxt symbol, so it can't collide with a candle pair.
 LOOP_SENTINEL_SYMBOL = "*"
 
 UPSERT_SUCCESS_SQL = """
@@ -103,10 +103,10 @@ def upsert_status_error(conn, exchange: str, market_type: str, symbol: str, time
 
 
 def upsert_loop_heartbeat(conn, exchange: str, market_type: str, loop: str):
-    """Record a completed funding/OI poll cycle as a per-loop liveness heartbeat.
+    """Record a per-loop liveness heartbeat for a poll cycle or a WS connection timer.
 
-    `loop` is a pseudo-timeframe (config.FUNDING_LOOP / OI_LOOP) stored in the
-    `timeframe` column. The monitor's staleness check flags this sentinel row when
+    `loop` is a pseudo-timeframe (config.FUNDING_LOOP / OI_LOOP / LIQUIDATION_WS) stored
+    in the `timeframe` column. The monitor's staleness check flags this sentinel row when
     it goes stale — the signal a silently-dead loop would otherwise never produce.
     """
     params = {
