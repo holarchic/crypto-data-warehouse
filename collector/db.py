@@ -49,7 +49,17 @@ def create_exchange(config: ExchangeConfig):
             raise ValueError(f"ccxt has no class '{config.ccxt_class}'")
         exchange = cls(opts)
 
-    exchange.load_markets()
+    # Close the just-constructed session if load_markets fails — this is the only layer that
+    # owns the exchange at that point, so a failure here must not leak it (a retrying caller,
+    # e.g. the dense pool's per-cycle init, would otherwise leak one session per attempt).
+    try:
+        exchange.load_markets()
+    except Exception:
+        try:
+            exchange.close()
+        except Exception:
+            pass
+        raise
     exchange._cc_markets_loaded_at = time.time()
     return exchange
 
