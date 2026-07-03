@@ -119,6 +119,45 @@ ALTER TABLE hl_asset_ctxs SET (
 SELECT add_compression_policy('hl_asset_ctxs', INTERVAL '7 days', if_not_exists => TRUE);
 SELECT add_retention_policy('hl_asset_ctxs', INTERVAL '1 year', if_not_exists => TRUE);
 
+-- Liquidation events, all venues, two fidelity grades (HL node_fills Grade A +
+-- Binance/Bybit WS Grade C). Superset of the HL seed's 13 cols + venue/grade/
+-- liquidated_side. Dedup via a UNIQUE INDEX (not a PK: oid/tid are NULL for C rows);
+-- HL rows dedup on re-pull + preserve same-ms clustered events, C rows always land.
+-- See db/migrations/008-liquidations.sql for the full rationale.
+CREATE TABLE IF NOT EXISTS liquidations (
+    timestamp        TIMESTAMPTZ NOT NULL,
+    venue            TEXT NOT NULL,
+    grade            TEXT NOT NULL,
+    asset_id         TEXT NOT NULL,
+    liquidated_side  TEXT,
+    side             TEXT,
+    dir              TEXT,
+    px               DOUBLE PRECISION,
+    sz               DOUBLE PRECISION,
+    mark_px          DOUBLE PRECISION,
+    closed_pnl       DOUBLE PRECISION,
+    method           TEXT,
+    liquidated_user  TEXT,
+    oid              BIGINT,
+    tid              BIGINT,
+    day              TEXT
+);
+
+SELECT create_hypertable('liquidations', 'timestamp',
+    chunk_time_interval => INTERVAL '1 week',
+    if_not_exists => TRUE);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_liquidations_dedup
+    ON liquidations (venue, asset_id, timestamp, oid, tid);
+
+ALTER TABLE liquidations SET (
+    timescaledb.compress,
+    timescaledb.compress_segmentby = 'venue, asset_id',
+    timescaledb.compress_orderby = 'timestamp DESC'
+);
+SELECT add_compression_policy('liquidations', INTERVAL '7 days', if_not_exists => TRUE);
+SELECT add_retention_policy('liquidations', INTERVAL '1 year', if_not_exists => TRUE);
+
 CREATE TABLE IF NOT EXISTS collection_status (
     exchange            TEXT NOT NULL,
     market_type         TEXT NOT NULL,
