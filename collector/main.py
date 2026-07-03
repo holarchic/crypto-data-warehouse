@@ -9,8 +9,8 @@ from funding import funding_loop
 from oi import oi_loop
 from rate_limiter import (
     RateLimiter,
-    WeightRateLimiter,
     binance_kline_weight,
+    build_rate_limiter,
     paced_call,
 )
 from status import query_active_pairs, upsert_status_error, upsert_status_success
@@ -232,21 +232,10 @@ def run():
     dsn = build_dsn()
 
     # Shared rate limiter — paces API calls to respect the exchange rate limit without
-    # serializing the actual network round-trip across threads. Binance uses a
-    # weight-budget limiter synced from response headers; others use fixed interval.
-    if config.rate_limit_weight_budget is not None:
-        rate_limiter = WeightRateLimiter(
-            budget=config.rate_limit_weight_budget,
-            window_s=config.rate_limit_window_s,
-            safety=config.rate_limit_safety,
-        )
-        log.info(
-            "Using WeightRateLimiter: budget=%d/%ds safety=%d",
-            config.rate_limit_weight_budget, config.rate_limit_window_s, config.rate_limit_safety,
-        )
-    else:
-        rate_limiter = RateLimiter(config.rate_limit_ms / 1000)
-        log.info("Using RateLimiter: interval=%dms", config.rate_limit_ms)
+    # serializing the actual network round-trip across threads. Binance uses a weight-budget
+    # limiter (synced from response headers, with the dense-OI priority reserve); others use a
+    # fixed interval. The factory owns the choice + the priority_reserve wiring.
+    rate_limiter = build_rate_limiter(config)
 
     # One daemon thread per timeframe
     threads = []
