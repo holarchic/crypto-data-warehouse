@@ -58,6 +58,11 @@ exchanges:
     rate_limit_weight_budget: 2400   # Binance IP weight cap per minute
     rate_limit_window_s: 60
     rate_limit_safety: 400           # headroom for in-flight bursts at shared TF boundaries
+    # Dense-OI weight lane (T-007.4): reserve 100 of the usable cap (2000→1900) for the
+    # priority dense burst so it never blocks on the candle-kline burst at a mass settlement.
+    # Sized >> dense in-flight (oi_dense_concurrency × OI-weight = 6); ~5% candle peak-cap cost.
+    # Invariant: keep >= oi_dense_concurrency × 1. 0 disables the lane (single-cap rollback).
+    rate_limit_priority_reserve: 100
     enabled: true
     has_funding: true
     has_oi: true

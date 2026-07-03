@@ -63,6 +63,8 @@ def test_oi_cadence_knobs_per_exchange():
     assert binance.oi_settlement_window_s == 900
     assert binance.oi_baseline_interval_s == 1800
     assert binance.oi_dense_concurrency == 6
+    # Dense-OI weight lane (T-007.4): binance reserves 100 for the priority dense burst.
+    assert binance.rate_limit_priority_reserve == 100
 
 
 def test_oi_cadence_defaults_for_non_oi_exchange():
@@ -72,6 +74,8 @@ def test_oi_cadence_defaults_for_non_oi_exchange():
     assert cfg.oi_settlement_window_s == 900
     assert cfg.oi_baseline_interval_s == 1800
     assert cfg.oi_dense_concurrency == 6
+    # Priority-reserve lane off by default (non-OI exchange never enters the dense path).
+    assert cfg.rate_limit_priority_reserve == 0
 
 
 # --- load_discovery_config ---
