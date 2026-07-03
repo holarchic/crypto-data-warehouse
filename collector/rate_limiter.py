@@ -23,6 +23,8 @@ import logging
 import threading
 import time
 
+from config import ExchangeConfig
+
 log = logging.getLogger(__name__)
 
 
@@ -38,8 +40,9 @@ class RateLimiter:
         self._next_slot = 0.0
         self._lock = threading.Lock()
 
-    def acquire(self, weight: int = 1) -> None:
-        # `weight` ignored — this limiter paces on request count, not weight.
+    def acquire(self, weight: int = 1, priority: bool = False) -> None:
+        # `weight` and `priority` ignored — this limiter paces on request count, not weight;
+        # `priority` is accepted so call sites stay uniform across limiter types.
         with self._lock:
             now = time.monotonic()
             slot = max(now, self._next_slot)
@@ -88,6 +91,7 @@ class WeightRateLimiter:
         safety: int = 400,
         poll_s: float = 0.5,
         header: str = DEFAULT_HEADER,
+        priority_reserve: int = 0,
     ):
         self._budget = budget
         self._window_s = window_s
@@ -98,8 +102,28 @@ class WeightRateLimiter:
         self._used = 0
         self._used_at = time.monotonic()
         self._in_flight = 0
+        # Weight held back from non-priority callers so a priority caller (the dense-OI lane)
+        # always has spendable headroom (see `acquire`). Guard: a reserve claiming half or more
+        # of the usable cap would collapse the non-priority cap and *deadlock* every candle/
+        # funding acquire (a hard stall, not a slow-down) — so neutralize an over-large reserve
+        # to 0 (fall back to single-cap behaviour, keep the collector alive) with a loud warning.
+        # Half-cap is a generic bound: it guarantees the non-priority cap stays > (budget-safety)/2,
+        # comfortably above any single caller's weight, without coupling the limiter to who calls it.
+        usable = budget - safety
+        if priority_reserve * 2 >= usable:
+            log.warning(
+                "priority_reserve=%d claims >= half the usable cap (budget=%d safety=%d "
+                "usable=%d); neutralizing to 0 to avoid starving non-priority callers",
+                priority_reserve, budget, safety, usable,
+            )
+            priority_reserve = 0
+        self._priority_reserve = max(0, priority_reserve)
 
-    def acquire(self, weight: int = 1) -> None:
+    def acquire(self, weight: int = 1, priority: bool = False) -> None:
+        # A zero-weight call consumes no budget (e.g. the openInterestHist baseline on the
+        # separate /futures/data bucket) — it must never block on the main-pool cap.
+        if weight <= 0:
+            return
         while True:
             with self._lock:
                 now = time.monotonic()
@@ -109,7 +133,11 @@ class WeightRateLimiter:
                     self._in_flight = 0
                     self._used_at = now
 
-                cap = self._budget - self._safety
+                # Two caps on one shared budget: priority callers (dense OI) may use the full
+                # `budget - safety`; non-priority callers (candles/funding) leave the reserve
+                # untouched. Holding non-priority below the high cap is what keeps `_used`
+                # low enough that the reserve is genuinely spendable by priority callers.
+                cap = self._budget - self._safety - (0 if priority else self._priority_reserve)
                 if self._used + self._in_flight + weight <= cap:
                     self._in_flight += weight
                     return
@@ -171,14 +199,40 @@ def binance_kline_weight(limit: int) -> int:
     return 10
 
 
-def paced_call(rate_limiter, exchange, weight, fn, *args, **kwargs):
+def paced_call(rate_limiter, exchange, weight, fn, *args, priority: bool = False, **kwargs):
     """Acquire budget, run `fn`, release budget using the exchange's last
     response headers. Release happens in a `finally` so failed calls don't
     leak the reservation. `exchange` may be None for non-ccxt callers.
+
+    `priority` is keyword-only (declared after `*args`) so it drives the limiter's
+    priority lane without ever being forwarded into `fn` (a ccxt method that would
+    reject an unexpected kwarg).
     """
-    rate_limiter.acquire(weight=weight)
+    rate_limiter.acquire(weight=weight, priority=priority)
     try:
         return fn(*args, **kwargs)
     finally:
         headers = getattr(exchange, "last_response_headers", None) if exchange else None
         rate_limiter.update_from_response(headers, weight=weight)
+
+
+def build_rate_limiter(config: ExchangeConfig):
+    """Construct the rate limiter for an exchange: a header-synced `WeightRateLimiter` when a
+    weight budget is set (Binance), else an interval `RateLimiter`. This is the single
+    construction seam — it owns the `priority_reserve` wiring so the config field provably
+    reaches the limiter, and it is testable without importing `main` (which the test harness
+    stubs). Returns the limiter; the caller passes it to every thread."""
+    if config.rate_limit_weight_budget is not None:
+        log.info(
+            "Using WeightRateLimiter: budget=%d/%ds safety=%d priority_reserve=%d",
+            config.rate_limit_weight_budget, config.rate_limit_window_s,
+            config.rate_limit_safety, config.rate_limit_priority_reserve,
+        )
+        return WeightRateLimiter(
+            budget=config.rate_limit_weight_budget,
+            window_s=config.rate_limit_window_s,
+            safety=config.rate_limit_safety,
+            priority_reserve=config.rate_limit_priority_reserve,
+        )
+    log.info("Using RateLimiter: interval=%dms", config.rate_limit_ms)
+    return RateLimiter(config.rate_limit_ms / 1000)

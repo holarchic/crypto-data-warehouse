@@ -1,9 +1,17 @@
 """RateLimiter pacing tests."""
 
+import logging
 import threading
 import time
 
-from rate_limiter import RateLimiter, WeightRateLimiter, binance_kline_weight
+from config import ExchangeConfig
+from rate_limiter import (
+    RateLimiter,
+    WeightRateLimiter,
+    binance_kline_weight,
+    build_rate_limiter,
+    paced_call,
+)
 
 
 def test_single_thread_paces_at_interval():
@@ -191,3 +199,145 @@ def test_binance_kline_weight():
     assert binance_kline_weight(500) == 5
     assert binance_kline_weight(1000) == 5
     assert binance_kline_weight(1500) == 10
+
+
+# ---------------------------------------------------------------------------
+# WeightRateLimiter — priority reserve lane (T-007.4)
+# ---------------------------------------------------------------------------
+
+
+def test_priority_reserve_lets_priority_proceed_while_nonpriority_blocks():
+    # budget=1000 safety=0 reserve=100 → non-priority cap 900, priority cap 1000.
+    # used=950: above the non-priority cap, below the priority cap.
+    lim = WeightRateLimiter(budget=1000, safety=0, poll_s=0.02, priority_reserve=100)
+    lim._used = 950
+
+    got = threading.Event()
+
+    def prio():
+        lim.acquire(weight=1, priority=True)  # 950+1 <= 1000 → into the reserve
+        got.set()
+
+    tp = threading.Thread(target=prio)
+    tp.start()
+    assert got.wait(0.5), "priority acquire should proceed into the reserved headroom"
+    tp.join()
+
+    blocked = threading.Event()
+
+    def nonprio():
+        lim.acquire(weight=1, priority=False)  # 950 + in_flight(1) + 1 > 900 → blocks
+        blocked.set()
+
+    tn = threading.Thread(target=nonprio)
+    tn.start()
+    assert not blocked.wait(0.15), "non-priority acquire should block below the reserved cap"
+
+    lim.update_from_response({"x-mbx-used-weight-1m": "0"}, weight=0)  # used → 0
+    assert blocked.wait(0.5), "non-priority should unblock once used drops"
+    tn.join()
+
+
+def test_priority_reserve_zero_is_single_cap_for_positive_weight():
+    # reserve=0 → priority and non-priority see the same cap (weight>0 backward-compat).
+    lim = WeightRateLimiter(budget=1000, safety=0, poll_s=0.02, priority_reserve=0)
+    lim._used = 950
+    lim.acquire(weight=1, priority=False)  # both fit under 1000
+    lim.acquire(weight=1, priority=True)
+    assert lim._in_flight == 2
+
+
+def test_weight_zero_bypasses_cap_gate():
+    # A weight-0 call (openInterestHist baseline on the separate bucket) never blocks on the
+    # cap, even with used at/above the high cap — it consumes no main-pool budget.
+    lim = WeightRateLimiter(budget=1000, safety=0, poll_s=0.02, priority_reserve=100)
+    lim._used = 1000
+    done = threading.Event()
+
+    def worker():
+        lim.acquire(weight=0, priority=False)
+        done.set()
+
+    t = threading.Thread(target=worker)
+    t.start()
+    assert done.wait(0.3), "weight-0 acquire must not block on the cap"
+    t.join()
+    assert lim._in_flight == 0  # zero-weight reserves nothing
+
+
+def test_over_large_reserve_neutralized_to_zero(caplog):
+    # reserve >= half the usable cap would deadlock non-priority callers → neutralized to 0.
+    with caplog.at_level(logging.WARNING):
+        lim = WeightRateLimiter(budget=1000, safety=0, poll_s=0.02, priority_reserve=600)
+    assert lim._priority_reserve == 0
+    assert any("neutralizing to 0" in r.message for r in caplog.records)
+    lim.acquire(weight=5, priority=False)  # weight-5 candle still proceeds (not deadlocked)
+    assert lim._in_flight == 5
+
+
+def test_priority_release_accounting_unchanged():
+    lim = WeightRateLimiter(budget=1000, safety=0, poll_s=0.02, priority_reserve=100)
+    lim.acquire(weight=5, priority=True)
+    assert lim._in_flight == 5
+    lim.update_from_response({"x-mbx-used-weight-1m": "0"}, weight=5)
+    assert lim._in_flight == 0  # release is weight-only; priority doesn't leak in-flight
+
+
+class _SpyLimiter:
+    """Records acquire(weight, priority); never blocks. For the paced_call wiring test."""
+
+    def __init__(self):
+        self.calls = []
+
+    def acquire(self, weight: int = 1, priority: bool = False) -> None:
+        self.calls.append((weight, priority))
+
+    def update_from_response(self, headers, weight: int = 1) -> None:
+        pass
+
+
+def test_paced_call_threads_priority_without_forwarding_to_fn():
+    spy = _SpyLimiter()
+    seen = {}
+
+    def fn(a, b, kw=None):
+        seen["args"] = (a, b)
+        seen["kw"] = kw
+        return "ok"
+
+    out = paced_call(spy, None, 7, fn, 1, 2, kw="x", priority=True)
+    assert out == "ok"
+    assert seen == {"args": (1, 2), "kw": "x"}  # 'priority' consumed by paced_call, not leaked to fn
+    assert spy.calls == [(7, True)]
+
+    paced_call(spy, None, 3, fn, 9, 8)  # default priority=False
+    assert spy.calls[-1] == (3, False)
+
+
+def test_rate_limiter_accepts_priority_arg():
+    # Interval limiter ignores priority (like weight), but must accept it — no throw.
+    RateLimiter(0.01).acquire(weight=5, priority=True)
+
+
+def _cfg(**over):
+    base = dict(
+        name="x", ccxt_class="x", btc_symbol="B", market_type="perp",
+        rate_limit_ms=100, enabled=True,
+    )
+    base.update(over)
+    return ExchangeConfig(**base)
+
+
+def test_build_rate_limiter_weight_path_wires_priority_reserve():
+    # Activation guard: proves the config field reaches the real limiter (a `main` that
+    # forgot to pass it would leave reserve=0 and every other test would still pass).
+    lim = build_rate_limiter(
+        _cfg(rate_limit_weight_budget=2400, rate_limit_safety=400, rate_limit_priority_reserve=100)
+    )
+    assert isinstance(lim, WeightRateLimiter)
+    assert lim._priority_reserve == 100
+
+
+def test_build_rate_limiter_interval_path_for_no_budget():
+    lim = build_rate_limiter(_cfg(rate_limit_weight_budget=None, rate_limit_ms=200))
+    assert isinstance(lim, RateLimiter)
