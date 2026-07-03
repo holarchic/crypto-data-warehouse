@@ -9,14 +9,19 @@ Two shapes, same interface:
   Used where the budget is expressed in request *weight*, not request count.
 
 Both expose:
-    acquire(weight: int = 1) -> None
+    acquire(weight: int = 1, priority: bool = False) -> None
     update_from_response(headers: dict | None, weight: int = 1) -> None
 
 Call sites pair `acquire(weight=W)` with `update_from_response(..., weight=W)`
 in a try/finally so the reservation is always released — otherwise a failed
 fetch would leak `_in_flight` forever. `RateLimiter.update_from_response` is a
-no-op; it exists so call sites stay uniform across exchanges. Weight helpers
-for Binance USDM futures live at the bottom of this module.
+no-op; it exists so call sites stay uniform across exchanges. `priority` selects
+`WeightRateLimiter`'s reserved lane (ignored by `RateLimiter`); see that class.
+
+`build_rate_limiter(config)` is the single construction seam — it picks the
+shape from the config and wires the priority reserve. `paced_call` runs one API
+call through acquire→fn→release. Weight helpers for Binance USDM futures live at
+the bottom of this module.
 """
 
 import logging
@@ -66,13 +71,25 @@ class WeightRateLimiter:
       multiple threads reserving before any response returns.
 
     Algorithm:
+    - A **zero-weight** call (`weight <= 0`) bypasses the gate entirely — it
+      consumes no budget (e.g. the openInterestHist baseline on the separate
+      `/futures/data` bucket) and so must never block on the main-pool cap.
     - If the last reading is older than `window_s + 5s`, assume the rolling
       window has rolled over and reset `_used` and `_in_flight`. This prevents
       permanent stall if no responses come back (e.g. during an IP ban).
-    - On `acquire(weight)`: if `_used + _in_flight + weight <= budget - safety`,
-      reserve and return. Otherwise sleep `poll_s` and retry.
+    - On `acquire(weight, priority)`: two caps on the one shared budget — a
+      **priority** caller (the dense-OI lane) may reserve up to `budget - safety`;
+      a **non-priority** caller (candles, funding) is held to
+      `budget - safety - priority_reserve`, leaving the reserve spendable by
+      priority callers even when candles have filled their lower cap. If the
+      relevant cap fits, reserve and return; otherwise sleep `poll_s` and retry.
     - On `update_from_response`: read server's used-weight header (case
-      insensitive), set `_used` to it, release the per-request reservation.
+      insensitive), set `_used` to it, release the per-request reservation
+      (weight-only; `priority` does not affect release).
+
+    `priority_reserve` is clamped ≥0 and neutralized to 0 (with a warning) if it
+    claims ≥ half the usable cap — an over-large reserve would collapse the
+    non-priority cap and deadlock candle/funding acquires.
 
     The server header is the source of truth for cross-process budget use — it
     reflects the IP's actual usage across this and any other process sharing the
