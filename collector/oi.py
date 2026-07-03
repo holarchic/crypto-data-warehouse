@@ -539,8 +539,11 @@ def _binance_dense_fetch(exchange, exchange_name, rate_limiter, dense_pairs, fun
     for pair in dense_pairs:
         sym = pair["symbol"]
         try:
+            # priority=True: dense OI rides the reserved weight lane (T-007.4) so it never
+            # blocks on the candle-kline burst — an untaken instantaneous OI sample is unbackfillable.
             oi_data = paced_call(
                 rate_limiter, exchange, BINANCE_OI_WEIGHT, exchange.fetch_open_interest, sym,
+                priority=True,
             )
         except RETRIABLE_EXCEPTIONS as exc:
             log.warning("[%s] Retriable error on dense %s: %s", thread_name, sym, exc)
@@ -601,8 +604,10 @@ class _DenseFetchPool:
     def _fetch_one(self, pair, rate_limiter, funding_rates, now_ts, exchange_name):
         ex = self._available.get_nowait()  # fail fast if the K==workers invariant ever breaks
         try:
+            # priority=True: dense OI weight lane (T-007.4) — see _binance_dense_fetch.
             oi_data = paced_call(
                 rate_limiter, ex, BINANCE_OI_WEIGHT, ex.fetch_open_interest, pair["symbol"],
+                priority=True,
             )
             return _dense_row(oi_data, pair, exchange_name, funding_rates, now_ts)
         finally:
@@ -755,8 +760,12 @@ def _oi_loop_binance(exchange, config: ExchangeConfig, dsn: str, rate_limiter: R
         cycle_start = time.monotonic()
 
         try:
+            # priority=True: the premiumIndex bulk is the dense-window trigger — it gates the
+            # whole dense cycle, so it rides the same weight lane (T-007.4) as the dense fetches
+            # below; blocking it at the low cap would strand the dense burst before it starts.
             funding_rates = paced_call(
                 rate_limiter, exchange, BINANCE_FUNDING_BULK_WEIGHT, exchange.fetch_funding_rates,
+                priority=True,
             )
         except Exception as exc:
             log.warning("[%s] premiumIndex bulk failed, skipping cycle: %s", thread_name, exc)

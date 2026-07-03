@@ -500,12 +500,24 @@ class _FakeExchange:
 
 
 def _patch_paced_and_sleep(monkeypatch):
-    monkeypatch.setattr(oi, "paced_call", lambda rl, ex, w, fn, *a, **k: fn(*a, **k))
+    """Stub `paced_call` to run `fn` directly, and `sleep` to a no-op. Records each call as
+    `(fn_name, priority)` and returns that list, so wiring tests can assert the dense lane's
+    `priority=True`. Mirrors the real `paced_call`: `priority` is consumed here, NOT forwarded
+    to `fn` (a ccxt method would reject it) — this is also what keeps these fakes valid now that
+    the dense sites pass `priority=True`."""
+    calls = []
+
+    def _spy(rl, ex, w, fn, *a, priority=False, **k):
+        calls.append((getattr(fn, "__name__", str(fn)), priority))
+        return fn(*a, **k)
+
+    monkeypatch.setattr(oi, "paced_call", _spy)
     monkeypatch.setattr(oi.time, "sleep", lambda s: None)
     # conftest stubs `backoff`, so oi.RETRIABLE_EXCEPTIONS is a MagicMock (uncatchable).
     # Install a real tuple so `except RETRIABLE_EXCEPTIONS` is valid; a raised RuntimeError
     # then falls to the generic `except Exception` skip path.
     monkeypatch.setattr(oi, "RETRIABLE_EXCEPTIONS", (ConnectionError,))
+    return calls
 
 
 def test_baseline_sweep_advances_cursor_after_commit(monkeypatch):
@@ -582,6 +594,15 @@ def test_dense_fetch_sequential_error_isolation_and_empty(monkeypatch):
     rows = oi._binance_dense_fetch(ex, "binance", None, pairs, {}, NOW, "binance/oi")
     assert [r["symbol"] for r in rows] == ["A/USDT:USDT"]  # B raised → skipped, A lands
     assert oi._binance_dense_fetch(ex, "binance", None, [], {}, NOW, "binance/oi") == []
+
+
+def test_dense_fetch_sequential_uses_priority_lane(monkeypatch):
+    # Every dense per-symbol fetch rides the priority weight lane (T-007.4).
+    calls = _patch_paced_and_sleep(monkeypatch)
+    ex = _FakeExchange(oi_by_symbol={f"C{i}/USDT:USDT": {"openInterestAmount": 1.0} for i in range(3)})
+    pairs = [{"asset_id": f"C{i}", "symbol": f"C{i}/USDT:USDT"} for i in range(3)]
+    oi._binance_dense_fetch(ex, "binance", None, pairs, {}, NOW, "binance/oi")
+    assert calls == [("fetch_open_interest", True)] * 3  # all dense calls priority=True
 
 
 # --- _DenseFetchPool: isolated per-worker sessions ---------------------------
@@ -679,6 +700,21 @@ def test_dense_pool_error_isolation_and_market_refresh(monkeypatch):
         pool.close()
 
 
+def test_dense_pool_uses_priority_lane(monkeypatch):
+    # Every pooled dense fetch rides the priority weight lane (T-007.4). Order is immaterial
+    # (as_completed), so assert the multiset: all entries priority=True, one per symbol.
+    calls = _patch_paced_and_sleep(monkeypatch)
+    syms = [f"C{i}/USDT:USDT" for i in range(5)]
+    factory = _pool_factory({s: {"openInterestAmount": float(i)} for i, s in enumerate(syms)})
+    pool = oi._DenseFetchPool(_cfg_binance(), 3, exchange_factory=factory)
+    try:
+        pairs = [{"asset_id": f"C{i}", "symbol": s} for i, s in enumerate(syms)]
+        pool.fetch(pairs, None, {s: _fr(NOW, mark=1.0) for s in syms}, NOW, "binance", "binance/oi")
+        assert len(calls) == 5 and all(c == ("fetch_open_interest", True) for c in calls)
+    finally:
+        pool.close()
+
+
 def test_dense_pool_empty_set(monkeypatch):
     pool = _mk_pool(monkeypatch, _pool_factory({}), concurrency=2)
     try:
@@ -719,7 +755,13 @@ def test_binance_loop_skips_baseline_when_seed_fails(monkeypatch):
         raise RuntimeError("seed boom")
 
     monkeypatch.setattr(oi, "_seed_baseline_cursor", _seed_boom)
-    monkeypatch.setattr(oi, "paced_call", lambda rl, ex, w, fn, *a, **k: fn(*a, **k))
+    paced_calls = []
+
+    def _spy(rl, ex, w, fn, *a, priority=False, **k):
+        paced_calls.append((getattr(fn, "__name__", str(fn)), priority))
+        return fn(*a, **k)
+
+    monkeypatch.setattr(oi, "paced_call", _spy)
     monkeypatch.setattr(oi, "_binance_dense_set", lambda *a: [])
     monkeypatch.setattr(oi, "_binance_dense_fetch", lambda *a: [])
     swept = {"n": 0}
@@ -731,7 +773,11 @@ def test_binance_loop_skips_baseline_when_seed_fails(monkeypatch):
         raise _StopLoop
 
     monkeypatch.setattr(oi, "_sleep_until_next", stop)
-    ex = SimpleNamespace(fetch_funding_rates=lambda: {}, last_response_headers=None)
+
+    def fetch_funding_rates():  # named (not a lambda) so the spy records the real fn name
+        return {}
+
+    ex = SimpleNamespace(fetch_funding_rates=fetch_funding_rates, last_response_headers=None)
     cfg = SimpleNamespace(name="binance", market_type="perp", ccxt_class="binanceusdm",
                           oi_poll_interval_s=60, oi_settlement_window_s=900,
                           oi_baseline_interval_s=1800, oi_dense_concurrency=1)  # sequential path
@@ -741,6 +787,8 @@ def test_binance_loop_skips_baseline_when_seed_fails(monkeypatch):
         pass
     assert swept["n"] == 0   # baseline sweep skipped (seed failed)
     assert hb["n"] == 1      # liveness heartbeat still fired
+    # The premiumIndex trigger rides the priority weight lane (T-007.4).
+    assert ("fetch_funding_rates", True) in paced_calls
 
 
 def test_prune_binance_state_drops_inactive_symbols():
