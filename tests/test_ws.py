@@ -128,7 +128,7 @@ def _spec(insert_batch, *, venue="bybit", parse_message=None, **overrides):
 def _patch_db(monkeypatch, pairs=None, conn=None):
     """Wire connect_db → a FakeConn and query_active_pairs → a fixed pair list (or side_effect)."""
     conn = conn or FakeConn()
-    monkeypatch.setattr(ws, "connect_db", lambda dsn: conn)
+    monkeypatch.setattr(ws, "connect_db", lambda dsn, **kw: conn)
     if callable(pairs):
         monkeypatch.setattr(ws, "query_active_pairs", pairs)
     else:
@@ -232,6 +232,18 @@ def test_proactive_reconnect_no_backoff(monkeypatch):
     ws.ws_loop(spec, _config(), "dsn", connect_fn=_connector([fake]), clock=clk, max_sessions=1)
     backoff.assert_not_called()  # clean end resets nothing to fear — error_count stayed 0
     assert fake.shutdown_calls == 1  # socket released
+
+
+def test_graceful_close_backs_off(monkeypatch):
+    """A server-initiated graceful close backs off (unlike proactive reconnect) — a venue that
+    accepts the handshake then immediately closes every session must not tight-spin."""
+    _patch_db(monkeypatch)
+    backoff = MagicMock()
+    monkeypatch.setattr(ws, "backoff_sleep", backoff)
+    box, clk = _clock()
+    fake = FakeWS([("close", None)], box)
+    ws.ws_loop(_spec(MagicMock(), venue="binance"), _config(), "dsn", connect_fn=_connector([fake]), clock=clk, max_sessions=1)
+    backoff.assert_called_once_with(1)
 
 
 def test_error_count_resets_on_healthy_reconnect(monkeypatch):
@@ -353,15 +365,29 @@ def test_parse_error_skips_frame_session_survives(monkeypatch):
 
 def test_ensure_conn_reconnects_on_closed(monkeypatch):
     reopened = FakeConn(closed=False)
-    monkeypatch.setattr(ws, "connect_db", lambda dsn: reopened)
+    monkeypatch.setattr(ws, "connect_db", lambda dsn, **kw: reopened)
     runtime = ws._WSRuntime(conn=FakeConn(closed=True), buffer=[])
     assert ws._ensure_conn(runtime, "dsn") is True
     assert runtime.conn is reopened
 
 
+def test_ensure_conn_is_nonblocking(monkeypatch):
+    """A mid-session DB reconnect must be single-shot — connect_db's default 10×5s retry would
+    freeze the recv loop (no draining/ping/heartbeat) for ~50s, defeating socket survival."""
+    calls = []
+
+    def fake_connect(dsn, max_retries=10, retry_delay=5):
+        calls.append((max_retries, retry_delay))
+        return FakeConn()
+
+    monkeypatch.setattr(ws, "connect_db", fake_connect)
+    ws._ensure_conn(ws._WSRuntime(conn=None, buffer=[]), "dsn")
+    assert calls == [(1, 0)]  # never the blocking default
+
+
 def test_mid_session_db_reconnect_flushes(monkeypatch):
     reopened = FakeConn(closed=False)
-    monkeypatch.setattr(ws, "connect_db", lambda dsn: reopened)
+    monkeypatch.setattr(ws, "connect_db", lambda dsn, **kw: reopened)
     insert = MagicMock(return_value=2)
     spec = _spec(insert, venue="binance")
     # conn dropped mid-session; _flush's _ensure_conn reconnects and the buffer flushes

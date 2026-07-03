@@ -91,7 +91,11 @@ def _ensure_conn(runtime: _WSRuntime, dsn: str) -> bool:
     if runtime.conn is not None and not runtime.conn.closed:
         return True
     try:
-        runtime.conn = connect_db(dsn)
+        # Single non-blocking attempt. connect_db's default 10×5s retry would freeze the WS recv
+        # loop (no draining, ping, or heartbeat) for ~50s on a DB blip — defeating the whole
+        # "socket survives a DB blip" goal. The next DB touchpoint (flush ~1s / heartbeat ~60s)
+        # retries, so the socket keeps flowing while Postgres is down.
+        runtime.conn = connect_db(dsn, max_retries=1, retry_delay=0)
         return True
     except RuntimeError:
         runtime.conn = None
@@ -217,9 +221,11 @@ def _safe_close(ws) -> None:
 # ---------------------------------------------------------------------------
 
 
-def _run_session(ws, runtime: _WSRuntime, spec: WSFeedSpec, config: ExchangeConfig, dsn: str, thread_name: str, clock: Callable[[], float]) -> None:
-    """One connected session: subscribe, then recv+service-timers until a graceful close or the
-    proactive-reconnect deadline (returns), or a drop (raises WS_RETRIABLE to the outer loop)."""
+def _run_session(ws, runtime: _WSRuntime, spec: WSFeedSpec, config: ExchangeConfig, dsn: str, thread_name: str, clock: Callable[[], float]) -> str:
+    """One connected session: subscribe, then recv+service-timers. Returns "proactive" (our own
+    reconnect deadline — reconnect clean, no backoff) or "closed" (server-initiated graceful close
+    — the caller backs off so a venue that closes every session can't tight-spin); raises
+    WS_RETRIABLE to the outer loop on a drop."""
     ws.settimeout(WS_RECV_TIMEOUT_S)
     topics = _subscribe_initial(ws, runtime, spec, config, dsn, thread_name)
     runtime.error_count = 0  # connection established + subscribed → a later independent drop backs off from step 1
@@ -236,7 +242,7 @@ def _run_session(ws, runtime: _WSRuntime, spec: WSFeedSpec, config: ExchangeConf
 
         if raw == "" and not ws.connected:
             log.info("[%s] Server closed the connection (graceful)", thread_name)
-            return
+            return "closed"
 
         if raw:
             try:
@@ -268,7 +274,7 @@ def _run_session(ws, runtime: _WSRuntime, spec: WSFeedSpec, config: ExchangeConf
 
         if spec.proactive_reconnect_s and now - conn_start >= spec.proactive_reconnect_s:
             log.info("[%s] Proactive reconnect after %.0fs", thread_name, now - conn_start)
-            return
+            return "proactive"
 
 
 def ws_loop(spec: WSFeedSpec, config: ExchangeConfig, dsn: str, *,
@@ -295,7 +301,13 @@ def ws_loop(spec: WSFeedSpec, config: ExchangeConfig, dsn: str, *,
             continue
 
         try:
-            _run_session(ws, runtime, spec, config, dsn, thread_name, clock)
+            reason = _run_session(ws, runtime, spec, config, dsn, thread_name, clock)
+            if reason == "closed":
+                # Server-initiated graceful close (NOT our proactive reconnect) → back off, so a
+                # venue that accepts the handshake then immediately closes every session (auth /
+                # policy / bad subscription) can't tight-spin. Proactive reconnect stays backoff-free.
+                runtime.error_count += 1
+                log.info("[%s] Reconnecting after server close (error_count=%d)", thread_name, runtime.error_count)
         except WS_RETRIABLE as exc:
             runtime.error_count += 1
             log.warning("[%s] Session dropped (error_count=%d): %s", thread_name, runtime.error_count, exc)
