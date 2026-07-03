@@ -13,9 +13,16 @@ YAML_PATH = Path(__file__).parent / "exchanges.yaml"
 # each poll cycle; the monitor's staleness check flags a silently-dead loop.
 # NOT candle timeframes — deliberately kept out of exchanges.yaml. Intervals feed
 # the monitor's `interval + max(interval, 1800)` threshold: funding → 2h, oi → 35m.
+#
+# LIQUIDATION_WS is the streaming variant (collector/ws.py): the heartbeat fires on
+# a ~60s connection timer *while the socket is up*, not per event — a WS feed is
+# routinely connected-but-silent, so an event-based heartbeat would false-alarm every
+# quiet hour. Interval 300 → the monitor's 30-min floor flags a dead WS thread ~35min
+# after its last heartbeat (cadence is 60s; alert latency is ~35min).
 FUNDING_LOOP = "funding"
 OI_LOOP = "oi"
-LOOP_INTERVALS = {FUNDING_LOOP: 3600, OI_LOOP: 300}
+LIQUIDATION_WS = "liq_ws"
+LOOP_INTERVALS = {FUNDING_LOOP: 3600, OI_LOOP: 300, LIQUIDATION_WS: 300}
 
 
 @dataclass

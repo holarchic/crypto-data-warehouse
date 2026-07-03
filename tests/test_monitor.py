@@ -5,7 +5,7 @@ import time
 from collections import deque
 from datetime import date, datetime, timezone
 
-from config import FUNDING_LOOP, LOOP_INTERVALS, OI_LOOP
+from config import FUNDING_LOOP, LIQUIDATION_WS, LOOP_INTERVALS, OI_LOOP
 from monitor import (
     LOOP_TIMEFRAMES,
     build_heartbeat_text,
@@ -92,7 +92,24 @@ def test_loop_timeframes_match_config():
     """Producer (config), consumer (monitor gap-skip), and the pseudo-TF set agree —
     pins against name drift between the heartbeat writers and the monitor."""
     assert LOOP_TIMEFRAMES == set(LOOP_INTERVALS)
-    assert {FUNDING_LOOP, OI_LOOP} == set(LOOP_INTERVALS)
+    assert {FUNDING_LOOP, OI_LOOP, LIQUIDATION_WS} == set(LOOP_INTERVALS)
+
+
+def test_compute_staleness_flags_dead_ws_loop():
+    """WS liveness pseudo-TF: liq_ws threshold = 300 + max(300, 1800) = 2100s. A heartbeat older
+    than that = a dead WS thread (the connection-timer heartbeat stopped). Same path as funding/oi."""
+    rows = [
+        {"exchange": "bybit", "symbol": "*", "timeframe": LIQUIDATION_WS, "seconds_since_success": 2500, "error_count": 0},
+    ]
+    stale = compute_staleness(rows, LOOP_AWARE_INTERVALS)
+    assert len(stale) == 1
+    assert stale[0]["timeframe"] == LIQUIDATION_WS
+
+
+def test_ws_loop_excluded_from_gap_detection():
+    """The liq_ws sentinel carries no candle series — it must be a LOOP_TIMEFRAME so the monitor's
+    gap scan skips it (mirrors funding/oi; a gap query on a pseudo-TF would be meaningless)."""
+    assert LIQUIDATION_WS in LOOP_TIMEFRAMES
 
 
 def test_compute_staleness_flags_dead_funding_loop():
