@@ -209,6 +209,24 @@ def test_reconnect_resubscribes(monkeypatch):
     assert any("allLiquidation.BTCUSDT" in f for f in ws2.sent)
 
 
+def test_topics_survive_reconnect_during_db_outage(monkeypatch):
+    """A per-symbol feed that reconnects while the DB is down must re-subscribe its LAST-KNOWN
+    topics (cached in _WSRuntime), not come back subscribed to nothing until the DB returns."""
+    pairs = MagicMock(side_effect=[
+        [{"native_symbol": "BTCUSDT"}],  # session1 initial subscribe → caches {BTCUSDT}
+        RuntimeError("db down"),          # session2 initial subscribe → _active_pairs returns None
+    ])
+    conn = FakeConn()
+    monkeypatch.setattr(ws, "connect_db", lambda dsn, **kw: conn)
+    monkeypatch.setattr(ws, "query_active_pairs", pairs)
+    monkeypatch.setattr(ws, "upsert_loop_heartbeat", MagicMock())
+    ws1, ws2 = FakeWS([("drop", None)], [0.0]), FakeWS([("drop", None)], [0.0])
+    _, clk = _clock()
+    ws.ws_loop(_spec(MagicMock(), venue="bybit"), _config(), "dsn",
+               connect_fn=_connector([ws1, ws2]), clock=clk, max_sessions=2)
+    assert any("allLiquidation.BTCUSDT" in f for f in ws2.sent)  # cached topics re-subscribed despite DB down
+
+
 def test_connect_timeout_feeds_backoff(monkeypatch):
     _patch_db(monkeypatch)
     backoff = MagicMock()

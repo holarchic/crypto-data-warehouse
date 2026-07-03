@@ -13,7 +13,7 @@ This module builds the engine only. Real venue specs, the `liquidations` table, 
 import logging
 import time
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from backoff import backoff_sleep
 from config import ExchangeConfig
@@ -72,12 +72,15 @@ class WSFeedSpec:
 class _WSRuntime:
     """Cross-session state owned by `ws_loop`. `conn` is rebindable (mid-session DB reconnect);
     `buffer` persists across reconnects so a batch retained through a DB outage survives a socket
-    drop; `error_count` drives the reconnect backoff and resets once a session is established.
+    drop; `error_count` drives the reconnect backoff and resets once a session is established;
+    `topics` is the last-known subscribed set, reused on a reconnect that lands during a DB outage
+    (so a per-symbol feed doesn't come back subscribed to nothing until the DB returns).
     """
 
     conn: object | None
     buffer: list[dict]
     error_count: int = 0
+    topics: set = field(default_factory=set)
 
 
 # ---------------------------------------------------------------------------
@@ -171,34 +174,36 @@ def _flush(runtime: _WSRuntime, spec: WSFeedSpec, dsn: str, thread_name: str) ->
 # ---------------------------------------------------------------------------
 
 
-def _subscribe_initial(ws, runtime: _WSRuntime, spec: WSFeedSpec, config: ExchangeConfig, dsn: str, thread_name: str) -> set[str]:
-    """Send the initial subscribe frames for the current active-pair topics. A DB failure yields
-    empty topics — do NOT tear down a healthy socket (a pairs-independent feed keeps flowing; a
-    per-symbol feed recovers via resubscribe when the DB returns)."""
+def _subscribe_initial(ws, runtime: _WSRuntime, spec: WSFeedSpec, config: ExchangeConfig, dsn: str, thread_name: str) -> None:
+    """Send the initial subscribe frames, updating `runtime.topics`. If the DB is down at (re)connect
+    (`_active_pairs` → None), **reuse the last-known `runtime.topics`** rather than resubscribing to
+    nothing — a reconnect during a DB outage must not silently drop a per-symbol feed's subscriptions.
+    Empty on a first-ever session with the DB down is correct (nothing known yet); a pairs-independent
+    feed (Binance) flows from its URL stream regardless."""
     pairs = _active_pairs(runtime, config, dsn, thread_name)
-    topics = spec.topics_for_pairs(pairs if pairs is not None else [])
+    topics = sorted(runtime.topics) if pairs is None else spec.topics_for_pairs(pairs)
     for frame in spec.subscribe_frames(topics):
         ws.send(frame)
+    runtime.topics = set(topics)
     log.info("[%s] Subscribed to %d topics", thread_name, len(topics))
-    return set(topics)
 
 
-def _resubscribe(ws, runtime: _WSRuntime, spec: WSFeedSpec, config: ExchangeConfig, dsn: str, current: set[str], thread_name: str) -> set[str]:
-    """Re-query active pairs and diff the topic set; subscribe added, unsubscribe removed. On DB
-    failure keep the current set (a transient blip must not drop live subscriptions)."""
+def _resubscribe(ws, runtime: _WSRuntime, spec: WSFeedSpec, config: ExchangeConfig, dsn: str, thread_name: str) -> None:
+    """Re-query active pairs and diff against `runtime.topics`; subscribe added, unsubscribe removed.
+    On DB failure keep the current set (a transient blip must not drop live subscriptions)."""
     pairs = _active_pairs(runtime, config, dsn, thread_name)
     if pairs is None:
-        return current
+        return
     new_topics = set(spec.topics_for_pairs(pairs))
-    added = new_topics - current
-    removed = current - new_topics
+    added = new_topics - runtime.topics
+    removed = runtime.topics - new_topics
     for frame in spec.subscribe_frames(sorted(added)):
         ws.send(frame)
     for frame in spec.unsubscribe_frames(sorted(removed)):
         ws.send(frame)
     if added or removed:
         log.info("[%s] Resubscribe: +%d -%d topics (now %d)", thread_name, len(added), len(removed), len(new_topics))
-    return new_topics
+    runtime.topics = new_topics
 
 
 def _safe_close(ws) -> None:
@@ -227,7 +232,7 @@ def _run_session(ws, runtime: _WSRuntime, spec: WSFeedSpec, config: ExchangeConf
     — the caller backs off so a venue that closes every session can't tight-spin); raises
     WS_RETRIABLE to the outer loop on a drop."""
     ws.settimeout(WS_RECV_TIMEOUT_S)
-    topics = _subscribe_initial(ws, runtime, spec, config, dsn, thread_name)
+    _subscribe_initial(ws, runtime, spec, config, dsn, thread_name)  # updates runtime.topics
     runtime.error_count = 0  # connection established + subscribed → a later independent drop backs off from step 1
 
     now = clock()
@@ -269,7 +274,7 @@ def _run_session(ws, runtime: _WSRuntime, spec: WSFeedSpec, config: ExchangeConf
             t_heartbeat = now
 
         if now - t_resub >= WS_RESUB_CHECK_INTERVAL_S:
-            topics = _resubscribe(ws, runtime, spec, config, dsn, topics, thread_name)
+            _resubscribe(ws, runtime, spec, config, dsn, thread_name)
             t_resub = now
 
         if spec.proactive_reconnect_s and now - conn_start >= spec.proactive_reconnect_s:
