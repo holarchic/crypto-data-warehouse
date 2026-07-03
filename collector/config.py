@@ -42,6 +42,7 @@ class ExchangeConfig:
     enabled: bool
     has_funding: bool = False
     has_oi: bool = False
+    has_liquidation_ws: bool = False  # launch the venue's liquidation WS feed (ws.py) in run()
     options: dict = field(default_factory=dict)
     timeframes: list[TimeframeConfig] = field(default_factory=list)
     # Weight-budget limiter (Binance): set to enable WeightRateLimiter instead
@@ -91,6 +92,7 @@ def _parse_exchange(exchange_name: str, ex: dict, tf_defs: dict) -> ExchangeConf
         enabled=True,
         has_funding=ex.get("has_funding", False),
         has_oi=ex.get("has_oi", False),
+        has_liquidation_ws=ex.get("has_liquidation_ws", False),
         options=ex.get("options", {}),
         timeframes=timeframes,
         rate_limit_weight_budget=ex.get("rate_limit_weight_budget"),

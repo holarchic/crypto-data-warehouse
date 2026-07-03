@@ -66,6 +66,7 @@ exchanges:
     enabled: true
     has_funding: true
     has_oi: true
+    has_liquidation_ws: true         # !forceOrder@arr all-market liquidation stream (Grade C, T-009.2)
     # OI two-source (T-007.2): dense-tick 60s (sized to halve peak OI weight at a mass
     # settlement — the dense burst shares this exchange's weight limiter with candles);
     # ±15m settlement window; per-symbol openInterestHist baseline refresh ~30m.
@@ -93,6 +94,7 @@ exchanges:
     enabled: true
     has_funding: true
     has_oi: true
+    has_liquidation_ws: true         # allLiquidation.{sym} per-symbol liquidation stream (Grade C, T-009.2)
     oi_poll_interval_s: 30          # bulk fetch_tickers (OI+USD), 1 call/cycle → flat 30s
     supported_timeframes:
       - 5m
