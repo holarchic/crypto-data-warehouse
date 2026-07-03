@@ -225,8 +225,9 @@ TIMEFRAME_INTERVALS = {
     "4h": 14400, "12h": 43200, "1d": 86400, "3d": 259200, "1w": 604800,
 }
 
-# Funding/OI per-loop heartbeat pseudo-timeframes (the keys of collector/config.py
-# LOOP_INTERVALS). The API is a separate container and cannot import collector/, so the
+# Per-loop heartbeat pseudo-timeframes — funding, OI, and the liquidation-WS sentinel
+# (the keys of collector/config.py LOOP_INTERVALS). The API is a separate container and
+# cannot import collector/, so the
 # names are mirrored here (as TIMEFRAME_INTERVALS above is). Only the NAMES are needed —
 # the staleness intervals are the monitor's concern. CONTRACT: every candle-facing
 # collection_status query in this module excludes these sentinel rows; loop liveness is

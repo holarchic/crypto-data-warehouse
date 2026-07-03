@@ -6,8 +6,9 @@ discovery changes the active set), batch-insert, and a connection-timer liveness
 heartbeat. Every venue-specific detail is injected via `WSFeedSpec` so the engine
 carries zero venue branches — Binance/Bybit × liquidations/mark all reuse it.
 
-This module builds the engine only. Real venue specs, the `liquidations` table, and the
-`run()` wiring land in T-009.2 / .4 — nothing here is wired into `main.run()` yet.
+This module is the engine only — it carries no venue logic. The Binance/Bybit liquidation
+specs live in `collector/liquidations.py` and are launched from `main.run()` (behind
+`has_liquidation_ws`) by passing a `WSFeedSpec` to `ws_loop`.
 """
 
 import logging
