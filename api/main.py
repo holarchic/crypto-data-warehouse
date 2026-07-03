@@ -231,7 +231,7 @@ TIMEFRAME_INTERVALS = {
 # the staleness intervals are the monitor's concern. CONTRACT: every candle-facing
 # collection_status query in this module excludes these sentinel rows; loop liveness is
 # surfaced by the monitor, not this API.
-LOOP_TIMEFRAMES = ("funding", "oi")
+LOOP_TIMEFRAMES = ("funding", "oi", "liq_ws")
 
 
 @app.get("/status")
