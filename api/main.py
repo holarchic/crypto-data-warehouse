@@ -100,7 +100,7 @@ def get_timeframes():
 
 @app.get("/candles/symbols")
 def get_symbols(exchange: str | None = None):
-    # Exclude the funding/OI loop heartbeat sentinel rows — this is candle metadata.
+    # Exclude the per-loop heartbeat sentinel rows (LOOP_TIMEFRAMES) — this is candle metadata.
     query = "SELECT DISTINCT asset_id, symbol, exchange FROM collection_status WHERE active = TRUE AND timeframe <> ALL(%(loop_tfs)s)"
     params: dict = {"loop_tfs": list(LOOP_TIMEFRAMES)}
     if exchange is not None:
@@ -237,8 +237,8 @@ LOOP_TIMEFRAMES = ("funding", "oi", "liq_ws")
 
 @app.get("/status")
 def get_status(exchange: str | None = None, timeframe: str | None = None):
-    # Candle-only: exclude funding/OI loop heartbeat sentinel rows (loop liveness is
-    # the monitor's surface, and its staleness threshold differs from this endpoint's).
+    # Candle-only: exclude the per-loop heartbeat sentinel rows (LOOP_TIMEFRAMES) — loop
+    # liveness is the monitor's surface, and its staleness threshold differs from this endpoint's.
     conditions = ["active = TRUE", "timeframe <> ALL(%(loop_tfs)s)"]
     params: dict = {"loop_tfs": list(LOOP_TIMEFRAMES)}
     if exchange is not None:
