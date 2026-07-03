@@ -162,14 +162,32 @@ def test_init_sql_has_liquidations():
         assert clause in sql, f"init.sql missing liquidations clause: {clause}"
 
 
-def test_liquidations_columns_match_across_migration_and_init():
+def _liq_column_defs(path):
+    """Extract [(name, normalized type+constraints), ...] from the CREATE TABLE liquidations block."""
+    sql = _read(path)
+    start = sql.index("(", sql.index("CREATE TABLE IF NOT EXISTS liquidations")) + 1
+    body = sql[start:sql.index(");", start)]
+    defs = []
+    for line in body.splitlines():
+        line = line.strip().rstrip(",").strip()
+        if not line:
+            continue
+        name, _, rest = line.partition(" ")
+        defs.append((name, " ".join(rest.split()).upper()))
+    return defs
+
+
+def test_liquidations_columns_are_seed_order():
+    """Each file lists the 16 columns (seed 13 + venue/grade/liquidated_side) in DDL order."""
     for path in (MIGRATION_008, INIT_SQL):
-        sql = _read(path)
-        idx = sql.index("CREATE TABLE IF NOT EXISTS liquidations")
-        block = sql[idx:idx + 900]
-        positions = [block.find(col) for col in LIQ_COLUMNS]
-        assert all(p > 0 for p in positions), f"{path.name}: missing a liquidations column"
-        assert positions == sorted(positions), f"{path.name}: liquidations columns out of order"
+        names = [name for name, _ in _liq_column_defs(path)]
+        assert names == LIQ_COLUMNS, f"{path.name}: liquidations columns drifted from seed order"
+
+
+def test_liquidations_migration_and_init_are_identical():
+    """migration 008 ≡ init.sql at the column level — name, type, AND nullability, no extras.
+    A weaker per-file check would miss a type/NOT-NULL/extra-column drift between the two files."""
+    assert _liq_column_defs(MIGRATION_008) == _liq_column_defs(INIT_SQL)
 
 
 def test_liquidations_dedup_index_preserves_oid_tid():
