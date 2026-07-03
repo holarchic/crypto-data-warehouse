@@ -52,7 +52,8 @@ class WSFeedSpec:
     Binance liquidations: stream is in the URL (`topics_for_pairs`/`subscribe_frames` → empty),
     no app-level ping (protocol pongs only), proactive reconnect at 24h.
     Bybit liquidations: per-symbol `allLiquidation.{sym}` topics, batched JSON subscribe (venue
-    owns its ≤10-arg cap inside `subscribe_frames`), 20s ping, no proactive reconnect.
+    owns framing inside `subscribe_frames`; the ceiling is the 21k-char args total per connection,
+    not an arg count — the ≤10 cap is Spot-only), 20s ping, no proactive reconnect.
     """
 
     name: str                                             # feed label for logs/thread name (NOT a DB key)

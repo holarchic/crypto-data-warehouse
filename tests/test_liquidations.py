@@ -206,3 +206,12 @@ def test_bybit_spec_constants():
     assert spec.ping_interval_s == 20.0
     assert json.loads(spec.ping_frame) == {"op": "ping"}
     assert spec.proactive_reconnect_s is None
+
+
+def test_build_liq_spec_resolves_venue_and_fails_fast():
+    # The seam main.run() calls: known venues resolve; an unknown venue raises (no silent no-op).
+    assert liq.build_liq_spec("binance").url == "wss://fstream.binance.com/market/ws/!forceOrder@arr"
+    assert liq.build_liq_spec("bybit").url == "wss://stream.bybit.com/v5/public/linear"
+    import pytest
+    with pytest.raises(ValueError, match="no liquidation spec builder"):
+        liq.build_liq_spec("kraken")
