@@ -3,6 +3,7 @@ import threading
 import time
 
 from backoff import RETRIABLE_EXCEPTIONS
+from candles import CANDLE_SEED_LIMIT, poll_limit
 from config import ExchangeConfig, TimeframeConfig, load_config
 from dotenv import load_dotenv
 from funding import funding_loop
@@ -121,16 +122,26 @@ def _collect_pair(exchange, pair, config, tf, rate_limiter, conn, thread_name):
     if stored_last is None:
         # Seed: fetch max history the exchange will return
         since_ms = None
+        limit = CANDLE_SEED_LIMIT
         label = "Seed"
     else:
         # Poll: fetch from just after last stored candle. 1ms nudge avoids the
         # ambiguous "since == last candle open" edge case across exchanges.
         # last_timestamp is a timestamptz → datetime, convert to epoch ms.
         since_ms = int(stored_last.timestamp() * 1000) + 1
+        # Weight diet (T-007.4): on weight-bound venues (Binance) size the kline `limit` to
+        # the actual gap so a caught-up poll costs weight 1 not 5 — this is what un-bloated the
+        # mass-settlement candle burst that was starving the dense-OI lane. Only weight-bound
+        # venues (`rate_limit_weight_budget` set) gate here; others keep the flat max fetch,
+        # since the weight only binds on Binance and there's no reason to change their semantics.
+        if config.rate_limit_weight_budget is not None:
+            limit = poll_limit(since_ms, int(time.time() * 1000), tf.interval_s)
+        else:
+            limit = CANDLE_SEED_LIMIT
         label = "Poll"
     candles = fetch_candles(
         exchange, pair["symbol"], market_info, config.name, tf.name, tf.interval_s, rate_limiter,
-        since_ms=since_ms, limit=1000,
+        since_ms=since_ms, limit=limit,
     )
     inserted = insert_candles(conn, candles)
     last_ts = max((c["timestamp"] for c in candles), default=None) if candles else None
