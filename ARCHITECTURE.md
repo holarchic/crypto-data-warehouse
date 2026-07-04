@@ -12,7 +12,7 @@ Candle fetching lives in `main.py` (`collect_loop` → `_collect_pair` → `fetc
 
 **DB-restart resilience:** every loop owns one long-lived connection and reconnects at the top of each cycle on `if conn.closed:` (`closed` == `pgconn.status == BAD`; psycopg detects a server-dropped socket only when the conn is next exercised). The hazard is the error handler itself: a `conn.rollback()` or a status/insert write on a just-dropped connection re-raises `OperationalError`, and unhandled that kills the loop thread (root cause of two total outages). So every error-path rollback goes through `db.safe_rollback` (swallows), and the only DB *writes* reachable on a restart raise — `funding._poll_bulk`'s bulk insert and the candle per-pair status write (`main._record_pair_error`) — are individually wrapped; a live-conn pre-check is not protection because the write itself can raise. With no exception able to escape a loop body, the next cycle's `if conn.closed:` reconnects and collection self-heals within ~1 cycle. `ws.py` already had this shape (`_ensure_conn` + a swallowing `_guarded_rollback`).
 
-The funding, OI, and liquidation-WS threads upsert a per-loop **liveness heartbeat** (`status.upsert_loop_heartbeat`): a sentinel `collection_status` row with `symbol = "*"` and a pseudo-timeframe from `config.LOOP_INTERVALS` (`funding` / `oi` / `liq_ws`). The poll loops fire it each cycle; the WS loop fires it on a ~60 s connection timer while the socket is up (a quiet feed is healthy). These threads write no per-pair candle status, so without the heartbeat a silently-dead loop produces no staleness footprint; the monitor flags the sentinel row when it goes stale.
+The funding, OI, premium, and liquidation-WS threads upsert a per-loop **liveness heartbeat** (`status.upsert_loop_heartbeat`): a sentinel `collection_status` row with `symbol = "*"` and a pseudo-timeframe from `config.LOOP_INTERVALS` (`funding` / `oi` / `liq_ws` / `premium`). The poll loops fire it each cycle; the WS loop fires it on a ~60 s connection timer while the socket is up (a quiet feed is healthy). These threads write no per-pair candle status, so without the heartbeat a silently-dead loop produces no staleness footprint; the monitor flags the sentinel row when it goes stale.
 
 The OI loop (`oi.py`) dispatches each `has_oi` exchange to one of **three strategies** (`oi_loop`; an unrecognized OI venue raises rather than defaulting), all cadences from `ExchangeConfig` (`oi_poll_interval_s` / `oi_settlement_window_s` / `oi_baseline_interval_s`):
 
@@ -38,13 +38,17 @@ The OI loop (`oi.py`) dispatches each `has_oi` exchange to one of **three strate
 
 The venue data for `ws.py` (the engine stays venue-agnostic). Two `WSFeedSpec` builders + `build_liq_spec(venue)` (the resolver `run()` calls; raises on an unknown venue). Binance `!forceOrder@arr` is one all-market stream on the **routed `/market` path** (an unrouted `/ws` gets only Public data); Bybit `allLiquidation.{native}` is per-symbol, batched-subscribe, 20 s ping. **asset_id resolution:** `parse_message` receives only the raw frame, so each builder closes over a shared `native_to_asset` map that `topics_for_pairs` rebuilds (engine-called at subscribe + resub) and `parse_message` reads — no lock, because `_run_session` calls both sequentially on the one feed thread, subscribe before recv. Binance's all-market stream is filtered to cc's tracked pairs (untracked → no map entry → skipped). Side normalized to `liquidated_side ∈ {long, short}` across the venues' opposite conventions. Grade-C insert (`ON CONFLICT` inert via NULLS-DISTINCT — every event lands). One Bybit connection holds the universe under the 21 k-char args ceiling; a char-based guard warns before a growth breach (sharding deferred).
 
-**Collector concurrency invariant:** each loop (candle per-TF, funding, OI, WS) runs on its own daemon thread with its **own DB connection and direct writes** to disjoint tables — there is no single-writer queue, by design (one container per exchange, no cross-loop write contention). The WS engine conforms: it buffers events and batch-flushes on its own connection.
+### collector/premium_index.py — Binance premium-index poll (T-010)
+
+Binance-only boundary-scheduled 5-min poll of `premiumIndexKlines` (ccxt `fetch_premium_index_ohlcv`) into `premium_index` — the perp mark-vs-index spread (funding term structure), a conditioning input for downstream backtests. Reuses the candle poll's shape: gap-aware `since` cursor + the T-007.4 weight diet (`candles.poll_limit` ⇒ a caught-up poll costs kline weight 1, not 5) + the T-014 error discipline (`safe_rollback` on every error path). The per-symbol cursor is seeded from the table so a restart resumes from the gap; **any active symbol missing from the in-memory map is re-seeded from the DB before polling** (so a reactivation resumes from its last stored bar, never a forward-only skip), and advances only after commit. First run is **forward-only** (a few recent bars via `PREMIUM_SEED_LIMIT`, not the 1000-bar candle seed — deep history is backfillable via T-011, so the empty-table rollout carries no weight spike). Stays **non-priority** on the shared `WeightRateLimiter` (yields to candles + the dense-OI reserve — premium is neither the primary product nor unbackfillable). Cadence (`PREMIUM_TIMEFRAME` / `PREMIUM_INTERVAL_S`) is single-sourced in `config.py` — the ccxt timeframe, the incomplete-bar guard, and the `premium` monitor staleness floor (`LOOP_INTERVALS`) all derive from it. `premium_index_loop` **raises fast** on a venue without `fetchPremiumIndexOHLCV` (Binance-only capability guard, matching `oi_loop` / `build_liq_spec`). Launched behind `has_premium_index`; the active-symbol universe comes from `query_active_pairs(…, "5m")` (the candle-TF anchor, not the poll cadence).
+
+**Collector concurrency invariant:** each loop (candle per-TF, funding, OI, premium, WS) runs on its own daemon thread with its **own DB connection and direct writes** to disjoint tables — there is no single-writer queue, by design (one container per exchange, no cross-loop write contention). The WS engine conforms: it buffers events and batch-flushes on its own connection.
 
 ### monitor (collector/monitor.py)
 
 Separate always-on container (`python -m monitor`). One `collection_status` fetch per cycle (`fetch_status_rows`) feeds two independent alert signals plus gap detection:
 
-- **Loop-liveness** — presence-based: any stale per-loop heartbeat sentinel row (funding/OI/liq_ws) pages (own cooldown key). A single dead loop is one row, so it is kept off the count-delta signal below.
+- **Loop-liveness** — presence-based: any stale per-loop heartbeat sentinel row (funding/OI/liq_ws/premium) pages (own cooldown key). A single dead loop is one row, so it is kept off the count-delta signal below.
 - **Candle alarming-mass** — `compute_alarming` counts collectors that are *alarming* (`error_count > 0`, or was-working-now-dark past `4×interval`; excludes the benign new-listing floor + the HL 5m within-cycle cursor). `evaluate_alarming` pages when that count exceeds its rolling-1h median by `ALARMING_DELTA_THRESHOLD` for `ALARMING_SUSTAIN_CYCLES` consecutive cycles, returning a named `AlarmingDecision` that owns the record-only-quiescent baseline invariant.
 - **Gap detection** (tiered by timeframe) + a daily heartbeat summary + a per-cycle healthcheck dead-man's-switch ping.
 
@@ -86,8 +90,8 @@ PK: `(exchange, market_type, symbol, timeframe, timestamp)`
 ### `collection_status`
 
 PK: `(exchange, market_type, symbol, timeframe)` — health tracking + discovery metadata per pair.
-Also holds per-loop **liveness heartbeats** for the funding/OI/liquidation-WS threads: sentinel rows with
-`symbol = "*"` and `timeframe ∈ {funding, oi, liq_ws}` (one per exchange/loop). Candle-facing readers
+Also holds per-loop **liveness heartbeats** for the funding/OI/premium/liquidation-WS threads: sentinel rows with
+`symbol = "*"` and `timeframe ∈ {funding, oi, liq_ws, premium}` (one per exchange/loop). Candle-facing readers
 (`query_active_pairs`, the `/candles/*` and `/status` API endpoints) exclude these by pseudo-timeframe;
 the monitor's staleness check is the only consumer that acts on them.
 
@@ -146,3 +150,16 @@ the forward tape is a schema-faithful continuation. PK: `(asset_id, timestamp)`.
 All-venue liquidation events, two fidelity grades: HL `node_fills` (Grade A, untruncated tape, `.3`) + Binance/Bybit WS (Grade C, forward directional sidecar, no historical seed, `.2`). **One** table (not per-venue) — a superset of the HL seed's 13 columns + `venue`/`grade`/`liquidated_side`; HL rows fill all seed columns, Grade-C rows leave the HL-specific ones NULL. 1-week chunks; compress after 7 days segmentby `venue, asset_id`; retention 1 year. `asset_id` holds the seed's `coin` value (T-011 export aliases it). Full column list in SPEC.
 
 **Dedup (the one structural subtlety):** a UNIQUE INDEX `(venue, asset_id, timestamp, oid, tid)`, **not** a PK — a PK is NOT NULL but `oid`/`tid` are NULL for Grade-C rows, and a hypertable needs the partition column in any unique key. HL rows carry non-null `oid`/`tid`, so distinct pairs preserve real same-ms clustered events (the backtester's structural hash is duplicate-sensitive) while an exact re-pull dedups via `ON CONFLICT DO NOTHING` (idempotency for the daily HL batch). Grade-C rows (NULL `oid`/`tid`, Postgres NULLS DISTINCT) never conflict → all land. The index's `(venue, asset_id, timestamp)` prefix serves range queries + the export. Table exists (migration 008); the writers are `.2`/`.3`.
+
+### `premium_index` hypertable
+
+Binance-only premium-index term structure (mark-vs-index spread), 5-min OHLC klines (`premiumIndexKlines`), 1-week chunks, compress after 7 days segmentby `(exchange, symbol)`, retention 1 year. A **superset** of the backtester's 1h `binance-premium-index` seed (downsamples to 1h for the T-011 export). Migration 009. PK: `(exchange, symbol, timestamp)`.
+
+| Column | Type | Notes |
+|--------|------|-------|
+| exchange | TEXT NOT NULL | `binance` |
+| asset_id | TEXT NOT NULL | canonical base (`BTC`) |
+| symbol | TEXT NOT NULL | ccxt-normalized |
+| native_symbol | TEXT NOT NULL | exchange-native (`BTCUSDT`) = seed `coin` |
+| timestamp | TIMESTAMPTZ NOT NULL | bar OPEN time, UTC (= seed `open_time_ms`) |
+| premium_open, premium_high, premium_low, premium_close | DOUBLE PRECISION | premium-index OHLC over the bar |
