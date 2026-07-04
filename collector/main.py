@@ -9,6 +9,7 @@ from dotenv import load_dotenv
 from funding import funding_loop
 from liquidations import build_liq_spec
 from oi import oi_loop
+from premium_index import premium_index_loop
 from rate_limiter import (
     RateLimiter,
     binance_kline_weight,
@@ -305,6 +306,18 @@ def run():
             target=ws_loop,
             args=(build_liq_spec(config.name), config, dsn),
             name=f"{config.name}-liq",
+            daemon=True,
+        )
+        t.start()
+        threads.append(t)
+        log.info("Started thread %s", t.name)
+
+    # Premium-index poll thread (T-010) — Binance premiumIndexKlines 5m → premium_index.
+    if config.has_premium_index:
+        t = threading.Thread(
+            target=premium_index_loop,
+            args=(exchange, config, dsn, rate_limiter),
+            name=f"{config.name}-premium",
             daemon=True,
         )
         t.start()
