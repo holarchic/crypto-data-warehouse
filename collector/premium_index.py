@@ -163,7 +163,6 @@ def premium_index_loop(exchange, config: ExchangeConfig, dsn: str, rate_limiter:
     thread_name = f"{config.name}/premium"
     conn = connect_db(dsn)
     cursors: dict[str, float] = {}
-    seeded = False
     cycles = 0
 
     while max_cycles is None or cycles < max_cycles:
@@ -194,25 +193,24 @@ def premium_index_loop(exchange, config: ExchangeConfig, dsn: str, rate_limiter:
             _heartbeat(conn, config, thread_name)
             continue
 
-        if not seeded:
+        # Ensure every active symbol has a cursor. Seed/refresh from the DB for any we are missing —
+        # first run (all missing) OR a reactivation whose in-memory cursor was pruned — so a
+        # returning symbol resumes from its last stored bar instead of a forward-only (since=None)
+        # skip over the gap. The DB read happens ONLY when the missing set is non-empty (steady
+        # state does none). A seed FAILURE must not fall through to a forward-only poll (it would
+        # skip the gap), so heartbeat for liveness + retry next cycle. A genuinely new symbol has no
+        # premium rows → absent from the seed result → stays cursorless → forward-only (correct).
+        active_syms = {p["symbol"] for p in pairs}
+        if active_syms - cursors.keys():
             try:
-                cursors = _seed_cursors(conn, config.name)
-                seeded = True
-                log.info("[%s] Seeded premium cursor for %d symbols", thread_name, len(cursors))
+                cursors.update(_seed_cursors(conn, config.name))
             except Exception:
-                # A failed seed must NOT fall through to the poll: an empty cursor map would drive
-                # every symbol down the forward-only (since=None) branch and silently skip the
-                # restart gap (a data-completeness loss). Heartbeat for liveness, then retry the
-                # seed next cycle — never poll until the cursor is known (a fresh/empty table seeds
-                # cleanly to {} with no exception, so this blocks only a real seed *failure*).
                 log.exception("[%s] Cursor seed failed, retrying next cycle", thread_name)
                 if not conn.closed:
                     safe_rollback(conn)
                 _heartbeat(conn, config, thread_name)
                 continue
-
-        # Prune the cursor map to the active set (bounded under listing churn).
-        active_syms = {p["symbol"] for p in pairs}
+        # Prune to the active set (bounded under churn); a later reactivation re-seeds above.
         for sym in [s for s in cursors if s not in active_syms]:
             del cursors[sym]
 
