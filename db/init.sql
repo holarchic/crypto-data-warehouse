@@ -34,6 +34,43 @@ ALTER TABLE candles SET (
 SELECT add_compression_policy('candles', INTERVAL '7 days', if_not_exists => TRUE);
 SELECT add_retention_policy('candles', INTERVAL '2 years', if_not_exists => TRUE);
 
+-- 1-minute OHLCV (Binance/Bybit), identical column shape to `candles`. On prod this lives on a
+-- dedicated Hetzner Cloud Volume tablespace (`ts_1m`) via db/migrations/010-candles-1m.sql; here
+-- (fresh/dev installs with no volume) it is created in the DEFAULT tablespace. Chunk interval is
+-- 1 DAY (density-driven, vs candles' 1 week). See db/migrations/010-candles-1m.sql.
+CREATE TABLE IF NOT EXISTS candles_1m (
+    exchange        TEXT NOT NULL,
+    market_type     TEXT NOT NULL,
+    asset_id        TEXT NOT NULL,
+    symbol          TEXT NOT NULL,
+    native_symbol   TEXT NOT NULL,
+    timeframe       TEXT NOT NULL,
+    timestamp       TIMESTAMPTZ NOT NULL,
+    open            DOUBLE PRECISION,
+    high            DOUBLE PRECISION,
+    low             DOUBLE PRECISION,
+    close           DOUBLE PRECISION,
+    volume          DOUBLE PRECISION,
+    quote_volume    DOUBLE PRECISION,
+    trades          INTEGER,
+    PRIMARY KEY (exchange, market_type, symbol, timeframe, timestamp)
+);
+
+SELECT create_hypertable('candles_1m', 'timestamp',
+    chunk_time_interval => INTERVAL '1 day',
+    if_not_exists => TRUE);
+
+CREATE INDEX IF NOT EXISTS idx_candles_1m_asset_ts
+    ON candles_1m (asset_id, timeframe, timestamp DESC);
+
+ALTER TABLE candles_1m SET (
+    timescaledb.compress,
+    timescaledb.compress_segmentby = 'exchange, market_type, symbol, timeframe',
+    timescaledb.compress_orderby = 'timestamp DESC'
+);
+SELECT add_compression_policy('candles_1m', INTERVAL '7 days', if_not_exists => TRUE);
+SELECT add_retention_policy('candles_1m', INTERVAL '2 years', if_not_exists => TRUE);
+
 CREATE TABLE IF NOT EXISTS funding_rates (
     exchange        TEXT NOT NULL,
     asset_id        TEXT NOT NULL,

@@ -275,3 +275,94 @@ def test_premium_index_pk_shape():
         idx = sql.index("CREATE TABLE IF NOT EXISTS premium_index")
         block = sql[idx:idx + 600]
         assert "PRIMARY KEY (exchange, symbol, timestamp)" in block, f"{path.name}: premium_index PK shape drifted"
+
+
+# --- candles_1m (migration 010) — 1-minute OHLCV on a dedicated volume tablespace ----
+# candles_1m MUST have the exact column shape of `candles` (a downstream reader treats the two as
+# one series split by TF). The migration additionally pins it to the `ts_1m` tablespace; init.sql
+# (fresh/dev, no volume) uses the default tablespace. So the drift guard compares column/PK/policy
+# shape between the two AND against `candles`, but the tablespace clauses are migration-ONLY (T-015).
+
+MIGRATION_010 = pathlib.Path(__file__).parent.parent / "db" / "migrations" / "010-candles-1m.sql"
+
+CANDLES_1M_SHARED_CLAUSES = [
+    "CREATE TABLE IF NOT EXISTS candles_1m",
+    "create_hypertable('candles_1m'",
+    "chunk_time_interval => INTERVAL '1 day'",
+    "idx_candles_1m_asset_ts",
+    "timescaledb.compress_segmentby = 'exchange, market_type, symbol, timeframe'",
+    "timescaledb.compress_orderby = 'timestamp DESC'",
+    "add_compression_policy('candles_1m', INTERVAL '7 days'",
+    "add_retention_policy('candles_1m', INTERVAL '2 years'",
+]
+
+# Present ONLY in the migration (prod volume); init.sql must NOT carry them (fresh/dev has no volume).
+CANDLES_1M_TABLESPACE_CLAUSES = [
+    "CREATE TABLESPACE ts_1m LOCATION '/mnt/pgvol/pgdata_1m'",
+    ") TABLESPACE ts_1m;",
+    "attach_tablespace('ts_1m', 'candles_1m'",
+]
+
+
+def _table_column_defs(sql, table):
+    """[(name, normalized type+constraints)] from a `CREATE TABLE IF NOT EXISTS <table> (...)` block,
+    skipping the trailing PRIMARY KEY line. Stops at the column-list close (`\\n)`), so it tolerates a
+    `) TABLESPACE ts_1m;` suffix (migration) as well as a plain `);` (init)."""
+    marker = f"CREATE TABLE IF NOT EXISTS {table} ("
+    start = sql.index(marker) + len(marker)
+    body = sql[start:sql.index("\n)", start)]
+    defs = []
+    for line in body.splitlines():
+        line = line.strip().rstrip(",").strip()
+        if not line or line.upper().startswith("PRIMARY KEY"):
+            continue
+        name, _, rest = line.partition(" ")
+        defs.append((name, " ".join(rest.split()).upper()))
+    return defs
+
+
+def test_migration_010_exists():
+    assert MIGRATION_010.exists(), "010-candles-1m.sql not found"
+
+
+def test_migration_010_has_shared_clauses():
+    sql = _read(MIGRATION_010)
+    for clause in CANDLES_1M_SHARED_CLAUSES:
+        assert clause in sql, f"010 missing: {clause}"
+
+
+def test_init_sql_has_candles_1m_shared_clauses():
+    """Fresh installs (init.sql) must create candles_1m with every non-tablespace clause."""
+    sql = _read(INIT_SQL)
+    for clause in CANDLES_1M_SHARED_CLAUSES:
+        assert clause in sql, f"init.sql missing candles_1m clause: {clause}"
+
+
+def test_candles_1m_tablespace_is_migration_only():
+    """The ts_1m tablespace placement lives ONLY in the migration (prod volume); init.sql (fresh/dev,
+    no volume) must create candles_1m in the default tablespace — else a local spin-up fails."""
+    migration = _read(MIGRATION_010)
+    init = _read(INIT_SQL)
+    for clause in CANDLES_1M_TABLESPACE_CLAUSES:
+        assert clause in migration, f"010 missing tablespace clause: {clause}"
+        assert clause not in init, f"init.sql must NOT carry the prod-only tablespace clause: {clause}"
+
+
+def test_candles_1m_columns_identical_to_candles():
+    """candles_1m column shape MUST equal `candles` exactly (name, type, nullability, order) — the
+    two tables are one series split by TF. Guard against candles in init.sql AND migration≡init."""
+    candles = _table_column_defs(_read(INIT_SQL), "candles")
+    candles_1m_init = _table_column_defs(_read(INIT_SQL), "candles_1m")
+    candles_1m_migration = _table_column_defs(_read(MIGRATION_010), "candles_1m")
+    assert candles_1m_init == candles, "init.sql candles_1m columns drifted from candles"
+    assert candles_1m_migration == candles, "migration 010 candles_1m columns drifted from candles"
+
+
+def test_candles_1m_pk_shape():
+    """PK MUST equal candles' (exchange, market_type, symbol, timeframe, timestamp) in both files."""
+    for path in (MIGRATION_010, INIT_SQL):
+        sql = _read(path)
+        idx = sql.index("CREATE TABLE IF NOT EXISTS candles_1m")
+        block = sql[idx:idx + 700]
+        assert "PRIMARY KEY (exchange, market_type, symbol, timeframe, timestamp)" in block, \
+            f"{path.name}: candles_1m PK shape drifted from candles"
