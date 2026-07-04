@@ -22,7 +22,8 @@ YAML_PATH = Path(__file__).parent / "exchanges.yaml"
 FUNDING_LOOP = "funding"
 OI_LOOP = "oi"
 LIQUIDATION_WS = "liq_ws"
-LOOP_INTERVALS = {FUNDING_LOOP: 3600, OI_LOOP: 300, LIQUIDATION_WS: 300}
+PREMIUM_LOOP = "premium"  # premiumIndexKlines poll (Binance, T-010) — 5-min cadence
+LOOP_INTERVALS = {FUNDING_LOOP: 3600, OI_LOOP: 300, LIQUIDATION_WS: 300, PREMIUM_LOOP: 300}
 
 
 @dataclass
@@ -43,6 +44,7 @@ class ExchangeConfig:
     has_funding: bool = False
     has_oi: bool = False
     has_liquidation_ws: bool = False  # launch the venue's liquidation WS feed (ws.py) in run()
+    has_premium_index: bool = False  # poll premiumIndexKlines into premium_index (Binance, T-010)
     options: dict = field(default_factory=dict)
     timeframes: list[TimeframeConfig] = field(default_factory=list)
     # Weight-budget limiter (Binance): set to enable WeightRateLimiter instead
@@ -97,6 +99,7 @@ def _parse_exchange(exchange_name: str, ex: dict, tf_defs: dict) -> ExchangeConf
         has_funding=ex.get("has_funding", False),
         has_oi=ex.get("has_oi", False),
         has_liquidation_ws=ex.get("has_liquidation_ws", False),
+        has_premium_index=ex.get("has_premium_index", False),
         options=ex.get("options", {}),
         timeframes=timeframes,
         rate_limit_weight_budget=ex.get("rate_limit_weight_budget"),

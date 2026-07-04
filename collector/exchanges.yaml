@@ -71,6 +71,7 @@ exchanges:
     has_funding: true
     has_oi: true
     has_liquidation_ws: true         # !forceOrder@arr all-market liquidation stream (Grade C, T-009.2)
+    has_premium_index: true          # premiumIndexKlines 5m poll → premium_index (T-010)
     # OI two-source (T-007.2): dense-tick 60s (sized to halve peak OI weight at a mass
     # settlement — the dense burst shares this exchange's weight limiter with candles);
     # ±15m settlement window; per-symbol openInterestHist baseline refresh ~30m.
