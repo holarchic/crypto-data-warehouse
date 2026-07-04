@@ -319,6 +319,22 @@ def test_rate_limiter_accepts_priority_arg():
     RateLimiter(0.01).acquire(weight=5, priority=True)
 
 
+def test_weight_limiter_used_snapshot_reports_used_and_in_flight():
+    # T-007.4 weight evidence: snapshot returns (server used-weight, reserved in-flight),
+    # read-only (leaves both unchanged for the next acquire).
+    lim = WeightRateLimiter(budget=1000, safety=0, poll_s=0.01)
+    lim.acquire(weight=30)  # reserves 30 in-flight
+    lim.update_from_response({"x-mbx-used-weight-1m": "150"}, weight=30)  # server used=150, release 30
+    lim.acquire(weight=10)  # reserve 10 more in-flight
+    assert lim.used_snapshot() == (150, 10)
+    assert lim.used_snapshot() == (150, 10)  # idempotent (no mutation)
+
+
+def test_interval_limiter_used_snapshot_is_none():
+    # Interval limiter tracks no weight → None (so callers can log uniformly).
+    assert RateLimiter(0.01).used_snapshot() is None
+
+
 def _cfg(**over):
     base = dict(
         name="x", ccxt_class="x", btc_symbol="B", market_type="perp",
