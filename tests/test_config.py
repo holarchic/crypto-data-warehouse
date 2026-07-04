@@ -130,11 +130,21 @@ def test_load_candle_tables():
 
 
 def test_unknown_table_raises_at_load():
-    # A yaml `table:` outside the allowlist fails ONCE at config load, not per-cycle at runtime.
+    # A yaml `table:` outside the allowlist fails ONCE at collector config load (via _parse_exchange).
     ex = {"ccxt_class": "x", "btc_symbol": "B", "market_type": "perp", "supported_timeframes": ["5m"]}
     tf_defs = {"5m": {"interval_s": 300, "buffer_s": 30, "table": "bogus_table"}}
     with pytest.raises(ValueError, match="not in allowlist"):
         _parse_exchange("x", ex, tf_defs)
+
+
+def test_load_candle_tables_validates_bad_table(monkeypatch):
+    # The MONITOR path (load_candle_tables) never runs _parse_exchange, so it must validate too —
+    # else a bad table: reaches GAP_SQL_BY_TABLE[table] as a per-cycle KeyError (codex correctness).
+    import config
+    monkeypatch.setattr(config, "_load_yaml",
+                        lambda: {"timeframes": {"5m": {"interval_s": 300, "buffer_s": 30, "table": "bogus"}}})
+    with pytest.raises(ValueError, match="not in allowlist"):
+        load_candle_tables()
 
 
 def test_timeframe_table_defaults_to_candles():
