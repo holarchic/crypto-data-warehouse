@@ -7,11 +7,15 @@ from datetime import date, datetime, timezone
 
 from config import FUNDING_LOOP, LIQUIDATION_WS, LOOP_INTERVALS, OI_LOOP, PREMIUM_LOOP
 from monitor import (
+    _TF_SCAN_INTERVALS,
+    GAP_SQL_BY_TABLE,
+    HEARTBEAT_CANDLES_SQL,
     LOOP_TIMEFRAMES,
     build_heartbeat_text,
     build_webhook_payload,
     compute_alarming,
     compute_staleness,
+    detect_gaps,
     evaluate_alarming,
     format_alarming_alert,
     format_gap_alert,
@@ -24,6 +28,44 @@ from monitor import (
 TF_INTERVALS = {"5m": 300, "15m": 900, "1h": 3600, "1d": 86400}
 # The monitor merges LOOP_INTERVALS into the candle-TF map at startup (monitor.run()).
 LOOP_AWARE_INTERVALS = {**TF_INTERVALS, **LOOP_INTERVALS}
+
+
+# --- candle-table gap-scan routing (T-015) ---
+
+
+def test_gap_sql_by_table_routes():
+    assert set(GAP_SQL_BY_TABLE) == {"candles", "candles_1m"}
+    assert "FROM candles\n" in GAP_SQL_BY_TABLE["candles"]
+    assert "FROM candles_1m\n" in GAP_SQL_BY_TABLE["candles_1m"]
+    assert "candles_1m" not in GAP_SQL_BY_TABLE["candles"]  # candles query must NOT hit 1m table
+
+
+def test_detect_gaps_selects_table():
+    # detect_gaps(table='candles_1m') must scan candles_1m (else 1m gaps are invisible).
+    captured = {}
+
+    class _Cur:
+        description = [("symbol",), ("gap_after",), ("gap_before",), ("missing_count",)]
+        def __enter__(self): return self
+        def __exit__(self, *a): return False
+        def execute(self, sql, params): captured["sql"] = sql
+        def fetchall(self): return []
+
+    class _Conn:
+        def cursor(self): return _Cur()
+
+    detect_gaps(_Conn(), "binance", "1m", 60, "candles_1m")
+    assert "FROM candles_1m" in captured["sql"]
+
+
+def test_heartbeat_candles_sql_sums_both_tables():
+    # The weekly heartbeat count must include candles_1m (the densest feed), not only candles.
+    assert "FROM candles WHERE" in HEARTBEAT_CANDLES_SQL
+    assert "FROM candles_1m WHERE" in HEARTBEAT_CANDLES_SQL
+
+
+def test_tf_scan_intervals_has_1m():
+    assert _TF_SCAN_INTERVALS["1m"] == 300
 
 
 # --- compute_staleness ---
