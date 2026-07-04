@@ -9,6 +9,10 @@ discovery:
     LUNA2: LUNA
 
 timeframes:
+  # 1m lands in candles_1m (a separate hypertable on the ts_1m volume tablespace — T-015), not
+  # candles. buffer_s 5: the 1m bar finalizes fast, and a small buffer lets the 1m thread issue
+  # first (its cycle wakes before the 30s/60s-buffer TFs, reducing shared-limiter contention).
+  1m:   { interval_s: 60,     buffer_s: 5,  table: candles_1m }
   5m:   { interval_s: 300,    buffer_s: 30 }
   15m:  { interval_s: 900,    buffer_s: 30 }
   30m:  { interval_s: 1800,   buffer_s: 30 }
@@ -80,6 +84,7 @@ exchanges:
     oi_baseline_interval_s: 1800
     oi_dense_concurrency: 6          # parallel per-symbol dense fetch (mass settlement ~541 syms)
     supported_timeframes:
+      - 1m                           # → candles_1m (ts_1m volume tablespace, T-015.2)
       - 5m
       - 15m
       - 30m

@@ -87,7 +87,7 @@ def _run_collect_pair(main_mod, monkeypatch, last_timestamp, weight_budget):
     monkeypatch.setattr(main_mod.time, "time", lambda: fixed_now)
 
     config = SimpleNamespace(name="binance", market_type="perp", rate_limit_weight_budget=weight_budget)
-    tf = SimpleNamespace(name="5m", interval_s=300)
+    tf = SimpleNamespace(name="5m", interval_s=300, table="candles")
     pair = {"asset_id": "BTC", "symbol": "BTC/USDT:USDT", "native_symbol": "BTCUSDT",
             "market_type": "perp", "last_timestamp": last_timestamp}
     main_mod._collect_pair(object(), pair, config, tf, None, None, "binance/5m")
@@ -120,3 +120,56 @@ def test_collect_pair_poll_non_weight_bound_keeps_full_limit(monkeypatch):
     stored = datetime.fromtimestamp(1_700_000_000.0 - 3 * interval_s, tz=timezone.utc)
     captured, _ = _run_collect_pair(main_mod, monkeypatch, last_timestamp=stored, weight_budget=None)
     assert captured["limit"] == CANDLE_SEED_LIMIT
+
+
+# --- candle-table routing (T-015) ---------------------------------------------
+
+
+def test_insert_sql_is_keyed_by_table():
+    # One INSERT per candle table, targeting the right table (built from CANDLE_TABLES at import).
+    main_mod = _load_real_main()
+    assert set(main_mod.INSERT_SQL) == {"candles", "candles_1m"}
+    assert "INTO candles (" in main_mod.INSERT_SQL["candles"]
+    assert "INTO candles_1m (" in main_mod.INSERT_SQL["candles_1m"]
+
+
+def test_insert_candles_selects_table(monkeypatch):
+    # insert_candles(table=...) executes the SQL for that table; unknown table fails fast.
+    main_mod = _load_real_main()
+    executed = {}
+
+    class _Cur:
+        rowcount = 1
+        def __enter__(self): return self
+        def __exit__(self, *a): return False
+        def execute(self, sql, row): executed["sql"] = sql
+
+    class _Conn:
+        def cursor(self): return _Cur()
+        def commit(self): pass
+
+    row = {"exchange": "binance", "market_type": "perp", "asset_id": "BTC", "symbol": "B",
+           "native_symbol": "B", "timeframe": "1m", "timestamp": 1.0, "open": 1, "high": 1,
+           "low": 1, "close": 1, "volume": 1, "quote_volume": None, "trades": None}
+    main_mod.insert_candles(_Conn(), [row], "candles_1m")
+    assert "INTO candles_1m (" in executed["sql"]
+    import pytest
+    with pytest.raises(KeyError):
+        main_mod.insert_candles(_Conn(), [row], "no_such_table")
+
+
+def test_collect_pair_threads_tf_table(monkeypatch):
+    # _collect_pair must route the insert to tf.table (so 1m lands in candles_1m).
+    main_mod = _load_real_main()
+    captured = {}
+    monkeypatch.setattr(main_mod, "fetch_candles", lambda *a, **k: [{"timestamp": 1.0}])
+    monkeypatch.setattr(main_mod, "insert_candles",
+                        lambda conn, candles, table="candles": captured.setdefault("table", table) or 1)
+    monkeypatch.setattr(main_mod, "upsert_status_success", lambda *a, **k: None)
+    monkeypatch.setattr(main_mod.time, "time", lambda: 1_700_000_000.0)
+    config = SimpleNamespace(name="binance", market_type="perp", rate_limit_weight_budget=None)
+    tf = SimpleNamespace(name="1m", interval_s=60, table="candles_1m")
+    pair = {"asset_id": "BTC", "symbol": "B", "native_symbol": "B",
+            "market_type": "perp", "last_timestamp": None}
+    main_mod._collect_pair(object(), pair, config, tf, None, object(), "binance/1m")
+    assert captured["table"] == "candles_1m"

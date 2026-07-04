@@ -32,12 +32,21 @@ PREMIUM_TIMEFRAME = "5m"
 PREMIUM_INTERVAL_S = 300
 LOOP_INTERVALS = {FUNDING_LOOP: 3600, OI_LOOP: 300, LIQUIDATION_WS: 300, PREMIUM_LOOP: PREMIUM_INTERVAL_S}
 
+# Candle storage tables. A timeframe's `table:` in exchanges.yaml routes its candles to one of these
+# (default `candles`); `1m` routes to `candles_1m` (a separate hypertable on the ts_1m volume
+# tablespace — T-015). This is the SINGLE source of the routing: the collector insert reads
+# TimeframeConfig.table, the monitor gap-scan reads load_candle_tables(), and the api/ container
+# mirrors this allowlist (it can't import collector/). A yaml `table:` outside this set is a config
+# error (fail once at load, below) — never a per-cycle runtime KeyError.
+CANDLE_TABLES = ("candles", "candles_1m")
+
 
 @dataclass
 class TimeframeConfig:
     name: str
     interval_s: int
     buffer_s: int
+    table: str = "candles"  # candle storage table (see CANDLE_TABLES); 1m → candles_1m
 
 
 @dataclass
@@ -94,7 +103,10 @@ def _parse_exchange(exchange_name: str, ex: dict, tf_defs: dict) -> ExchangeConf
         if tf_name not in tf_defs:
             raise ValueError(f"Timeframe '{tf_name}' not defined in timeframes section")
         td = tf_defs[tf_name]
-        timeframes.append(TimeframeConfig(name=tf_name, interval_s=td["interval_s"], buffer_s=td["buffer_s"]))
+        table = td.get("table", "candles")
+        if table not in CANDLE_TABLES:
+            raise ValueError(f"Timeframe '{tf_name}' table '{table}' not in allowlist {CANDLE_TABLES}")
+        timeframes.append(TimeframeConfig(name=tf_name, interval_s=td["interval_s"], buffer_s=td["buffer_s"], table=table))
 
     return ExchangeConfig(
         name=exchange_name,
@@ -158,3 +170,12 @@ def load_timeframe_intervals() -> dict[str, int]:
     """Return {timeframe: interval_s} for all configured timeframes."""
     raw = _load_yaml()
     return {name: td["interval_s"] for name, td in raw["timeframes"].items()}
+
+
+def load_candle_tables() -> dict[str, str]:
+    """Return {timeframe: candle-storage-table} for all configured timeframes (default `candles`).
+
+    The single source for candle-table routing (see CANDLE_TABLES). The monitor loads this once to
+    route its gap-scan to the right table per timeframe; the collector uses TimeframeConfig.table."""
+    raw = _load_yaml()
+    return {name: td.get("table", "candles") for name, td in raw["timeframes"].items()}

@@ -1,7 +1,14 @@
 """Tests for collector/config.py — YAML config loading."""
 
 import pytest
-from config import load_all_configs, load_config, load_discovery_config
+from config import (
+    CANDLE_TABLES,
+    _parse_exchange,
+    load_all_configs,
+    load_candle_tables,
+    load_config,
+    load_discovery_config,
+)
 
 # --- load_config ---
 
@@ -93,6 +100,40 @@ def test_oi_cadence_defaults_for_non_oi_exchange():
     assert cfg.oi_dense_concurrency == 6
     # Priority-reserve lane off by default (non-OI exchange never enters the dense path).
     assert cfg.rate_limit_priority_reserve == 0
+
+
+# --- candle-table routing (T-015) ---
+
+def test_timeframe_table_routing():
+    # 1m routes to candles_1m (ts_1m volume tablespace); every other TF defaults to candles.
+    by_name = {tf.name: tf.table for tf in load_config("binance").timeframes}
+    assert by_name["1m"] == "candles_1m"
+    assert by_name["5m"] == "candles"
+    assert by_name["1h"] == "candles"
+
+
+def test_load_candle_tables():
+    tables = load_candle_tables()
+    assert tables["1m"] == "candles_1m"
+    assert tables["5m"] == "candles"
+    # every mapping is a valid storage table
+    assert set(tables.values()) <= set(CANDLE_TABLES)
+
+
+def test_unknown_table_raises_at_load():
+    # A yaml `table:` outside the allowlist fails ONCE at config load, not per-cycle at runtime.
+    ex = {"ccxt_class": "x", "btc_symbol": "B", "market_type": "perp", "supported_timeframes": ["5m"]}
+    tf_defs = {"5m": {"interval_s": 300, "buffer_s": 30, "table": "bogus_table"}}
+    with pytest.raises(ValueError, match="not in allowlist"):
+        _parse_exchange("x", ex, tf_defs)
+
+
+def test_timeframe_table_defaults_to_candles():
+    # A tf def with no `table:` key → default candles (dataclass default + parse default).
+    ex = {"ccxt_class": "x", "btc_symbol": "B", "market_type": "perp", "supported_timeframes": ["5m"]}
+    tf_defs = {"5m": {"interval_s": 300, "buffer_s": 30}}
+    cfg = _parse_exchange("x", ex, tf_defs)
+    assert cfg.timeframes[0].table == "candles"
 
 
 # --- load_discovery_config ---
