@@ -98,6 +98,21 @@ def build_dsn():
     return f"postgresql://{user}:{password}@{host}:{port}/{db}"
 
 
+def safe_rollback(conn):
+    """Roll back, swallowing any error. When the server drops the connection (a `db` container
+    restart for backup/maintenance), a rollback on the now-dead conn itself raises
+    `OperationalError` — and inside an `except` handler that raise is unhandled, killing the loop
+    thread (the mechanism behind the 2026-07-03/04 total-collection outages). After this
+    no-op-on-failure rollback the loop falls through to its existing top-of-cycle `if conn.closed:`
+    reconnect (`closed` == `pgconn.status == BAD`) and self-heals within ~1 cycle."""
+    if conn is None:
+        return
+    try:
+        conn.rollback()
+    except Exception:
+        pass
+
+
 def connect_db(dsn, max_retries=10, retry_delay=5):
     for attempt in range(1, max_retries + 1):
         try:
