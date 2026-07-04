@@ -59,6 +59,11 @@ class RateLimiter:
     def update_from_response(self, headers: dict | None, weight: int = 1) -> None:
         return None
 
+    def used_snapshot(self) -> None:
+        """No weight budget to report — this limiter paces on request count. Exists so
+        callers can log weight uniformly across limiter types (see `WeightRateLimiter`)."""
+        return None
+
 
 class WeightRateLimiter:
     """Weight-budget limiter synced from response headers.
@@ -174,6 +179,13 @@ class WeightRateLimiter:
                 self._used = used_weight
                 self._used_at = time.monotonic()
             self._in_flight = max(0, self._in_flight - weight)
+
+    def used_snapshot(self) -> tuple[int, int]:
+        """Read-only `(server used-weight, reserved in-flight)` for logging — direct evidence
+        the rolling-minute weight stays under the priority cap during the dense burst
+        (T-007.4 closed the correlation-only diagnosis with this). Lock-guarded; mutates nothing."""
+        with self._lock:
+            return self._used, self._in_flight
 
 
 def _read_weight_header(headers: dict, key: str) -> int | None:
