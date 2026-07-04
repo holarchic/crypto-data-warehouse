@@ -8,6 +8,8 @@ Fetches OHLCV candles, funding rates, and open interest from exchanges. Writes d
 
 Candle fetching lives in `main.py` (`collect_loop` → `_collect_pair` → `fetch_candles`); request-size policy is factored into `candles.py` (`poll_limit` + `CANDLE_LIMIT_*`), a pure module so the weight diet is unit-testable (see Shared-limiter coupling below).
 
+**Candle-table routing (T-015):** which table a timeframe's candles land in is a data-driven property — `table:` in `exchanges.yaml` (default `candles`; `1m` → `candles_1m`). `config._validate_candle_table` is the single validation seam (both `_parse_exchange` and `load_candle_tables` call it, so a bad `table:` fails once at load in the collector AND monitor processes); `TimeframeConfig.table` / `config.load_candle_tables()` is the single routing source, consumed by the collector insert (`main.INSERT_SQL`, a dict keyed by table, built at import from the closed `CANDLE_TABLES` allowlist via one template — no runtime identifier interpolation), the monitor gap-scan (`monitor.GAP_SQL_BY_TABLE`), and — mirrored, since `api/` can't import `collector/` — the API (`_candle_table`, pinned to config by an exact-equality drift test). No hardcoded `1m` branch anywhere.
+
 `collect_loop` calls `maybe_reload_markets()` (in `db.py`) at the top of each cycle. The helper is age-gated (`MARKETS_RELOAD_INTERVAL_S`, default 86400s) and lock-guarded so the per-timeframe threads sharing one ccxt `exchange` reload at most once per interval. Without this, symbols added by daily discovery stay invisible to the long-running collector container.
 
 **DB-restart resilience:** every loop owns one long-lived connection and reconnects at the top of each cycle on `if conn.closed:` (`closed` == `pgconn.status == BAD`; psycopg detects a server-dropped socket only when the conn is next exercised). The hazard is the error handler itself: a `conn.rollback()` or a status/insert write on a just-dropped connection re-raises `OperationalError`, and unhandled that kills the loop thread (root cause of two total outages). So every error-path rollback goes through `db.safe_rollback` (swallows), and the only DB *writes* reachable on a restart raise — `funding._poll_bulk`'s bulk insert and the candle per-pair status write (`main._record_pair_error`) — are individually wrapped; a live-conn pre-check is not protection because the write itself can raise. With no exception able to escape a loop body, the next cycle's `if conn.closed:` reconnects and collection self-heals within ~1 cycle. `ws.py` already had this shape (`_ensure_conn` + a swallowing `_guarded_rollback`).
@@ -50,7 +52,7 @@ Separate always-on container (`python -m monitor`). One `collection_status` fetc
 
 - **Loop-liveness** — presence-based: any stale per-loop heartbeat sentinel row (funding/OI/liq_ws/premium) pages (own cooldown key). A single dead loop is one row, so it is kept off the count-delta signal below.
 - **Candle alarming-mass** — `compute_alarming` counts collectors that are *alarming* (`error_count > 0`, or was-working-now-dark past `4×interval`; excludes the benign new-listing floor + the HL 5m within-cycle cursor). `evaluate_alarming` pages when that count exceeds its rolling-1h median by `ALARMING_DELTA_THRESHOLD` for `ALARMING_SUSTAIN_CYCLES` consecutive cycles, returning a named `AlarmingDecision` that owns the record-only-quiescent baseline invariant.
-- **Gap detection** (tiered by timeframe) + a daily heartbeat summary + a per-cycle healthcheck dead-man's-switch ping.
+- **Gap detection** (tiered by timeframe, **routed to the timeframe's candle table** via `load_candle_tables()` so 1m gaps scan `candles_1m`, not the 1m-empty `candles`) + a weekly heartbeat summary (24h candle count summed across `candles` + `candles_1m`) + a per-cycle healthcheck dead-man's-switch ping.
 
 ### api/
 
@@ -58,7 +60,7 @@ FastAPI read-only REST API. Queries PostgreSQL, serves consumers on GCP.
 
 ### db/
 
-Schema migrations and TimescaleDB hypertable setup. Candles hypertable partitioned on timestamp, 1-week chunks. Compression (>7d) and retention policies (2y candles, 1y funding/OI).
+Schema migrations and TimescaleDB hypertable setup. Candles hypertable partitioned on timestamp, 1-week chunks; `candles_1m` (1m only) on the `ts_1m` volume tablespace, 1-day chunks (migration 010, operator-applied). Compression (>7d) and retention policies (2y candles + candles_1m, 1y funding/OI).
 
 ## Data Flow
 
@@ -86,6 +88,10 @@ PK: `(exchange, market_type, symbol, timeframe, timestamp)`
 | volume | DOUBLE PRECISION | Base currency |
 | quote_volume | DOUBLE PRECISION | Nullable |
 | trades | INTEGER | Nullable |
+
+### `candles_1m` hypertable
+
+Identical column shape + PK to `candles`, holding ONLY `1m` (Binance + Bybit). A **separate hypertable pinned to the `ts_1m` tablespace** (a Hetzner Cloud Volume) so 1m's ~5× density (~1.4M rows/day, ~19 GB/yr compressed) sits on cheap block storage off the 34 GB root disk — without migrating the in-place `candles` data. Chunk interval **1 day** (vs candles' 1 week — density: a 1-week chunk would be ~3.8 GB uncompressed, half of RAM). Compress >7d, retention 2y (the volume holds it, no shorter-retention compromise). On prod the chunks live in `ts_1m` (migration 010, applied after the operator mounts the volume); `init.sql` (fresh/dev, no volume) creates it in the **default** tablespace — the drift guard compares column/PK/policy shape, not the tablespace clause. Readers treat `candles` + `candles_1m` as one series split by TF; the T-011 export unions them.
 
 ### `collection_status`
 
