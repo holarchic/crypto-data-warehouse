@@ -29,6 +29,14 @@ def test_has_liquidation_ws_flag():
     assert load_config("coinbase").has_liquidation_ws is False
 
 
+def test_has_premium_index_flag():
+    # T-010: only binance polls premiumIndexKlines; others default False.
+    assert load_config("binance").has_premium_index is True
+    assert load_config("bybit").has_premium_index is False
+    assert load_config("hyperliquid").has_premium_index is False
+    assert load_config("coinbase").has_premium_index is False
+
+
 def test_load_config_unknown_exchange_raises():
     with pytest.raises(ValueError, match="Unknown exchange"):
         load_config("doesnotexist")

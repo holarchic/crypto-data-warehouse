@@ -29,3 +29,8 @@ def test_api_loop_timeframes_match_config_loop_intervals():
 
 def test_api_excludes_liq_ws_sentinel():
     assert "liq_ws" in _api_loop_timeframes()
+
+
+def test_api_excludes_premium_sentinel():
+    # T-010: the premium poll's liveness sentinel must not leak into candle-facing /status.
+    assert "premium" in _api_loop_timeframes()
