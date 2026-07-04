@@ -22,8 +22,15 @@ YAML_PATH = Path(__file__).parent / "exchanges.yaml"
 FUNDING_LOOP = "funding"
 OI_LOOP = "oi"
 LIQUIDATION_WS = "liq_ws"
-PREMIUM_LOOP = "premium"  # premiumIndexKlines poll (Binance, T-010) — 5-min cadence
-LOOP_INTERVALS = {FUNDING_LOOP: 3600, OI_LOOP: 300, LIQUIDATION_WS: 300, PREMIUM_LOOP: 300}
+PREMIUM_LOOP = "premium"
+# Premium-index poll cadence (T-010) — the SINGLE source: the ccxt timeframe, the poll interval,
+# AND the loop staleness floor (LOOP_INTERVALS below) all derive from here, so a cadence change is
+# one edit. collector/premium_index.py imports these (it must not redefine them). Fixed, not a
+# runtime knob — the timeframe, the incomplete-bar guard, and the monitor floor are coupled, so a
+# config-only change would silently break monitoring.
+PREMIUM_TIMEFRAME = "5m"
+PREMIUM_INTERVAL_S = 300
+LOOP_INTERVALS = {FUNDING_LOOP: 3600, OI_LOOP: 300, LIQUIDATION_WS: 300, PREMIUM_LOOP: PREMIUM_INTERVAL_S}
 
 
 @dataclass
