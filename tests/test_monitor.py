@@ -292,30 +292,37 @@ def test_build_heartbeat_text_zero_errors():
 
 def test_should_send_heartbeat_wrong_hour():
     now = datetime(2026, 4, 17, 3, 0, tzinfo=timezone.utc)
-    assert should_send_heartbeat(now, last_sent_date=None, target_hour=0) is False
+    assert should_send_heartbeat(now, None, target_hour=0, target_weekday=now.weekday()) is False
 
 
-def test_should_send_heartbeat_right_hour_never_sent():
+def test_should_send_heartbeat_wrong_weekday():
+    # Right hour but not the target weekday → the weekly cadence holds fire (this is the T-013 fix:
+    # a daily send is what trained the operator to mute the channel).
     now = datetime(2026, 4, 17, 0, 30, tzinfo=timezone.utc)
-    assert should_send_heartbeat(now, last_sent_date=None, target_hour=0) is True
+    assert should_send_heartbeat(now, None, target_hour=0, target_weekday=(now.weekday() + 1) % 7) is False
 
 
-def test_should_send_heartbeat_right_hour_already_sent_today():
+def test_should_send_heartbeat_right_slot_never_sent():
     now = datetime(2026, 4, 17, 0, 30, tzinfo=timezone.utc)
-    assert should_send_heartbeat(now, last_sent_date=date(2026, 4, 17), target_hour=0) is False
+    assert should_send_heartbeat(now, None, target_hour=0, target_weekday=now.weekday()) is True
 
 
-def test_should_send_heartbeat_right_hour_yesterday_sent():
+def test_should_send_heartbeat_already_sent_this_slot():
     now = datetime(2026, 4, 17, 0, 30, tzinfo=timezone.utc)
-    assert should_send_heartbeat(now, last_sent_date=date(2026, 4, 16), target_hour=0) is True
+    assert should_send_heartbeat(now, date(2026, 4, 17), target_hour=0, target_weekday=now.weekday()) is False
+
+
+def test_should_send_heartbeat_prior_week_sent():
+    # Sent on the same weekday a week ago → fires again this week (date idempotency key differs).
+    now = datetime(2026, 4, 17, 0, 30, tzinfo=timezone.utc)
+    assert should_send_heartbeat(now, date(2026, 4, 10), target_hour=0, target_weekday=now.weekday()) is True
 
 
 def test_should_send_heartbeat_non_zero_target_hour():
-    # 7am UTC target
     now_ok = datetime(2026, 4, 17, 7, 5, tzinfo=timezone.utc)
     now_bad = datetime(2026, 4, 17, 6, 55, tzinfo=timezone.utc)
-    assert should_send_heartbeat(now_ok, None, target_hour=7) is True
-    assert should_send_heartbeat(now_bad, None, target_hour=7) is False
+    assert should_send_heartbeat(now_ok, None, target_hour=7, target_weekday=now_ok.weekday()) is True
+    assert should_send_heartbeat(now_bad, None, target_hour=7, target_weekday=now_bad.weekday()) is False
 
 
 # --- compute_alarming (T-005): the high-signal subset, 5m → 4×interval = 1200s ---

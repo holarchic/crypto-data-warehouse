@@ -186,13 +186,16 @@ def build_heartbeat_text(stats):
     )
 
 
-def should_send_heartbeat(now_utc, last_sent_date, target_hour):
-    """True if a daily heartbeat should fire right now.
+def should_send_heartbeat(now_utc, last_sent_date, target_hour, target_weekday):
+    """True if the weekly status heartbeat should fire right now.
 
-    Fires once per UTC day when `now_utc.hour == target_hour`. Uses the
-    last_sent_date as idempotency key so the same hour-window doesn't
-    trigger multiple sends across consecutive monitor cycles.
+    Fires once per week: on `target_weekday` (Mon=0 … Sun=6) when `now_utc.hour == target_hour`.
+    A weekly cadence, not daily — a daily "all-ok" ping trained the operator to mute the alert
+    channel, which then hid a real 7h outage's pages (T-013). `last_sent_date` is the idempotency
+    key so the same hour-window doesn't fire on every monitor cycle within that hour.
     """
+    if now_utc.weekday() != target_weekday:
+        return False
     if now_utc.hour != target_hour:
         return False
     return last_sent_date != now_utc.date()
@@ -360,11 +363,12 @@ _TF_SCAN_INTERVALS = {
 
 
 def monitor_loop(dsn, timeframe_intervals, webhook_url, poll_s=300, cooldown_s=3600,
-                 healthcheck_url="", heartbeat_hour_utc=0, delta_threshold=25, sustain_cycles=2):
+                 healthcheck_url="", heartbeat_hour_utc=0, delta_threshold=25, sustain_cycles=2,
+                 heartbeat_weekday=0):
     """Main monitor loop. Checks staleness + gaps on each cycle.
 
-    Also hits healthcheck_url every cycle (dead-man's switch) and posts a
-    daily heartbeat summary at heartbeat_hour_utc.
+    Also hits healthcheck_url every cycle (dead-man's switch) and posts a weekly status
+    summary on heartbeat_weekday at heartbeat_hour_utc.
     """
     import psycopg
 
@@ -454,9 +458,9 @@ def monitor_loop(dsn, timeframe_intervals, webhook_url, poll_s=300, cooldown_s=3
                             log.warning("Gap alert delivery failed: %s/%s", exchange, timeframe)
                 last_gap_scan[(exchange, timeframe)] = now
 
-            # --- Daily heartbeat (Discord summary) ---
+            # --- Weekly status heartbeat (Discord summary) ---
             now_utc = datetime.now(timezone.utc)
-            if should_send_heartbeat(now_utc, last_heartbeat_date, heartbeat_hour_utc):
+            if should_send_heartbeat(now_utc, last_heartbeat_date, heartbeat_hour_utc, heartbeat_weekday):
                 try:
                     stats = fetch_heartbeat_stats(conn)
                     text = build_heartbeat_text(stats)
@@ -497,6 +501,7 @@ def run():
     cooldown_s = int(os.environ.get("ALERT_COOLDOWN_S", "3600"))
     healthcheck_url = os.environ.get("HEALTHCHECK_PING_URL", "")
     heartbeat_hour_utc = int(os.environ.get("HEARTBEAT_HOUR_UTC", "0"))
+    heartbeat_weekday = int(os.environ.get("HEARTBEAT_DAY_UTC", "0"))  # 0=Mon … 6=Sun; weekly status ping
     delta_threshold = int(os.environ.get("ALARMING_DELTA_THRESHOLD", "25"))
     sustain_cycles = int(os.environ.get("ALARMING_SUSTAIN_CYCLES", "2"))
 
@@ -504,15 +509,17 @@ def run():
     # flags a silently-dead loop (poll or WS) via the same staleness path.
     timeframe_intervals = {**load_timeframe_intervals(), **LOOP_INTERVALS}
 
+    _weekdays = ("Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun")
     log.info(
-        "Monitor starting: poll=%ds cooldown=%ds webhook=%s healthcheck=%s heartbeat=%02d:00 UTC alarming=+%d×%d cycles",
+        "Monitor starting: poll=%ds cooldown=%ds webhook=%s healthcheck=%s heartbeat=weekly %s %02d:00 UTC alarming=+%d×%d cycles",
         poll_s, cooldown_s,
         "configured" if webhook_url else "none",
         "configured" if healthcheck_url else "none",
-        heartbeat_hour_utc, delta_threshold, sustain_cycles,
+        _weekdays[heartbeat_weekday % 7], heartbeat_hour_utc, delta_threshold, sustain_cycles,
     )
     monitor_loop(dsn, timeframe_intervals, webhook_url, poll_s, cooldown_s,
-                 healthcheck_url, heartbeat_hour_utc, delta_threshold, sustain_cycles)
+                 healthcheck_url, heartbeat_hour_utc, delta_threshold, sustain_cycles,
+                 heartbeat_weekday=heartbeat_weekday)
 
 
 if __name__ == "__main__":
