@@ -9,6 +9,7 @@ launches the thread) is covered in test_candles-style real-main loading (see tes
 from pathlib import Path
 
 import premium_index as pi
+import pytest
 from candles import poll_limit
 from rate_limiter import RateLimiter, binance_kline_weight
 
@@ -62,6 +63,7 @@ class FakeExchange:
         self.bars = bars
         self.calls = []
         self.last_response_headers = {}
+        self.has = {"fetchPremiumIndexOHLCV": True}  # Binance capability; guard checks this
 
     def fetch_premium_index_ohlcv(self, symbol, timeframe, since, limit):
         self.calls.append({"symbol": symbol, "timeframe": timeframe, "since": since, "limit": limit})
@@ -254,3 +256,12 @@ def test_loop_reactivated_symbol_resumes_from_db_cursor(monkeypatch):
     pi.premium_index_loop(ex, _cfg(), "dsn", RateLimiter(0), max_cycles=1)
     assert len(ex.calls) == 1
     assert ex.calls[0]["since"] == int(cursor_ts * 1000) + 1   # resumed from DB, not since=None
+
+
+def test_loop_raises_for_venue_without_premium_index_support():
+    # Fail fast on a misconfig: has_premium_index on a venue with no premiumIndexKlines must raise,
+    # not heartbeat-as-alive while every fetch fails silently (matches oi_loop / build_liq_spec).
+    ex = FakeExchange([])
+    ex.has = {}  # no fetchPremiumIndexOHLCV capability
+    with pytest.raises(ValueError, match="Binance-only"):
+        pi.premium_index_loop(ex, _cfg(), "dsn", RateLimiter(0), max_cycles=1)

@@ -22,7 +22,7 @@ import time
 
 from backoff import RETRIABLE_EXCEPTIONS
 from candles import poll_limit
-from config import PREMIUM_LOOP, ExchangeConfig
+from config import PREMIUM_INTERVAL_S, PREMIUM_LOOP, PREMIUM_TIMEFRAME, ExchangeConfig
 from rate_limiter import RateLimiter, binance_kline_weight, paced_call
 from status import query_active_pairs, upsert_loop_heartbeat
 
@@ -30,13 +30,11 @@ from db import connect_db, maybe_reload_markets, safe_rollback
 
 log = logging.getLogger(__name__)
 
-# Cadence is FIXED here, not a runtime config knob: the ccxt timeframe string, the
-# incomplete-bar guard, and the `premium` monitor staleness floor (config.LOOP_INTERVALS)
-# are coupled — a config-only change would silently break monitoring (codex plan-review).
-# Changing the cadence is a small, one-place code edit that moves all three together.
-PREMIUM_TIMEFRAME = "5m"
-PREMIUM_INTERVAL_S = 300
-PREMIUM_POLL_BUFFER_S = 15   # fetch just after the 5m bar closes (server-side settle margin)
+# Cadence (PREMIUM_TIMEFRAME / PREMIUM_INTERVAL_S) is the single source in config.py — the ccxt
+# timeframe, the incomplete-bar guard here, and the `premium` monitor staleness floor
+# (config.LOOP_INTERVALS) all derive from it, so a cadence change is one edit. Fixed, not a runtime
+# knob (the three are coupled — a config-only change would silently break monitoring).
+PREMIUM_POLL_BUFFER_S = 15   # fetch just after the bar closes (server-side settle margin)
 # Forward-only first fetch: with no cursor, pull only the latest few bars (since=None → ccxt
 # returns the most-recent `limit`), NOT the 1000-bar candle seed — deep history is backfillable
 # via T-011, so the empty-table rollout must not seed ~3.5 days × ~500 symbols and spike weight.
@@ -160,6 +158,14 @@ def premium_index_loop(exchange, config: ExchangeConfig, dsn: str, rate_limiter:
     """Boundary-scheduled 5-min premium-index poll for Binance. Own DB connection; never exits
     (daemon). `max_cycles` bounds the outer loop for tests (None = run forever), mirroring
     `ws_loop`'s `max_sessions`."""
+    # Fail fast on a misconfig (matches oi_loop's raise + build_liq_spec): premiumIndexKlines is
+    # Binance-only, so has_premium_index on a venue without it would otherwise heartbeat as alive
+    # while every fetch_premium_index_ohlcv fails silently. A dead thread + traceback is the correct,
+    # loud outcome for a config error, not a limp-along loop.
+    if not getattr(exchange, "has", {}).get("fetchPremiumIndexOHLCV"):
+        raise ValueError(
+            f"'{config.name}' has no fetchPremiumIndexOHLCV — has_premium_index is Binance-only"
+        )
     thread_name = f"{config.name}/premium"
     conn = connect_db(dsn)
     cursors: dict[str, float] = {}
