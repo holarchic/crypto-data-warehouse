@@ -13,7 +13,7 @@ from rate_limiter import (
 )
 from status import query_active_pairs, upsert_loop_heartbeat
 
-from db import connect_db
+from db import connect_db, safe_rollback
 
 log = logging.getLogger(__name__)
 
@@ -103,11 +103,11 @@ def _seed_funding(exchange, config, conn, pairs, rate_limiter):
             log.warning("[%s/funding] Seed retriable error on %s: %s", config.name, pair["symbol"], exc)
             if conn.closed:
                 return
-            conn.rollback()
+            safe_rollback(conn)
         except Exception as exc:
             log.warning("[%s/funding] Seed error on %s: %s", config.name, pair["symbol"], exc)
             if not conn.closed:
-                conn.rollback()
+                safe_rollback(conn)
 
     log.info("[%s/funding] Seed complete: %d rows inserted across %d pairs", config.name, total_inserted, len(pairs))
 
@@ -122,12 +122,12 @@ def _poll_bulk(exchange, config, conn, pairs, rate_limiter):
     except RETRIABLE_EXCEPTIONS as exc:
         log.warning("[%s/funding] Bulk fetch retriable error: %s", config.name, exc)
         if not conn.closed:
-            conn.rollback()
+            safe_rollback(conn)
         return 0
     except Exception as exc:
         log.warning("[%s/funding] Bulk fetch error: %s", config.name, exc)
         if not conn.closed:
-            conn.rollback()
+            safe_rollback(conn)
         return 0
 
     # Build symbol lookup from active pairs
@@ -141,8 +141,15 @@ def _poll_bulk(exchange, config, conn, pairs, rate_limiter):
         if row:
             rows.append(row)
 
-    inserted = _insert_funding(conn, rows)
-    return inserted
+    # Guard the bulk insert like the fetch above and like _poll_dydx's per-pair insert: a db
+    # restart here would otherwise raise OperationalError straight out of funding_loop (this insert
+    # sits outside the fetch handler) and kill the thread (T-014).
+    try:
+        return _insert_funding(conn, rows)
+    except Exception as exc:
+        log.warning("[%s/funding] Bulk insert error: %s", config.name, exc)
+        safe_rollback(conn)
+        return 0
 
 
 def _poll_dydx(exchange, config, conn, pairs, rate_limiter):
@@ -165,11 +172,11 @@ def _poll_dydx(exchange, config, conn, pairs, rate_limiter):
             log.warning("[%s/funding] dYdX retriable error on %s: %s", config.name, pair["symbol"], exc)
             if conn.closed:
                 return total_inserted
-            conn.rollback()
+            safe_rollback(conn)
         except Exception as exc:
             log.warning("[%s/funding] dYdX error on %s: %s", config.name, pair["symbol"], exc)
             if not conn.closed:
-                conn.rollback()
+                safe_rollback(conn)
 
     return total_inserted
 
@@ -196,7 +203,7 @@ def _heartbeat(conn, config: ExchangeConfig, thread_name: str):
     except Exception:
         log.exception("[%s] Heartbeat upsert failed", thread_name)
         if not conn.closed:
-            conn.rollback()
+            safe_rollback(conn)
 
 
 def funding_loop(exchange, config: ExchangeConfig, dsn: str, rate_limiter: RateLimiter):
@@ -220,7 +227,7 @@ def funding_loop(exchange, config: ExchangeConfig, dsn: str, rate_limiter: RateL
             pairs = _get_active_pairs(conn, config.name)
         except Exception:
             log.exception("[%s] Failed to query active pairs", thread_name)
-            conn.rollback()
+            safe_rollback(conn)
             _sleep_until_next_hour()
             continue
 

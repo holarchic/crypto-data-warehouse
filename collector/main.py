@@ -18,7 +18,7 @@ from rate_limiter import (
 from status import query_active_pairs, upsert_status_error, upsert_status_success
 from ws import ws_loop
 
-from db import build_dsn, connect_db, create_exchange, maybe_reload_markets
+from db import build_dsn, connect_db, create_exchange, maybe_reload_markets, safe_rollback
 
 log = logging.getLogger(__name__)
 
@@ -166,6 +166,21 @@ def _defer_first_cycle(interval_s: int) -> bool:
     return _DEFER_FIRST_CYCLE_MIN_S <= interval_s < _DEFER_FIRST_CYCLE_MAX_S
 
 
+def _record_pair_error(conn, config: ExchangeConfig, pair, tf: TimeframeConfig, exc) -> None:
+    """Best-effort per-pair error-status write. MUST NOT raise out of the collect handler — a db
+    restart mid-write would otherwise propagate and kill the collection thread (T-014). The
+    rollback is unconditionally safe; the status write is gated on a live conn AND wrapped, so a
+    restart between the check and the write can't escape either (the check alone is not protection)."""
+    safe_rollback(conn)
+    if conn.closed:
+        return
+    try:
+        upsert_status_error(conn, config.name, pair.get("market_type", config.market_type),
+                            pair["symbol"], tf.name, str(exc))
+    except Exception:
+        safe_rollback(conn)
+
+
 def collect_loop(exchange, config: ExchangeConfig, tf: TimeframeConfig, dsn: str, rate_limiter: RateLimiter):
     """Multi-pair poll loop for a single timeframe. Own DB connection. Never exits."""
     thread_name = f"{config.name}/{tf.name}"
@@ -197,7 +212,7 @@ def collect_loop(exchange, config: ExchangeConfig, tf: TimeframeConfig, dsn: str
             pairs = query_active_pairs(conn, config.name, tf.name)
         except Exception:
             log.exception("[%s] Failed to query active pairs", thread_name)
-            conn.rollback()
+            safe_rollback(conn)
             pairs = []
         if not pairs:
             pairs = _btc_fallback_pairs(config, exchange)
@@ -216,14 +231,10 @@ def collect_loop(exchange, config: ExchangeConfig, tf: TimeframeConfig, dsn: str
                     except RuntimeError:
                         log.error("[%s] DB reconnect failed mid-cycle", thread_name)
                         break
-                if not conn.closed:
-                    conn.rollback()
-                    upsert_status_error(conn, config.name, pair.get("market_type", config.market_type), pair["symbol"], tf.name, str(exc))
+                _record_pair_error(conn, config, pair, tf, exc)
             except Exception as exc:
                 log.warning("[%s] Error on %s: %s", thread_name, pair["symbol"], exc)
-                if not conn.closed:
-                    conn.rollback()
-                    upsert_status_error(conn, config.name, pair.get("market_type", config.market_type), pair["symbol"], tf.name, str(exc))
+                _record_pair_error(conn, config, pair, tf, exc)
 
 
 # ---------------------------------------------------------------------------

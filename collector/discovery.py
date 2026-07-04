@@ -13,7 +13,7 @@ from dotenv import load_dotenv
 from status import deactivate_stale_pairs, upsert_discovery_pair
 from symbols import resolve_asset_id
 
-from db import build_dsn, connect_db, create_exchange
+from db import build_dsn, connect_db, create_exchange, safe_rollback
 
 log = logging.getLogger(__name__)
 
@@ -175,7 +175,7 @@ def discover():
         log.info("Deactivated %d stale pair×timeframe rows", total_deactivated)
 
     except Exception:
-        conn.rollback()
+        safe_rollback(conn)
         log.exception("Discovery failed during DB writes")
         sys.exit(1)
     finally:
