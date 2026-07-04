@@ -12,7 +12,7 @@ import urllib.request
 from collections import deque, namedtuple
 from datetime import datetime, timezone
 
-from config import LOOP_INTERVALS, load_timeframe_intervals
+from config import CANDLE_TABLES, LOOP_INTERVALS, load_candle_tables, load_timeframe_intervals
 from dotenv import load_dotenv
 from status import LOOP_SENTINEL_SYMBOL
 
@@ -213,11 +213,15 @@ STALENESS_SQL = """
     ORDER BY exchange, timeframe, symbol
 """
 
-GAP_SQL = """
+# One gap-scan query per candle table (candles, candles_1m). The FROM table is substituted at
+# import from the closed CANDLE_TABLES allowlist — NOT interpolated from a runtime value — so 1m
+# gap detection scans candles_1m (else it would query `candles`, find no 1m rows, and be silently
+# blind to 1m bar-gaps). Mirrors the collector's INSERT_SQL routing (same single source).
+_GAP_TEMPLATE = """
     WITH consecutive AS (
         SELECT symbol, timestamp,
                LEAD(timestamp) OVER (PARTITION BY symbol ORDER BY timestamp) AS next_ts
-        FROM candles
+        FROM {table}
         WHERE exchange = %(exchange)s
           AND timeframe = %(timeframe)s
           AND timestamp > NOW() - INTERVAL '1 second' * %(lookback_s)s
@@ -229,6 +233,7 @@ GAP_SQL = """
       AND EXTRACT(EPOCH FROM next_ts - timestamp) > %(interval_s)s * 1.5
     ORDER BY symbol, timestamp
 """
+GAP_SQL_BY_TABLE = {table: _GAP_TEMPLATE.format(table=table) for table in CANDLE_TABLES}
 
 
 def send_webhook(url, text):
@@ -264,11 +269,13 @@ HEARTBEAT_STATS_SQL = """
     WHERE active = TRUE
 """
 
-HEARTBEAT_CANDLES_SQL = """
-    SELECT count(*) AS candles_24h
-    FROM candles
-    WHERE timestamp > NOW() - INTERVAL '24 hours'
-"""
+# Sum the 24h candle count across every candle table (candles + candles_1m) so the weekly heartbeat
+# doesn't undercount — 1m is the densest feed (~1.4M rows/day, > all other TFs combined). Built from
+# the closed CANDLE_TABLES allowlist (literal, no runtime interpolation).
+HEARTBEAT_CANDLES_SQL = "SELECT " + " + ".join(
+    f"(SELECT count(*) FROM {table} WHERE timestamp > NOW() - INTERVAL '24 hours')"
+    for table in CANDLE_TABLES
+) + " AS candles_24h"
 
 
 def fetch_heartbeat_stats(conn):
@@ -318,8 +325,8 @@ def fetch_status_rows(conn):
         return [dict(zip(cols, row)) for row in cur.fetchall()]
 
 
-def detect_gaps(conn, exchange, timeframe, interval_s, lookback_count=10):
-    """Detect candle gaps for an exchange/timeframe. Returns list of gap dicts."""
+def detect_gaps(conn, exchange, timeframe, interval_s, table="candles", lookback_count=10):
+    """Detect candle gaps for an exchange/timeframe in its storage table. Returns list of gap dicts."""
     lookback_s = lookback_count * interval_s
     params = {
         "exchange": exchange,
@@ -328,7 +335,7 @@ def detect_gaps(conn, exchange, timeframe, interval_s, lookback_count=10):
         "interval_s": interval_s,
     }
     with conn.cursor() as cur:
-        cur.execute(GAP_SQL, params)
+        cur.execute(GAP_SQL_BY_TABLE[table], params)
         cols = [desc[0] for desc in cur.description]
         rows = [dict(zip(cols, row)) for row in cur.fetchall()]
     # Convert timestamps to ISO strings for readability
@@ -349,6 +356,7 @@ def _get_exchange_timeframe_pairs(conn):
 
 # Slower timeframes checked less frequently — map of minimum cycle interval in seconds
 _TF_SCAN_INTERVALS = {
+    "1m": 300,    # every cycle (candles_1m; the 300s monitor tick is the finest cadence anyway)
     "5m": 300,    # every cycle
     "15m": 900,
     "30m": 1800,
@@ -379,6 +387,10 @@ def monitor_loop(dsn, timeframe_intervals, webhook_url, poll_s=300, cooldown_s=3
     # consecutive breaches. In-memory like cooldowns — resets on restart, rebuilds over 1h.
     alarming_history = deque(maxlen=max(1, 3600 // poll_s))
     alarming_consecutive = 0
+
+    # Timeframe → candle storage table (candles / candles_1m). Loaded once; routes the gap-scan so
+    # 1m gaps are detected against candles_1m, not the (1m-empty) candles table.
+    candle_tables = load_candle_tables()
 
     while True:
         try:
@@ -447,7 +459,7 @@ def monitor_loop(dsn, timeframe_intervals, webhook_url, poll_s=300, cooldown_s=3
                 if interval_s is None:
                     continue
 
-                gaps = detect_gaps(conn, exchange, timeframe, interval_s)
+                gaps = detect_gaps(conn, exchange, timeframe, interval_s, candle_tables.get(timeframe, "candles"))
                 if gaps:
                     alert_text = format_gap_alert(exchange, timeframe, gaps)
                     alert_key = f"gaps:{exchange}:{timeframe}"
