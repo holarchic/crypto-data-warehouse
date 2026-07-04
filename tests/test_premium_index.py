@@ -6,6 +6,8 @@ selection and cursor advance are exercised without a live wire. Loop wiring (has
 launches the thread) is covered in test_candles-style real-main loading (see test at bottom).
 """
 
+from pathlib import Path
+
 import premium_index as pi
 from candles import poll_limit
 from rate_limiter import RateLimiter, binance_kline_weight
@@ -190,3 +192,15 @@ def test_sleep_until_next_boundary_math(monkeypatch):
 def _cfg():
     from types import SimpleNamespace
     return SimpleNamespace(name="binance", market_type="perp")
+
+
+# --- run() wiring (source-pin — run() is a blocking daemon entry point) -------
+
+
+def test_run_wires_premium_thread_behind_flag():
+    """The premium loop is imported and launched only when has_premium_index is set. Source-pinned
+    because run() blocks forever; a live launch test would hang (matches the api LOOP_TIMEFRAMES pin)."""
+    src = (Path(pi.__file__).parent / "main.py").read_text()
+    assert "from premium_index import premium_index_loop" in src
+    assert "config.has_premium_index" in src
+    assert "target=premium_index_loop" in src
