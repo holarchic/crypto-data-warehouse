@@ -64,7 +64,7 @@ def get_candles(
         params["end"] = end
 
     where = " AND ".join(conditions)
-    query = f"SELECT * FROM candles WHERE {where} ORDER BY timestamp DESC LIMIT %(limit)s"
+    query = f"SELECT * FROM {_candle_table(timeframe)} WHERE {where} ORDER BY timestamp DESC LIMIT %(limit)s"
 
     with pool.connection() as conn:
         rows = conn.execute(query, params).fetchall()
@@ -221,9 +221,23 @@ def get_oi_latest(asset_id: str):
 # ---------------------------------------------------------------------------
 
 TIMEFRAME_INTERVALS = {
-    "5m": 300, "15m": 900, "30m": 1800, "1h": 3600, "2h": 7200,
+    "1m": 60, "5m": 300, "15m": 900, "30m": 1800, "1h": 3600, "2h": 7200,
     "4h": 14400, "12h": 43200, "1d": 86400, "3d": 259200, "1w": 604800,
 }
+
+# Candle-table routing, MIRRORED from collector/exchanges.yaml (config.load_candle_tables); the api/
+# container can't import collector/, same as TIMEFRAME_INTERVALS above and LOOP_TIMEFRAMES below.
+# Only the NON-default routes live here (default is `candles`); a drift test pins this against config
+# so the two mirrors can't diverge. `1m` → candles_1m (a separate hypertable on the ts_1m volume,
+# T-015). `/candles` and `/status/gaps` route their FROM clause through _candle_table so a query for
+# `1m` reads candles_1m — else the API advertises 1m (from collection_status) while serving 0 rows.
+CANDLE_TABLE_BY_TIMEFRAME = {"1m": "candles_1m"}
+
+
+def _candle_table(timeframe: str) -> str:
+    """The candle storage table for a timeframe (default `candles`). Value is a fixed literal from a
+    closed map, safe to inline into a query identifier (psycopg can't bind an identifier as a value)."""
+    return CANDLE_TABLE_BY_TIMEFRAME.get(timeframe, "candles")
 
 # Per-loop heartbeat pseudo-timeframes — funding, OI, the liquidation-WS, and the premium-poll
 # sentinel (the keys of collector/config.py LOOP_INTERVALS). The API is a separate container and
@@ -334,7 +348,7 @@ def get_status_gaps(
         WITH consecutive AS (
             SELECT symbol, timestamp,
                    LEAD(timestamp) OVER (PARTITION BY symbol ORDER BY timestamp) AS next_ts
-            FROM candles
+            FROM {_candle_table(timeframe)}
             WHERE {where}
         )
         SELECT symbol, timestamp AS gap_after, next_ts AS gap_before,
