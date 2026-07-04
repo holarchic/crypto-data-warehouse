@@ -241,3 +241,16 @@ def test_loop_seeds_empty_then_polls(monkeypatch):
     assert len(ex.calls) == 1              # polled the one pair
     assert ex.calls[0]["since"] is None    # forward-only on the empty table
     assert hb["n"] == 1
+
+
+def test_loop_reactivated_symbol_resumes_from_db_cursor(monkeypatch):
+    # A symbol with existing premium rows (returned by the seed) resumes from its DB cursor — NOT a
+    # forward-only since=None poll. This is the deactivate→reactivate gap-skip guard: an active
+    # symbol missing from the in-memory cursor map is re-seeded from the DB before first-run.
+    cursor_ts = 1_600_000_000.0
+    conn, ex, hb = FakeConn(), FakeExchange([_closed_bar(1_600_000_500_000)]), {"n": 0}
+    pairs = [dict(PAIR, market_type="perp", last_timestamp=None)]
+    _patch_loop(monkeypatch, conn, pairs, lambda *a: {PAIR["symbol"]: cursor_ts}, hb)
+    pi.premium_index_loop(ex, _cfg(), "dsn", RateLimiter(0), max_cycles=1)
+    assert len(ex.calls) == 1
+    assert ex.calls[0]["since"] == int(cursor_ts * 1000) + 1   # resumed from DB, not since=None
