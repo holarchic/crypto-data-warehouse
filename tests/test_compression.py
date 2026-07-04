@@ -198,3 +198,80 @@ def test_liquidations_dedup_index_preserves_oid_tid():
         idx = sql.index("idx_liquidations_dedup")
         block = sql[idx:idx + 120]
         assert "(venue, asset_id, timestamp, oid, tid)" in block, f"{path.name}: dedup index shape drifted"
+
+
+# --- premium_index (migration 009) — Binance premium-index term structure ----
+# Guard migration ≡ init.sql at the text level so the two never drift (T-010).
+
+MIGRATION_009 = pathlib.Path(__file__).parent.parent / "db" / "migrations" / "009-premium-index.sql"
+
+PREMIUM_CLAUSES = [
+    "CREATE TABLE IF NOT EXISTS premium_index",
+    "create_hypertable('premium_index'",
+    "chunk_time_interval => INTERVAL '1 week'",
+    "idx_premium_index_asset_ts",
+    "timescaledb.compress_segmentby = 'exchange, symbol'",
+    "timescaledb.compress_orderby = 'timestamp DESC'",
+    "add_compression_policy('premium_index'",
+    "add_retention_policy('premium_index'",
+]
+
+# Identity cols + premium OHLC, in DDL order (native_symbol = seed `coin`).
+PREMIUM_COLUMNS = [
+    "exchange", "asset_id", "symbol", "native_symbol", "timestamp",
+    "premium_open", "premium_high", "premium_low", "premium_close",
+]
+
+
+def _premium_column_defs(path):
+    """[(name, normalized type+constraints)] from the CREATE TABLE premium_index block,
+    skipping the trailing PRIMARY KEY line (a constraint, not a column)."""
+    sql = _read(path)
+    start = sql.index("(", sql.index("CREATE TABLE IF NOT EXISTS premium_index")) + 1
+    body = sql[start:sql.index(");", start)]
+    defs = []
+    for line in body.splitlines():
+        line = line.strip().rstrip(",").strip()
+        if not line or line.upper().startswith("PRIMARY KEY"):
+            continue
+        name, _, rest = line.partition(" ")
+        defs.append((name, " ".join(rest.split()).upper()))
+    return defs
+
+
+def test_migration_009_exists():
+    assert MIGRATION_009.exists(), "009-premium-index.sql not found"
+
+
+def test_migration_009_has_all_clauses():
+    sql = _read(MIGRATION_009)
+    for clause in PREMIUM_CLAUSES:
+        assert clause in sql, f"009 missing: {clause}"
+
+
+def test_init_sql_has_premium_index():
+    """Fresh installs (init.sql) must create premium_index with every clause the migration has."""
+    sql = _read(INIT_SQL)
+    for clause in PREMIUM_CLAUSES:
+        assert clause in sql, f"init.sql missing premium_index clause: {clause}"
+
+
+def test_premium_index_columns_are_ddl_order():
+    for path in (MIGRATION_009, INIT_SQL):
+        names = [name for name, _ in _premium_column_defs(path)]
+        assert names == PREMIUM_COLUMNS, f"{path.name}: premium_index columns drifted"
+
+
+def test_premium_index_migration_and_init_are_identical():
+    """migration 009 ≡ init.sql at the column level — name, type, AND nullability, no extras."""
+    assert _premium_column_defs(MIGRATION_009) == _premium_column_defs(INIT_SQL)
+
+
+def test_premium_index_pk_shape():
+    """PK MUST be (exchange, symbol, timestamp) — the hypertable partition col (timestamp)
+    must be in the key, and per-symbol idempotency needs symbol. Pin it in both files."""
+    for path in (MIGRATION_009, INIT_SQL):
+        sql = _read(path)
+        idx = sql.index("CREATE TABLE IF NOT EXISTS premium_index")
+        block = sql[idx:idx + 600]
+        assert "PRIMARY KEY (exchange, symbol, timestamp)" in block, f"{path.name}: premium_index PK shape drifted"
