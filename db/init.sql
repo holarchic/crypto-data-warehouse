@@ -158,6 +158,37 @@ ALTER TABLE liquidations SET (
 SELECT add_compression_policy('liquidations', INTERVAL '7 days', if_not_exists => TRUE);
 SELECT add_retention_policy('liquidations', INTERVAL '1 year', if_not_exists => TRUE);
 
+-- Binance premium-index term structure (mark-vs-index spread), 5-min OHLC klines.
+-- Binance-only; a superset of the backtester's 1h binance-premium-index seed.
+-- See db/migrations/009-premium-index.sql.
+CREATE TABLE IF NOT EXISTS premium_index (
+    exchange       TEXT NOT NULL,
+    asset_id       TEXT NOT NULL,
+    symbol         TEXT NOT NULL,
+    native_symbol  TEXT NOT NULL,
+    timestamp      TIMESTAMPTZ NOT NULL,
+    premium_open   DOUBLE PRECISION,
+    premium_high   DOUBLE PRECISION,
+    premium_low    DOUBLE PRECISION,
+    premium_close  DOUBLE PRECISION,
+    PRIMARY KEY (exchange, symbol, timestamp)
+);
+
+SELECT create_hypertable('premium_index', 'timestamp',
+    chunk_time_interval => INTERVAL '1 week',
+    if_not_exists => TRUE);
+
+CREATE INDEX IF NOT EXISTS idx_premium_index_asset_ts
+    ON premium_index (asset_id, timestamp DESC);
+
+ALTER TABLE premium_index SET (
+    timescaledb.compress,
+    timescaledb.compress_segmentby = 'exchange, symbol',
+    timescaledb.compress_orderby = 'timestamp DESC'
+);
+SELECT add_compression_policy('premium_index', INTERVAL '7 days', if_not_exists => TRUE);
+SELECT add_retention_policy('premium_index', INTERVAL '1 year', if_not_exists => TRUE);
+
 CREATE TABLE IF NOT EXISTS collection_status (
     exchange            TEXT NOT NULL,
     market_type         TEXT NOT NULL,
