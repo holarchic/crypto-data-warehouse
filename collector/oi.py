@@ -700,18 +700,14 @@ def _oi_loop_binance(exchange, config: ExchangeConfig, dsn: str, rate_limiter: R
     bucket) + sub-5-min dense openInterest for symbols within ±window of settlement."""
     thread_name = f"{config.name}/oi"
 
-    # Operator-invariant check (T-007.4): the priority reserve must cover the dense in-flight
-    # footprint (oi_dense_concurrency × per-call weight), else dense workers can block on the
-    # reserve boundary at a mass settlement and re-dilute the cadence. Warn once at startup; a
-    # too-small reserve degrades gracefully (it doesn't break), so don't abort. 0 = lane off.
+    # Reserve-contention signal (T-007.4): the binding constraint is the dense weight-RATE, not
+    # the instantaneous in-flight — a reserve that covers `oi_dense_concurrency × weight` (6) can
+    # still be too small if the in-window dense set is large. So instead of a startup in-flight
+    # check we watch it at RUNTIME: when a cycle's dense weight (in-window symbols × per-call
+    # weight) exceeds the reserve, dense may contend with candles at the cap. Edge-triggered so an
+    # 11-min mass settlement logs once, not once per cycle. 0 = lane off (no signal).
     reserve = config.rate_limit_priority_reserve
-    needed = config.oi_dense_concurrency * BINANCE_OI_WEIGHT
-    if 0 < reserve < needed:
-        log.warning(
-            "[%s] rate_limit_priority_reserve=%d < oi_dense_concurrency×weight=%d — dense may "
-            "block on the reserve at a mass settlement; raise rate_limit_priority_reserve",
-            thread_name, reserve, needed,
-        )
+    dense_over_reserve = False
 
     conn = connect_db(dsn)
     prev_next_ft: dict = {}      # symbol → last-seen nextFundingTime (ms), for change-detection
@@ -792,6 +788,20 @@ def _oi_loop_binance(exchange, config: ExchangeConfig, dsn: str, rate_limiter: R
         dense = _binance_dense_set(
             funding_rates, active, now, config.oi_settlement_window_s, prev_next_ft, settlement_at,
         )
+        # Rate-based reserve-contention warning (edge-triggered): the dense weight this cycle vs
+        # the reserve band. Logs once on the rising edge of a breach so a mass settlement isn't
+        # spammed, and re-arms when the set falls back under the reserve.
+        dense_weight = len(dense) * BINANCE_OI_WEIGHT
+        if reserve and dense_weight > reserve:
+            if not dense_over_reserve:
+                log.warning(
+                    "[%s] dense weight=%d exceeds rate_limit_priority_reserve=%d — dense may "
+                    "contend with candles at the weight cap; raise rate_limit_priority_reserve",
+                    thread_name, dense_weight, reserve,
+                )
+            dense_over_reserve = True
+        else:
+            dense_over_reserve = False
         if dense_pool is not None:
             dense_rows = dense_pool.fetch(dense, rate_limiter, funding_rates, now, config.name, thread_name)
         else:
@@ -822,9 +832,13 @@ def _oi_loop_binance(exchange, config: ExchangeConfig, dsn: str, rate_limiter: R
             )
 
         cycle_s = time.monotonic() - cycle_start
+        # weight = (server rolling-minute used, reserved in-flight) — direct evidence the dense
+        # burst stays under the priority cap (T-007.4). None when the limiter tracks no weight
+        # (interval limiter, or the None limiter in unit tests).
+        weight = rate_limiter.used_snapshot() if rate_limiter is not None else None
         log.info(
-            "[%s] Poll: dense=%d (set=%d) baseline=%d (due=%d) cycle_duration_s=%.1f",
-            thread_name, dense_inserted, len(dense), base_inserted, len(due), cycle_s,
+            "[%s] Poll: dense=%d (set=%d) baseline=%d (due=%d) cycle_duration_s=%.1f weight=%s",
+            thread_name, dense_inserted, len(dense), base_inserted, len(due), cycle_s, weight,
         )
         _heartbeat(conn, config, thread_name)
         _sleep_until_next(config.oi_poll_interval_s, OI_POLL_BUFFER_S)

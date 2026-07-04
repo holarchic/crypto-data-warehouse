@@ -58,11 +58,15 @@ exchanges:
     rate_limit_weight_budget: 2400   # Binance IP weight cap per minute
     rate_limit_window_s: 60
     rate_limit_safety: 400           # headroom for in-flight bursts at shared TF boundaries
-    # Dense-OI weight lane (T-007.4): reserve 100 of the usable cap (2000→1900) for the
-    # priority dense burst so it never blocks on the candle-kline burst at a mass settlement.
-    # Sized >> dense in-flight (oi_dense_concurrency × OI-weight = 6); ~5% candle peak-cap cost.
-    # Invariant: keep >= oi_dense_concurrency × 1. 0 disables the lane (single-cap rollback).
-    rate_limit_priority_reserve: 100
+    # Dense-OI weight lane (T-007.4): reserve of the usable cap for the priority dense burst so it
+    # never blocks on the candle-kline burst at a mass settlement. Sized to the dense weight-RATE,
+    # not the in-flight count — dense needs ~543 weight/min at a mass settlement (in-window symbols
+    # × OI-weight), and `_used` is the server's rolling-minute weight, so a reserve of 100 (the
+    # in-flight footprint, 6) was insufficient and re-verify FAILED. 600 ≥ the ~543/min rate ⇒
+    # non-priority cap 2400−400−600=1400, and candle_cap(1400)+dense(543) < priority_cap(2000) ⇒
+    # dense never stalls. The candle weight diet (adaptive kline `limit`, collector/candles.py)
+    # shrinks the candle burst ~5× so this larger reserve is nearly free. 0 = lane off (rollback).
+    rate_limit_priority_reserve: 600
     enabled: true
     has_funding: true
     has_oi: true

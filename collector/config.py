@@ -55,7 +55,11 @@ class ExchangeConfig:
     # callers (dense `fetch_open_interest` + its premiumIndex trigger) draw up to `budget -
     # safety`, so the dense burst never blocks on the candle-kline burst. (The openInterestHist
     # baseline is weight 0 and bypasses the cap entirely — separate /futures/data bucket.) 0 =
-    # lane off (single-cap rollback). Operator invariant: reserve >= oi_dense_concurrency × OI weight.
+    # lane off (single-cap rollback). Size to the dense weight-RATE at a mass settlement (in-window
+    # symbols × OI-weight ≈ 543/min), NOT the instantaneous in-flight count — the rolling-minute
+    # `_used` is the binding constraint, so an in-flight-sized reserve under-provisions and dense
+    # stalls (see exchanges.yaml binance). The runtime check in `_oi_loop_binance` warns when a
+    # cycle's dense weight exceeds this band.
     rate_limit_priority_reserve: int = 0
     # OI cadence knobs (T-007.2). oi_poll_interval_s is the loop tick for every OI
     # strategy (HL bulk, Bybit/OKX bulk, Binance dense). oi_settlement_window_s and
