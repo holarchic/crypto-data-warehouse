@@ -204,3 +204,40 @@ def test_run_wires_premium_thread_behind_flag():
     assert "from premium_index import premium_index_loop" in src
     assert "config.has_premium_index" in src
     assert "target=premium_index_loop" in src
+
+
+# --- loop control flow (max_cycles-bounded) ----------------------------------
+
+
+def _patch_loop(monkeypatch, conn, pairs, seed_fn, hb):
+    monkeypatch.setattr(pi, "_sleep_until_next_boundary", lambda *a: None)
+    monkeypatch.setattr(pi, "maybe_reload_markets", lambda *a: None)
+    monkeypatch.setattr(pi, "connect_db", lambda *a, **k: conn)
+    monkeypatch.setattr(pi, "query_active_pairs", lambda *a, **k: pairs)
+    monkeypatch.setattr(pi, "_seed_cursors", seed_fn)
+    monkeypatch.setattr(pi, "upsert_loop_heartbeat", lambda *a, **k: hb.__setitem__("n", hb["n"] + 1))
+    monkeypatch.setattr(pi, "safe_rollback", lambda *a: None)
+
+
+def test_loop_seed_failure_skips_poll_and_heartbeats(monkeypatch):
+    # A failed cursor seed must NOT fall through to a forward-only poll — that would skip the
+    # restart gap. The cycle heartbeats (liveness) + retries the seed next cycle, never fetching.
+    def _boom(*a, **k):
+        raise RuntimeError("db down during seed")
+    conn, ex, hb = FakeConn(), FakeExchange([_closed_bar(1_600_000_000_000)]), {"n": 0}
+    pairs = [dict(PAIR, market_type="perp", last_timestamp=None)]
+    _patch_loop(monkeypatch, conn, pairs, _boom, hb)
+    pi.premium_index_loop(ex, _cfg(), "dsn", RateLimiter(0), max_cycles=1)
+    assert ex.calls == []   # never polled forward-only over the gap
+    assert hb["n"] == 1     # liveness maintained while the seed retries
+
+
+def test_loop_seeds_empty_then_polls(monkeypatch):
+    # A clean seed (empty table → {}) proceeds to the forward-only poll (fetch happens).
+    conn, ex, hb = FakeConn(), FakeExchange([_closed_bar(1_600_000_000_000)]), {"n": 0}
+    pairs = [dict(PAIR, market_type="perp", last_timestamp=None)]
+    _patch_loop(monkeypatch, conn, pairs, lambda *a: {}, hb)
+    pi.premium_index_loop(ex, _cfg(), "dsn", RateLimiter(0), max_cycles=1)
+    assert len(ex.calls) == 1              # polled the one pair
+    assert ex.calls[0]["since"] is None    # forward-only on the empty table
+    assert hb["n"] == 1
