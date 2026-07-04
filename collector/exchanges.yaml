@@ -100,13 +100,20 @@ exchanges:
     ccxt_class: bybit
     btc_symbol: "BTC/USDT:USDT"
     market_type: perp
-    rate_limit_ms: 100
+    # 30ms (33 req/s) not 100ms — the shared interval limiter issues ALL bybit calls at 1/rate_ms;
+    # full-universe 1m (~467 pairs/60s ≈ 7.8 req/s + other TFs ≈ 2.6) needs >10 req/s, which 100ms
+    # (10 req/s) can't sustain (a solo 1m cycle alone was 467/10 = 47s, no tick margin). 30ms drops
+    # it to ~14s. Still 3.6× under Bybit's documented 600 req/5s (120 req/s) IP cap. Real-time 1m
+    # keep-up is then RTT-bound (serial per-pair fetch), not limiter-bound — deploy-measured; missed
+    # bars backfill losslessly via poll_limit (T-015.3).
+    rate_limit_ms: 30
     enabled: true
     has_funding: true
     has_oi: true
     has_liquidation_ws: true         # allLiquidation.{sym} per-symbol liquidation stream (Grade C, T-009.2)
     oi_poll_interval_s: 30          # bulk fetch_tickers (OI+USD), 1 call/cycle → flat 30s
     supported_timeframes:
+      - 1m                           # → candles_1m (ts_1m volume tablespace, T-015.3)
       - 5m
       - 15m
       - 30m

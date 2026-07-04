@@ -112,6 +112,15 @@ def test_timeframe_table_routing():
     assert by_name["1h"] == "candles"
 
 
+def test_bybit_1m_enabled_and_rate_retuned():
+    # T-015.3: bybit collects 1m (→ candles_1m) and its shared limiter is retuned for the
+    # full-universe 1m issue rate (100ms→30ms; still 3.6× under the 120 req/s IP cap).
+    cfg = load_config("bybit")
+    by_name = {tf.name: tf.table for tf in cfg.timeframes}
+    assert by_name["1m"] == "candles_1m"
+    assert cfg.rate_limit_ms == 30
+
+
 def test_load_candle_tables():
     tables = load_candle_tables()
     assert tables["1m"] == "candles_1m"
