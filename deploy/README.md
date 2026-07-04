@@ -13,7 +13,8 @@
 |-----|---------|
 | `WEBHOOK_URL` | Discord/Slack webhook for staleness, gap, and heartbeat messages |
 | `HEALTHCHECK_PING_URL` | Optional uptime-monitor URL hit every cycle (dead-man's switch — e.g. healthchecks.io) |
-| `HEARTBEAT_HOUR_UTC` | UTC hour for the daily heartbeat. Default `0` |
+| `HEARTBEAT_HOUR_UTC` | UTC hour for the weekly status heartbeat. Default `0` |
+| `HEARTBEAT_DAY_UTC` | UTC weekday for the weekly status heartbeat: `0`=Mon … `6`=Sun. Default `0` (Monday) |
 | `MONITOR_INTERVAL_S` | Monitor cycle interval. Default `300` |
 | `ALERT_COOLDOWN_S` | Dedup window for staleness/gap alerts. Default `3600` |
 | `ALARMING_DELTA_THRESHOLD` | Alarming-collector count must exceed its rolling-1h median by this much to page. Default `25` |
