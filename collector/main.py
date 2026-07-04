@@ -4,7 +4,7 @@ import time
 
 from backoff import RETRIABLE_EXCEPTIONS
 from candles import CANDLE_SEED_LIMIT, poll_limit
-from config import ExchangeConfig, TimeframeConfig, load_config
+from config import CANDLE_TABLES, ExchangeConfig, TimeframeConfig, load_config
 from dotenv import load_dotenv
 from funding import funding_loop
 from liquidations import build_liq_spec
@@ -59,8 +59,12 @@ def fetch_candles(exchange, symbol, market_info, exchange_name, timeframe, inter
     return candles
 
 
-INSERT_SQL = """
-    INSERT INTO candles (exchange, market_type, asset_id, symbol, native_symbol,
+# One INSERT per candle table (candles, candles_1m). The table name is substituted at import from
+# the closed CANDLE_TABLES allowlist — NOT interpolated from any runtime/external value — so there
+# is no injection surface (psycopg can't bind an identifier as a value; a literal-template over a
+# fixed allowlist is the safe idiom). The column list has a single source (this template).
+_INSERT_TEMPLATE = """
+    INSERT INTO {table} (exchange, market_type, asset_id, symbol, native_symbol,
                          timeframe, timestamp, open, high, low, close,
                          volume, quote_volume, trades)
     VALUES (%(exchange)s, %(market_type)s, %(asset_id)s, %(symbol)s, %(native_symbol)s,
@@ -68,15 +72,17 @@ INSERT_SQL = """
             %(volume)s, %(quote_volume)s, %(trades)s)
     ON CONFLICT DO NOTHING
 """
+INSERT_SQL = {table: _INSERT_TEMPLATE.format(table=table) for table in CANDLE_TABLES}
 
 
-def insert_candles(conn, candles):
+def insert_candles(conn, candles, table="candles"):
     if not candles:
         return 0
+    sql = INSERT_SQL[table]  # KeyError on an unknown table = fail fast (config-validated at load)
     inserted = 0
     with conn.cursor() as cur:
         for row in candles:
-            cur.execute(INSERT_SQL, row)
+            cur.execute(sql, row)
             inserted += cur.rowcount
     conn.commit()
     return inserted
@@ -144,7 +150,7 @@ def _collect_pair(exchange, pair, config, tf, rate_limiter, conn, thread_name):
         exchange, pair["symbol"], market_info, config.name, tf.name, tf.interval_s, rate_limiter,
         since_ms=since_ms, limit=limit,
     )
-    inserted = insert_candles(conn, candles)
+    inserted = insert_candles(conn, candles, tf.table)
     last_ts = max((c["timestamp"] for c in candles), default=None) if candles else None
     upsert_status_success(conn, config.name, market_info["market_type"], pair["symbol"], tf.name, last_ts, asset_id=market_info["asset_id"])
 
