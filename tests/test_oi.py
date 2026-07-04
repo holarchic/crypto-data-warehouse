@@ -836,6 +836,53 @@ def test_binance_loop_warns_when_dense_weight_exceeds_reserve(monkeypatch, caplo
     assert any("exceeds rate_limit_priority_reserve" in r.message for r in records)
 
 
+def test_binance_loop_reserve_warning_is_edge_triggered_across_cycles(monkeypatch, caplog):
+    # The warning is edge-triggered: it fires once on the rising edge of a breach, stays silent
+    # while the breach persists, re-arms when the dense set falls back under the reserve, and
+    # fires again on the next rise. Drive breach → breach → recover → breach = exactly 2 warnings.
+    import logging
+    from types import SimpleNamespace
+
+    def _pairs(n):
+        return [{"asset_id": f"A{i}", "symbol": f"A{i}/USDT:USDT"} for i in range(n)]
+
+    dense_by_cycle = [_pairs(5), _pairs(5), _pairs(0), _pairs(5)]  # weights 5,5,0,5 vs reserve 2
+    it = iter(dense_by_cycle)
+    conn = FakeConn()
+    monkeypatch.setattr(oi, "connect_db", lambda dsn: conn)
+    monkeypatch.setattr(oi, "_get_active_pairs", lambda c, name: [{"asset_id": "BTC", "symbol": "BTC/USDT:USDT"}])
+    monkeypatch.setattr(oi, "_seed_baseline_cursor", lambda *a: {})
+    monkeypatch.setattr(oi, "_binance_dense_set", lambda *a: next(it))
+    monkeypatch.setattr(oi, "_binance_dense_fetch", lambda *a: [])
+    monkeypatch.setattr(oi, "paced_call", lambda rl, ex, w, fn, *a, priority=False, **k: fn(*a, **k))
+    monkeypatch.setattr(oi, "_binance_baseline_sweep", lambda *a: 0)
+    monkeypatch.setattr(oi, "_heartbeat", lambda *a: None)
+
+    def stop_when_drained(*a):
+        # Let the loop run until the dense-set sequence is exhausted, then break out.
+        if next(_remaining, None) is None:
+            raise _StopLoop
+
+    _remaining = iter(range(len(dense_by_cycle) - 1))  # allow N cycles, stop before the (N+1)th set
+    monkeypatch.setattr(oi, "_sleep_until_next", stop_when_drained)
+
+    def fetch_funding_rates():
+        return {}
+
+    ex = SimpleNamespace(fetch_funding_rates=fetch_funding_rates, last_response_headers=None)
+    cfg = SimpleNamespace(name="binance", market_type="perp", ccxt_class="binanceusdm",
+                          oi_poll_interval_s=60, oi_settlement_window_s=900,
+                          oi_baseline_interval_s=1800, oi_dense_concurrency=1,
+                          rate_limit_priority_reserve=2)
+    with caplog.at_level(logging.WARNING):
+        try:
+            oi._oi_loop_binance(ex, cfg, "dsn", None)
+        except (_StopLoop, StopIteration):
+            pass
+    warns = [r for r in caplog.records if "exceeds rate_limit_priority_reserve" in r.message]
+    assert len(warns) == 2  # cycle 1 (rise) + cycle 4 (re-armed rise); cycles 2/3 silent
+
+
 def test_binance_loop_silent_when_dense_weight_within_reserve(monkeypatch, caplog):
     # Dense weight under the reserve band → no contention warning (avoids false alarms every cycle).
     dense = [{"asset_id": f"A{i}", "symbol": f"A{i}/USDT:USDT"} for i in range(5)]  # weight 5
