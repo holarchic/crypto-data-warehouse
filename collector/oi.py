@@ -32,7 +32,7 @@ from rate_limiter import (
 )
 from status import query_active_pairs, upsert_loop_heartbeat
 
-from db import connect_db, create_exchange, maybe_reload_markets
+from db import connect_db, create_exchange, maybe_reload_markets, safe_rollback
 
 log = logging.getLogger(__name__)
 
@@ -168,7 +168,7 @@ def _heartbeat(conn, config: ExchangeConfig, thread_name: str):
     except Exception:
         log.exception("[%s] Heartbeat upsert failed", thread_name)
         if not conn.closed:
-            conn.rollback()
+            safe_rollback(conn)
 
 
 # ---------------------------------------------------------------------------
@@ -313,7 +313,7 @@ def _oi_loop_hyperliquid(config: ExchangeConfig, dsn: str):
             pairs = _get_active_pairs(conn, config.name)
         except Exception:
             log.exception("[%s] Failed to query active pairs", thread_name)
-            conn.rollback()
+            safe_rollback(conn)
             _sleep_until_next(config.oi_poll_interval_s, OI_POLL_BUFFER_S)
             continue
 
@@ -342,7 +342,7 @@ def _oi_loop_hyperliquid(config: ExchangeConfig, dsn: str):
             # the cycle with nothing committed. Heartbeat (liveness) still fires below.
             log.warning("[%s] Error in HL OI cycle: %s", thread_name, exc)
             if not conn.closed:
-                conn.rollback()
+                safe_rollback(conn)
 
         _heartbeat(conn, config, thread_name)
         _sleep_until_next(config.oi_poll_interval_s, OI_POLL_BUFFER_S)
@@ -417,7 +417,7 @@ def _oi_loop_bulk(exchange, config: ExchangeConfig, dsn: str, rate_limiter: Rate
             pairs = _get_active_pairs(conn, config.name)
         except Exception:
             log.exception("[%s] Failed to query active pairs", thread_name)
-            conn.rollback()
+            safe_rollback(conn)
             _sleep_until_next(config.oi_poll_interval_s, OI_POLL_BUFFER_S)
             continue
 
@@ -450,7 +450,7 @@ def _oi_loop_bulk(exchange, config: ExchangeConfig, dsn: str, rate_limiter: Rate
         except Exception as exc:
             log.warning("[%s] Error in bulk OI cycle: %s", thread_name, exc)
             if not conn.closed:
-                conn.rollback()
+                safe_rollback(conn)
 
         _heartbeat(conn, config, thread_name)
         _sleep_until_next(config.oi_poll_interval_s, OI_POLL_BUFFER_S)
@@ -684,7 +684,7 @@ def _binance_baseline_sweep(exchange, exchange_name, rate_limiter, conn, due_pai
         except Exception as exc:
             log.warning("[%s] Baseline insert failed on %s: %s", thread_name, sym, exc)
             if not conn.closed:
-                conn.rollback()
+                safe_rollback(conn)
             time.sleep(BINANCE_OI_HIST_SPACING_S)
             continue  # cursor unadvanced → no gap
 
@@ -741,7 +741,7 @@ def _oi_loop_binance(exchange, config: ExchangeConfig, dsn: str, rate_limiter: R
             pairs = _get_active_pairs(conn, config.name)
         except Exception:
             log.exception("[%s] Failed to query active pairs", thread_name)
-            conn.rollback()
+            safe_rollback(conn)
             _sleep_until_next(config.oi_poll_interval_s, OI_POLL_BUFFER_S)
             continue
 
@@ -760,7 +760,7 @@ def _oi_loop_binance(exchange, config: ExchangeConfig, dsn: str, rate_limiter: R
             except Exception:
                 log.exception("[%s] Baseline cursor seed failed, retrying next cycle", thread_name)
                 if not conn.closed:
-                    conn.rollback()
+                    safe_rollback(conn)
 
         active = {p["symbol"]: p for p in pairs}
         # Prune cross-tick state to currently-active symbols so the maps track the active
@@ -780,7 +780,7 @@ def _oi_loop_binance(exchange, config: ExchangeConfig, dsn: str, rate_limiter: R
         except Exception as exc:
             log.warning("[%s] premiumIndex bulk failed, skipping cycle: %s", thread_name, exc)
             if not conn.closed:
-                conn.rollback()
+                safe_rollback(conn)
             _heartbeat(conn, config, thread_name)
             _sleep_until_next(config.oi_poll_interval_s, OI_POLL_BUFFER_S)
             continue
@@ -813,7 +813,7 @@ def _oi_loop_binance(exchange, config: ExchangeConfig, dsn: str, rate_limiter: R
         except Exception as exc:
             log.warning("[%s] Dense insert failed: %s", thread_name, exc)
             if not conn.closed:
-                conn.rollback()
+                safe_rollback(conn)
             dense_inserted = 0
 
         # Baseline runs ONLY once the cursor is seeded — otherwise a since=None sweep would
