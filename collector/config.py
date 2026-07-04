@@ -41,6 +41,15 @@ LOOP_INTERVALS = {FUNDING_LOOP: 3600, OI_LOOP: 300, LIQUIDATION_WS: 300, PREMIUM
 CANDLE_TABLES = ("candles", "candles_1m")
 
 
+def _validate_candle_table(tf_name: str, table: str) -> str:
+    """A timeframe's `table:` must be in the CANDLE_TABLES allowlist. The single validation seam —
+    used by BOTH _parse_exchange (collector startup) and load_candle_tables (monitor startup), so a
+    bad yaml value fails once at load in either process, never as a per-cycle runtime KeyError."""
+    if table not in CANDLE_TABLES:
+        raise ValueError(f"Timeframe '{tf_name}' table '{table}' not in allowlist {CANDLE_TABLES}")
+    return table
+
+
 @dataclass
 class TimeframeConfig:
     name: str
@@ -103,9 +112,7 @@ def _parse_exchange(exchange_name: str, ex: dict, tf_defs: dict) -> ExchangeConf
         if tf_name not in tf_defs:
             raise ValueError(f"Timeframe '{tf_name}' not defined in timeframes section")
         td = tf_defs[tf_name]
-        table = td.get("table", "candles")
-        if table not in CANDLE_TABLES:
-            raise ValueError(f"Timeframe '{tf_name}' table '{table}' not in allowlist {CANDLE_TABLES}")
+        table = _validate_candle_table(tf_name, td.get("table", "candles"))
         timeframes.append(TimeframeConfig(name=tf_name, interval_s=td["interval_s"], buffer_s=td["buffer_s"], table=table))
 
     return ExchangeConfig(
@@ -176,6 +183,9 @@ def load_candle_tables() -> dict[str, str]:
     """Return {timeframe: candle-storage-table} for all configured timeframes (default `candles`).
 
     The single source for candle-table routing (see CANDLE_TABLES). The monitor loads this once to
-    route its gap-scan to the right table per timeframe; the collector uses TimeframeConfig.table."""
+    route its gap-scan to the right table per timeframe; the collector uses TimeframeConfig.table.
+    Validates each `table:` against the allowlist so the monitor process (which never runs
+    _parse_exchange) also fails fast on a bad value, not with a per-cycle KeyError at gap-scan."""
     raw = _load_yaml()
-    return {name: td.get("table", "candles") for name, td in raw["timeframes"].items()}
+    return {name: _validate_candle_table(name, td.get("table", "candles"))
+            for name, td in raw["timeframes"].items()}
