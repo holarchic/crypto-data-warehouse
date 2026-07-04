@@ -8,7 +8,36 @@ from types import SimpleNamespace
 sys.modules.pop("db", None)
 
 import db  # noqa: E402  (must follow stub removal)
-from db import create_exchange, maybe_reload_markets  # noqa: E402
+from db import create_exchange, maybe_reload_markets, safe_rollback  # noqa: E402
+
+
+def test_safe_rollback_swallows_a_raising_rollback():
+    # The T-014 core guarantee: a rollback on a server-dropped connection raises OperationalError;
+    # safe_rollback must swallow it so it never escapes an except handler and kills the loop thread.
+    class _DeadConn:
+        closed = False
+
+        def rollback(self):
+            raise RuntimeError("the connection is lost")
+
+    safe_rollback(_DeadConn())  # must NOT raise
+
+
+def test_safe_rollback_none_is_noop():
+    safe_rollback(None)  # must NOT raise
+
+
+def test_safe_rollback_rolls_back_a_live_conn():
+    calls = {"n": 0}
+
+    class _LiveConn:
+        closed = False
+
+        def rollback(self):
+            calls["n"] += 1
+
+    safe_rollback(_LiveConn())
+    assert calls["n"] == 1
 
 
 def _fake_exchange(loaded_at, n_markets=10):
