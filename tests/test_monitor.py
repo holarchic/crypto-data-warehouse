@@ -5,7 +5,15 @@ import time
 from collections import deque
 from datetime import date, datetime, timezone
 
-from config import FUNDING_LOOP, LIQUIDATION_WS, LOOP_INTERVALS, OI_LOOP, PREMIUM_LOOP
+from config import (
+    CANDLE_BACKFILL,
+    CANDLE_WS,
+    FUNDING_LOOP,
+    LIQUIDATION_WS,
+    LOOP_INTERVALS,
+    OI_LOOP,
+    PREMIUM_LOOP,
+)
 from monitor import (
     _TF_SCAN_INTERVALS,
     GAP_SQL_BY_TABLE,
@@ -134,7 +142,8 @@ def test_loop_timeframes_match_config():
     """Producer (config), consumer (monitor gap-skip), and the pseudo-TF set agree —
     pins against name drift between the heartbeat writers and the monitor."""
     assert LOOP_TIMEFRAMES == set(LOOP_INTERVALS)
-    assert {FUNDING_LOOP, OI_LOOP, LIQUIDATION_WS, PREMIUM_LOOP} == set(LOOP_INTERVALS)
+    assert {FUNDING_LOOP, OI_LOOP, LIQUIDATION_WS, PREMIUM_LOOP,
+            CANDLE_WS, CANDLE_BACKFILL} == set(LOOP_INTERVALS)
 
 
 def test_compute_staleness_flags_dead_ws_loop():

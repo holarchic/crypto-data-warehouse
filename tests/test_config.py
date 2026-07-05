@@ -2,7 +2,10 @@
 
 import pytest
 from config import (
+    CANDLE_BACKFILL,
     CANDLE_TABLES,
+    CANDLE_WS,
+    LOOP_INTERVALS,
     _parse_exchange,
     load_all_configs,
     load_candle_tables,
@@ -42,6 +45,31 @@ def test_has_premium_index_flag():
     assert load_config("bybit").has_premium_index is False
     assert load_config("hyperliquid").has_premium_index is False
     assert load_config("coinbase").has_premium_index is False
+
+
+def test_has_candle_ws_flag():
+    # T-015.1: only HL streams 1m candles over WS; others default False.
+    assert load_config("hyperliquid").has_candle_ws is True
+    assert load_config("binance").has_candle_ws is False
+    assert load_config("bybit").has_candle_ws is False
+    assert load_config("coinbase").has_candle_ws is False
+
+
+def test_candle_ws_loop_sentinels_registered():
+    # T-015.1: both streamed-feed sentinels must be in LOOP_INTERVALS so the monitor staleness-checks
+    # them (and the api LOOP_TIMEFRAMES mirror derives from this — see test_api_loop_timeframes).
+    assert CANDLE_WS == "candle_ws"
+    assert CANDLE_BACKFILL == "candle_backfill"
+    assert CANDLE_WS in LOOP_INTERVALS
+    assert CANDLE_BACKFILL in LOOP_INTERVALS
+
+
+def test_hl_1m_streamed_not_polled():
+    # T-015.1: HL 1m is streamed via has_candle_ws — it must NOT be a configured timeframe, or run()
+    # would launch the per-symbol REST 1m collect_loop that starves the unbackfillable dense OI.
+    cfg = load_config("hyperliquid")
+    assert cfg.has_candle_ws is True
+    assert "1m" not in {tf.name for tf in cfg.timeframes}
 
 
 def test_load_config_unknown_exchange_raises():
