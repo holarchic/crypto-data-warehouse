@@ -23,6 +23,13 @@ FUNDING_LOOP = "funding"
 OI_LOOP = "oi"
 LIQUIDATION_WS = "liq_ws"
 PREMIUM_LOOP = "premium"
+# HL 1m streamed feed (T-015.1): the WS candle thread and the REST gap-backfill thread each upsert
+# their own sentinel. Like LIQUIDATION_WS, the WS heartbeat fires on the ~60s connection timer while
+# the socket is up; the backfill heartbeat fires each ~300s sweep. HL 1m is streamed, not polled — it
+# is deliberately kept OUT of supported_timeframes, so these two sentinels (not per-pair candle status)
+# are its liveness surface. Interval 300 → the monitor's 30-min floor flags a dead thread ~35min after.
+CANDLE_WS = "candle_ws"
+CANDLE_BACKFILL = "candle_backfill"
 # Premium-index poll cadence (T-010) — the SINGLE source: the ccxt timeframe, the poll interval,
 # AND the loop staleness floor (LOOP_INTERVALS below) all derive from here, so a cadence change is
 # one edit. collector/premium_index.py imports these (it must not redefine them). Fixed, not a
@@ -30,7 +37,8 @@ PREMIUM_LOOP = "premium"
 # config-only change would silently break monitoring.
 PREMIUM_TIMEFRAME = "5m"
 PREMIUM_INTERVAL_S = 300
-LOOP_INTERVALS = {FUNDING_LOOP: 3600, OI_LOOP: 300, LIQUIDATION_WS: 300, PREMIUM_LOOP: PREMIUM_INTERVAL_S}
+LOOP_INTERVALS = {FUNDING_LOOP: 3600, OI_LOOP: 300, LIQUIDATION_WS: 300, PREMIUM_LOOP: PREMIUM_INTERVAL_S,
+                  CANDLE_WS: 300, CANDLE_BACKFILL: 300}
 
 # Candle storage tables. A timeframe's `table:` in exchanges.yaml routes its candles to one of these
 # (default `candles`); `1m` routes to `candles_1m` (a separate hypertable on the ts_1m volume
@@ -70,6 +78,7 @@ class ExchangeConfig:
     has_oi: bool = False
     has_liquidation_ws: bool = False  # launch the venue's liquidation WS feed (ws.py) in run()
     has_premium_index: bool = False  # poll premiumIndexKlines into premium_index (Binance, T-010)
+    has_candle_ws: bool = False  # launch the HL WS 1m candle feed + REST gap-backfill (T-015.1)
     options: dict = field(default_factory=dict)
     timeframes: list[TimeframeConfig] = field(default_factory=list)
     # Weight-budget limiter (Binance): set to enable WeightRateLimiter instead
@@ -126,6 +135,7 @@ def _parse_exchange(exchange_name: str, ex: dict, tf_defs: dict) -> ExchangeConf
         has_oi=ex.get("has_oi", False),
         has_liquidation_ws=ex.get("has_liquidation_ws", False),
         has_premium_index=ex.get("has_premium_index", False),
+        has_candle_ws=ex.get("has_candle_ws", False),
         options=ex.get("options", {}),
         timeframes=timeframes,
         rate_limit_weight_budget=ex.get("rate_limit_weight_budget"),

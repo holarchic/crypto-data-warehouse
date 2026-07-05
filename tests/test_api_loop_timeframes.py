@@ -34,3 +34,11 @@ def test_api_excludes_liq_ws_sentinel():
 def test_api_excludes_premium_sentinel():
     # T-010: the premium poll's liveness sentinel must not leak into candle-facing /status.
     assert "premium" in _api_loop_timeframes()
+
+
+def test_api_excludes_candle_ws_and_backfill_sentinels():
+    # T-015.1: HL 1m is streamed, not polled — its two loop sentinels are its liveness surface and
+    # must be excluded from candle-facing /status (no per-pair HL 1m status rows exist).
+    tfs = _api_loop_timeframes()
+    assert "candle_ws" in tfs
+    assert "candle_backfill" in tfs
