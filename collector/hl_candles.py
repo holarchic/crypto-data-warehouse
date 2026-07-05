@@ -33,12 +33,15 @@ log = logging.getLogger(__name__)
 HL_WS_URL = "wss://api.hyperliquid.xyz/ws"
 HL_PING_INTERVAL_S = 30.0   # HL closes an idle socket at 60s (timeouts doc) → ping at 2× margin
 
-# HL publishes 1000 subscriptions / 10 connections / 30 new-conns/min PER IP. At ~161 subs on one
-# connection there is a wide margin; warn as the count nears the ceiling so a future universe-growth
-# breach is visible. Note the 1000 is IP-scoped, so more *connections* would not raise it — a real
-# breach (far off) means fewer subs or a second IP, not just sharding.
-HL_SUB_CEILING = 1000
-HL_SUB_WARN = 900
+# HL's docs list 1000 subs / 10 conns / 30 new-conns/min PER IP, but the real **per-connection** candle
+# limit is far lower — measured 2026-07-05: a single connection holds ≤70 candle subs but is dropped
+# ~1.1s after subscribing ≥80. So the universe (~161) is SHARDED across HL_CANDLE_SHARDS connections
+# (≤~33 subs each, wide margin under 70; 5 conns < the 10-conn IP limit). The ceiling-guard warns per
+# shard as it nears the per-connection limit → the lever is MORE shards (raise HL_CANDLE_SHARDS), not
+# fewer subs, until the 10-connection IP cap (then a second IP).
+HL_CANDLE_SHARDS = 5
+HL_SUB_PER_CONN_LIMIT = 70   # observed per-connection candle-sub limit (drops at ≥80)
+HL_SUB_WARN = 55             # warn as a shard nears the limit → raise HL_CANDLE_SHARDS
 
 INSERT_CANDLES_1M_SQL = """
     INSERT INTO candles_1m (exchange, market_type, asset_id, symbol, native_symbol,
@@ -154,12 +157,13 @@ def _sub_frame(method, coin):
 
 
 def _check_sub_ceiling(coins, thread_name="hyperliquid/candle"):
-    """Warn as the subscription count nears HL's per-IP 1000-sub ceiling. Returns the count (tests)."""
+    """Warn as a shard's subscription count nears HL's per-connection candle limit. Returns the count
+    (tests). The lever when this fires is a larger HL_CANDLE_SHARDS (up to the 10-connection IP cap)."""
     n = len(coins)
     if n >= HL_SUB_WARN:
         log.warning(
-            "[%s] Candle subscriptions %d/%d approaching the per-IP ceiling — fewer subs or a second IP"
-            " needed soon (more connections do not raise an IP-scoped cap)", thread_name, n, HL_SUB_CEILING,
+            "[%s] Shard has %d candle subs, nearing the ~%d per-connection limit — raise HL_CANDLE_SHARDS",
+            thread_name, n, HL_SUB_PER_CONN_LIMIT,
         )
     return n
 
@@ -169,20 +173,31 @@ def _check_sub_ceiling(coins, thread_name="hyperliquid/candle"):
 # ---------------------------------------------------------------------------
 
 
-def build_hl_candle_spec() -> WSFeedSpec:
-    """HL per-coin `candle` feed on the generic `ws.py` engine. `topics_for_pairs` returns coin *ids*
-    (the engine diffs the id set across resubs) and rebuilds the shared asset map; the frame builders
-    wrap each id in HL's candle-subscribe JSON; `parse_message` resolves the id back to the row."""
+def _shard_pairs(pairs, shard_index, shard_count):
+    """This shard's pairs: a stable strided slice of the asset_id-sorted universe (index `i` gets
+    coins i, i+count, i+2·count, …). Stable + balanced, so a resub with the same universe yields the
+    same partition on every connection."""
+    ordered = sorted((p for p in pairs if p.get("asset_id")), key=lambda p: p["asset_id"])
+    return ordered[shard_index::shard_count]
+
+
+def build_hl_candle_spec(shard_index: int = 0, shard_count: int = 1) -> WSFeedSpec:
+    """HL per-coin `candle` feed on the generic `ws.py` engine, for ONE shard of the universe (HL drops
+    a connection carrying ≥~80 candle subs, so the ~161-coin universe is split across `shard_count`
+    connections). `topics_for_pairs` returns this shard's coin *ids* (the engine diffs the id set across
+    resubs) and rebuilds this shard's asset map; the frame builders wrap each id in HL's candle-subscribe
+    JSON; `parse_message` resolves the id back to the row. All shards share the `candle_ws` sentinel."""
     asset_map: dict[str, dict] = {}
 
     def topics_for_pairs(pairs):
-        _rebuild_map(asset_map, pairs)
-        coins = [p["asset_id"] for p in pairs if p.get("asset_id")]
-        _check_sub_ceiling(coins)
+        shard = _shard_pairs(pairs, shard_index, shard_count)
+        _rebuild_map(asset_map, shard)
+        coins = [p["asset_id"] for p in shard]
+        _check_sub_ceiling(coins, thread_name=f"hyperliquid/candle-{shard_index}")
         return coins
 
     return WSFeedSpec(
-        name="candle",
+        name=f"candle-{shard_index}",
         loop_tf=CANDLE_WS,
         url=HL_WS_URL,
         topics_for_pairs=topics_for_pairs,
