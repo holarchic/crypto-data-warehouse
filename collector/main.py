@@ -347,7 +347,7 @@ def run():
 
         t = threading.Thread(
             target=hl_candle_backfill_loop,
-            args=(exchange, config, dsn, rate_limiter),
+            args=(exchange, config, dsn, rate_limiter, fetch_candles),
             name=f"{config.name}-candle-backfill",
             daemon=True,
         )

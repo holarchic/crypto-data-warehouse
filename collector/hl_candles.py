@@ -19,6 +19,7 @@ import logging
 import time
 
 from backoff import RETRIABLE_EXCEPTIONS
+from candles import CANDLE_SEED_LIMIT
 from config import CANDLE_BACKFILL, CANDLE_WS, ExchangeConfig
 from rate_limiter import RateLimiter
 from status import query_active_pairs, upsert_loop_heartbeat
@@ -249,7 +250,10 @@ def _scan_candles_1m(conn, lookback_s=BACKFILL_LOOKBACK_S, interval_s=_INTERVAL_
     by symbol; a symbol absent from the dict has no rows in the window (→ a zero-row seed candidate)."""
     with conn.cursor() as cur:
         cur.execute(SCAN_CANDLES_1M_SQL, {"lookback_s": lookback_s, "interval_s": interval_s})
-        return {row[0]: {"last_ts": row[1], "earliest_gap_after": row[2]} for row in cur.fetchall()}
+        cols = [d[0] for d in cur.description]           # name fields, don't index by position
+        rows = (dict(zip(cols, row)) for row in cur.fetchall())
+        return {r["symbol"]: {"last_ts": r["last_ts"], "earliest_gap_after": r["earliest_gap_after"]}
+                for r in rows}
 
 
 def _gap_since_ms(scan_row, now_ms, interval_s=_INTERVAL_S):
@@ -297,6 +301,15 @@ def _market_info(pair, market_type):
             "market_type": pair.get("market_type") or market_type}
 
 
+def _fetch_limit(since_ms, now_ms):
+    """Bars to request for a candidate: a recent `since` (a trailing coin or a small fresh gap) needs
+    only a few bars; a seed (`since=None`) or an old gap needs the full window (the per-sweep bar cap
+    then clamps this, so a huge backlog still spreads across sweeps)."""
+    if since_ms and since_ms >= now_ms - (BACKFILL_TRAILING_BARS + 2) * _INTERVAL_S * 1000:
+        return BACKFILL_TRAILING_BARS + 1
+    return CANDLE_SEED_LIMIT
+
+
 def _sleep_until_next_boundary(interval_s, buffer_s):
     now = time.time()
     time.sleep((now // interval_s + 1) * interval_s + buffer_s - now)
@@ -311,11 +324,11 @@ def _heartbeat(conn, config, thread_name):
         safe_rollback(conn)
 
 
-def _run_backfill_sweep(exchange, config, conn, rate_limiter, sweep_index, thread_name):
+def _run_backfill_sweep(exchange, config, conn, rate_limiter, sweep_index, thread_name, fetch_candles):
     """One sweep: scan → gap candidates + rotating trailing share → bounded fetch/UPSERT. Gap repair
-    takes precedence over trailing for the same coin. Returns (repaired_bars, remaining_candidates)."""
-    from main import fetch_candles  # deferred: main imports this module at top (chunk 4 wiring)
-
+    takes precedence over trailing for the same coin. `fetch_candles` is injected (not imported from
+    `main`) so this feature module has no reverse dependency on the application root. Returns
+    (repaired_bars, remaining_candidates)."""
     universe = query_active_pairs(conn, config.name, "5m")
     if not universe:
         _heartbeat(conn, config, thread_name)
@@ -330,16 +343,20 @@ def _run_backfill_sweep(exchange, config, conn, rate_limiter, sweep_index, threa
                 for pair in _trailing_share(universe, sweep_index) if pair["symbol"] not in gap_symbols]
     queue = gap_cands + trailing   # gap repair first
 
-    repaired = fetches = 0
+    # Bound by ATTEMPTS (not successes — a failing sweep must not fetch unbounded) and by BARS. The
+    # per-fetch `limit` is clamped to the remaining bar budget so the sweep can never overshoot
+    # BACKFILL_MAX_BARS by a full request — the OI-protection contract is strict, not approximate.
+    repaired = attempts = 0
     for pair, since_ms in queue:
-        if fetches >= BACKFILL_MAX_FETCHES or repaired >= BACKFILL_MAX_BARS:
+        remaining_bars = BACKFILL_MAX_BARS - repaired
+        if attempts >= BACKFILL_MAX_FETCHES or remaining_bars <= 0:
             break
-        limit = BACKFILL_TRAILING_BARS + 1 if since_ms and since_ms >= now_ms - (BACKFILL_TRAILING_BARS + 2) * _INTERVAL_S * 1000 else 1000
+        attempts += 1
+        limit = min(_fetch_limit(since_ms, now_ms), remaining_bars)
         try:
             rows = fetch_candles(exchange, pair["symbol"], _market_info(pair, config.market_type),
                                  config.name, "1m", _INTERVAL_S, rate_limiter, since_ms=since_ms, limit=limit)
             repaired += _insert_candles_1m(conn, rows)
-            fetches += 1
         except RETRIABLE_EXCEPTIONS as exc:
             log.warning("[%s] Backfill retriable on %s: %s", thread_name, pair["symbol"], exc)
             safe_rollback(conn)
@@ -347,18 +364,19 @@ def _run_backfill_sweep(exchange, config, conn, rate_limiter, sweep_index, threa
             log.warning("[%s] Backfill error on %s: %s", thread_name, pair["symbol"], exc)
             safe_rollback(conn)
 
-    remaining = max(0, len(queue) - fetches)
+    remaining = max(0, len(queue) - attempts)
     _heartbeat(conn, config, thread_name)
-    log.info("[%s] Sweep %d: %d coins fetched, %d bars repaired, %d candidates deferred",
-             thread_name, sweep_index, fetches, repaired, remaining)
+    log.info("[%s] Sweep %d: %d coins attempted, %d bars repaired, %d candidates deferred",
+             thread_name, sweep_index, attempts, repaired, remaining)
     return repaired, remaining
 
 
 def hl_candle_backfill_loop(exchange, config: ExchangeConfig, dsn: str, rate_limiter: RateLimiter,
-                            *, max_sweeps: int | None = None):
+                            fetch_candles, *, max_sweeps: int | None = None):
     """HL 1m gap-backfill thread target (daemon). Own DB conn; a low-priority 300s sweep that RESTs
-    only real gaps + a tiny rotating trailing share. `max_sweeps` bounds the loop for tests (None =
-    forever), mirroring `ws_loop`'s `max_sessions`."""
+    only real gaps + a tiny rotating trailing share. `fetch_candles` is injected by `main.run()` (the
+    app root wires the concrete fetcher into this feature — one-way dependency flow). `max_sweeps`
+    bounds the loop for tests (None = forever), mirroring `ws_loop`'s `max_sessions`."""
     thread_name = f"{config.name}/{CANDLE_BACKFILL}"
     conn = connect_db(dsn)
     sweep = 0
@@ -378,7 +396,7 @@ def hl_candle_backfill_loop(exchange, config: ExchangeConfig, dsn: str, rate_lim
             log.exception("[%s] Markets reload failed — continuing with stale cache", thread_name)
 
         try:
-            _run_backfill_sweep(exchange, config, conn, rate_limiter, sweep, thread_name)
+            _run_backfill_sweep(exchange, config, conn, rate_limiter, sweep, thread_name, fetch_candles)
         except Exception:
             log.exception("[%s] Sweep failed", thread_name)
             safe_rollback(conn)

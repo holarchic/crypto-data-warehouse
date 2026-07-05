@@ -7,6 +7,7 @@ import hl_candles
 from config import CANDLE_WS
 from hl_candles import (
     _NO_REPAIR,
+    BACKFILL_MAX_BARS,
     BACKFILL_MAX_FETCHES,
     BACKFILL_TRAILING_CYCLE,
     INSERT_CANDLES_1M_SQL,
@@ -204,20 +205,31 @@ class _DummyConn:
     def rollback(self): pass
 
 
-def _wire_sweep(monkeypatch, universe, scan, bars_per_fetch):
-    """Stub the sweep's DB + fetch touchpoints; return a list capturing each fetch's since_ms."""
-    import main
+def _universe(n):
+    return [{"symbol": str(i), "asset_id": str(i), "native_symbol": "0", "market_type": "perp"} for i in range(n)]
+
+
+def _wire_sweep(monkeypatch, universe, scan, bars_per_fetch, raises=False):
+    """Stub the sweep's DB touchpoints; return (seen_since_list, fake_fetch). The fetcher is INJECTED
+    into _run_backfill_sweep (not imported from main), and it HONORS the clamped `limit` so the bar-cap
+    test exercises the real clamp."""
     seen = []
     monkeypatch.setattr(hl_candles, "query_active_pairs", lambda conn, name, tf: universe)
     monkeypatch.setattr(hl_candles, "_scan_candles_1m", lambda conn: scan)
     monkeypatch.setattr(hl_candles, "_insert_candles_1m", lambda conn, rows: len(rows))
     monkeypatch.setattr(hl_candles, "_heartbeat", lambda *a: None)
+    monkeypatch.setattr(hl_candles, "safe_rollback", lambda *a: None)
+    # conftest stubs psycopg as a MagicMock, so RETRIABLE_EXCEPTIONS (which includes
+    # psycopg.OperationalError) is not a valid except-tuple at test time — neutralize it so the
+    # failure-path test exercises the real bounding logic, not the stub artifact.
+    monkeypatch.setattr(hl_candles, "RETRIABLE_EXCEPTIONS", (RuntimeError,))
 
     def fake_fetch(exchange, symbol, mi, name, tf, interval_s, rl, since_ms=None, limit=1000):
         seen.append(since_ms)
-        return [{"x": 1}] * bars_per_fetch
-    monkeypatch.setattr(main, "fetch_candles", fake_fetch)
-    return seen
+        if raises:
+            raise RuntimeError("boom")
+        return [{"x": 1}] * min(bars_per_fetch, limit)   # honor the clamped limit
+    return seen, fake_fetch
 
 
 def _cfg():
@@ -228,22 +240,40 @@ def _cfg():
 def test_sweep_fetch_cap_bounds_volume(monkeypatch):
     # 100 zero-row coins → 100 gap candidates; 100 bars/fetch keeps the BAR cap slack so the FETCH
     # cap (40) is the binding bound.
-    universe = [{"symbol": str(i), "asset_id": str(i), "native_symbol": "0", "market_type": "perp"} for i in range(100)]
-    seen = _wire_sweep(monkeypatch, universe, {}, bars_per_fetch=100)
-    repaired, remaining = _run_backfill_sweep(object(), _cfg(), _DummyConn(), None, 0, "t")
-    assert len(seen) == BACKFILL_MAX_FETCHES        # capped at 40 fetches
+    seen, fetch = _wire_sweep(monkeypatch, _universe(100), {}, bars_per_fetch=100)
+    repaired, remaining = _run_backfill_sweep(object(), _cfg(), _DummyConn(), None, 0, "t", fetch)
+    assert len(seen) == BACKFILL_MAX_FETCHES        # capped at 40 attempts
     assert remaining == 100 - BACKFILL_MAX_FETCHES  # the rest deferred to later sweeps
+
+
+def test_sweep_bounded_even_when_all_fetches_fail(monkeypatch):
+    # THE HIGH regression: the loop must bound on ATTEMPTS, not successes — else a sweep where every
+    # fetch raises would hammer the REST lane unbounded (starving OI). 100 candidates all raise →
+    # attempts still capped at 40, 0 repaired.
+    seen, fetch = _wire_sweep(monkeypatch, _universe(100), {}, bars_per_fetch=100, raises=True)
+    repaired, remaining = _run_backfill_sweep(object(), _cfg(), _DummyConn(), None, 0, "t", fetch)
+    assert len(seen) == BACKFILL_MAX_FETCHES
+    assert repaired == 0
+    assert remaining == 100 - BACKFILL_MAX_FETCHES
+
+
+def test_sweep_bar_cap_never_overshoots_nondivisor(monkeypatch):
+    # THE HIGH regression: 900-bar responses (a non-divisor of 5000) must NOT overshoot BACKFILL_MAX_BARS
+    # — the last fetch's `limit` is clamped to the remaining budget (else 6×900 = 5400 > 5000).
+    seen, fetch = _wire_sweep(monkeypatch, _universe(100), {}, bars_per_fetch=900)
+    repaired, _ = _run_backfill_sweep(object(), _cfg(), _DummyConn(), None, 0, "t", fetch)
+    assert repaired == BACKFILL_MAX_BARS            # exactly the cap, not 5400
+    assert repaired <= BACKFILL_MAX_BARS
 
 
 def test_sweep_zero_gaps_only_fetches_trailing_share(monkeypatch):
     # All 100 coins up to date → no gap candidates; only the rotating 1/CYCLE trailing share is fetched
     # (steady-state REST is just that tiny share, not the whole universe).
-    universe = [{"symbol": str(i), "asset_id": str(i), "native_symbol": "0", "market_type": "perp"} for i in range(100)]
     scan = {str(i): {"last_ts": _dt(_NOW_MS - _MIN), "earliest_gap_after": None} for i in range(100)}
     # freeze now so the scan rows read as current
     monkeypatch.setattr(hl_candles.time, "time", lambda: _NOW_MS / 1000.0)
-    seen = _wire_sweep(monkeypatch, universe, scan, bars_per_fetch=3)
-    _run_backfill_sweep(object(), _cfg(), _DummyConn(), None, 0, "t")
+    seen, fetch = _wire_sweep(monkeypatch, _universe(100), scan, bars_per_fetch=3)
+    _run_backfill_sweep(object(), _cfg(), _DummyConn(), None, 0, "t", fetch)
     assert len(seen) == 100 // BACKFILL_TRAILING_CYCLE   # 10 trailing coins, no gap fetches
 
 
