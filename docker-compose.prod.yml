@@ -9,6 +9,11 @@
 services:
   db:
     ports: !reset []
+    # Bind-mount the Hetzner Cloud Volume (mounted at /mnt/pgvol on the host, ext4/noatime, persistent
+    # via fstab) so the ts_1m tablespace lives on it (T-015). Container path matches migration 010's
+    # CREATE TABLESPACE LOCATION. Appends to the base compose db volumes (pgdata + init.sql).
+    volumes:
+      - /mnt/pgvol:/mnt/pgvol
     deploy:
       resources:
         limits:
