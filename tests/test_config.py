@@ -48,8 +48,9 @@ def test_has_premium_index_flag():
 
 
 def test_has_candle_ws_flag():
-    # T-015.1: only HL streams 1m candles over WS; others default False.
-    assert load_config("hyperliquid").has_candle_ws is True
+    # T-015.1: HL candle WS is currently DISABLED (the REST backfill starved HL's 5m…1w limiter —
+    # re-enable WS-only after stripping the backfill). No venue has it on right now.
+    assert load_config("hyperliquid").has_candle_ws is False
     assert load_config("binance").has_candle_ws is False
     assert load_config("bybit").has_candle_ws is False
     assert load_config("coinbase").has_candle_ws is False
@@ -65,10 +66,9 @@ def test_candle_ws_loop_sentinels_registered():
 
 
 def test_hl_1m_streamed_not_polled():
-    # T-015.1: HL 1m is streamed via has_candle_ws — it must NOT be a configured timeframe, or run()
-    # would launch the per-symbol REST 1m collect_loop that starves the unbackfillable dense OI.
+    # T-015.1: HL 1m must NEVER be a configured timeframe (regardless of the has_candle_ws flag) — else
+    # run() would launch the per-symbol REST 1m collect_loop that starves HL's shared limiter.
     cfg = load_config("hyperliquid")
-    assert cfg.has_candle_ws is True
     assert "1m" not in {tf.name for tf in cfg.timeframes}
 
 
