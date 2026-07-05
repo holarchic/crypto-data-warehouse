@@ -7,7 +7,7 @@ from candles import CANDLE_SEED_LIMIT, poll_limit
 from config import CANDLE_TABLES, ExchangeConfig, TimeframeConfig, load_config
 from dotenv import load_dotenv
 from funding import funding_loop
-from hl_candles import HL_CANDLE_SHARDS, build_hl_candle_spec, hl_candle_backfill_loop
+from hl_candles import build_hl_candle_spec, hl_candle_backfill_loop
 from liquidations import build_liq_spec
 from oi import oi_loop
 from premium_index import premium_index_loop
@@ -335,18 +335,17 @@ def run():
     # gap-backfill sweep. STREAMED, not polled: 1m is deliberately NOT in supported_timeframes, so no
     # per-symbol REST 1m collect_loop launches above (it would starve the unbackfillable dense OI).
     if config.has_candle_ws:
-        # HL drops a connection carrying ≥~80 candle subs, so the universe is sharded across
-        # HL_CANDLE_SHARDS ws_loop connections (each ≤~33 subs). All share the candle_ws sentinel.
-        for shard in range(HL_CANDLE_SHARDS):
-            t = threading.Thread(
-                target=ws_loop,
-                args=(build_hl_candle_spec(shard, HL_CANDLE_SHARDS), config, dsn),
-                name=f"{config.name}-candle-ws-{shard}",
-                daemon=True,
-            )
-            t.start()
-            threads.append(t)
-            log.info("Started thread %s", t.name)
+        # One connection for the whole HL universe (well inside HL's per-IP sub ceiling). The spec
+        # resolves each coin's HL WS name from ccxt markets, so `exchange` is passed in.
+        t = threading.Thread(
+            target=ws_loop,
+            args=(build_hl_candle_spec(exchange), config, dsn),
+            name=f"{config.name}-candle-ws",
+            daemon=True,
+        )
+        t.start()
+        threads.append(t)
+        log.info("Started thread %s", t.name)
 
         t = threading.Thread(
             target=hl_candle_backfill_loop,
