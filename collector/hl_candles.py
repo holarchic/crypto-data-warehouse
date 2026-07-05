@@ -7,11 +7,16 @@ only what the WS drops. Both write `candles_1m` via an UPSERT (below), never the
 `ON CONFLICT DO NOTHING` insert — HL streams the *forming* bar continuously with no closed flag, so the
 row must converge to the bar's closed value (last-write-wins).
 
-**asset_id resolution.** The WS candle frame carries `s` = the coin name, which for HL *is* the cc
-`asset_id` (HL's `native_symbol` is a numeric asset index like 28/210 — the opposite of the
-liquidations feed, which keys on `native_symbol`). `topics_for_pairs` rebuilds a shared
-`asset_id → {symbol, native_symbol, market_type}` map that `parse_message` reads; both run in the one
-`ws_loop` thread, so the map needs no lock (the liquidations pattern).
+**Coin-name mapping (load-bearing).** The WS `coin`/`s` field is HL's authoritative meta *name*, which
+is NOT always the cc `asset_id`: ccxt uppercases the base, so HL's 1000×-token names (`kPEPE`, `kBONK`,
+`kSHIB`, …) become `KPEPE`/`KBONK`/`KSHIB` as cc's `asset_id`. Subscribing with the wrong-cased name
+makes HL **drop the whole connection** (verified 2026-07-05 — one bad coin killed all 161 subs). So the
+WS name is resolved from ccxt `market['info']['name']` (authoritative — `KAITO`/`KAS` stay uppercase,
+only the 1000× tokens lowercase the `k`). `topics_for_pairs` rebuilds a shared `hl_name → {asset_id,
+symbol, native_symbol, market_type}` map (keyed on the HL name so `parse_message` can route the `s`
+field) and subscribes with the HL names; the stored row keeps cc's canonical uppercase `asset_id`. Both
+run in the one `ws_loop` thread, so the map needs no lock (the liquidations pattern). HL's
+`native_symbol` is a numeric asset index (28/210) — unused here, unlike the liquidations feed.
 """
 
 import json
@@ -33,15 +38,11 @@ log = logging.getLogger(__name__)
 HL_WS_URL = "wss://api.hyperliquid.xyz/ws"
 HL_PING_INTERVAL_S = 30.0   # HL closes an idle socket at 60s (timeouts doc) → ping at 2× margin
 
-# HL's docs list 1000 subs / 10 conns / 30 new-conns/min PER IP, but the real **per-connection** candle
-# limit is far lower — measured 2026-07-05: a single connection holds ≤70 candle subs but is dropped
-# ~1.1s after subscribing ≥80. So the universe (~161) is SHARDED across HL_CANDLE_SHARDS connections
-# (≤~33 subs each, wide margin under 70; 5 conns < the 10-conn IP limit). The ceiling-guard warns per
-# shard as it nears the per-connection limit → the lever is MORE shards (raise HL_CANDLE_SHARDS), not
-# fewer subs, until the 10-connection IP cap (then a second IP).
-HL_CANDLE_SHARDS = 5
-HL_SUB_PER_CONN_LIMIT = 70   # observed per-connection candle-sub limit (drops at ≥80)
-HL_SUB_WARN = 55             # warn as a shard nears the limit → raise HL_CANDLE_SHARDS
+# HL documents 1000 subs / 10 conns / 30 new-conns/min per IP; ~161 candle subs on one connection is
+# well inside (verified 2026-07-05: all 161 held on a single connection once coin names were correct —
+# see the name-mapping note below). The ceiling-guard warns as the count nears the documented limit.
+HL_SUB_CEILING = 1000
+HL_SUB_WARN = 900
 
 INSERT_CANDLES_1M_SQL = """
     INSERT INTO candles_1m (exchange, market_type, asset_id, symbol, native_symbol,
@@ -86,12 +87,20 @@ def _ts_seconds(ms):
         return None
 
 
-def _rebuild_map(asset_map, pairs):
-    """Rebuild the shared asset_id→{symbol,native_symbol,market_type} map IN PLACE (clear+update, not
-    rebind, so the closures keep the same dict object). Single-threaded per ws_loop → no lock."""
+def _hl_name(pair, name_by_asset):
+    """The HL WS coin name for a pair: ccxt's authoritative `info.name` (falls back to the cc asset_id
+    when absent — correct for every coin whose HL name already equals its uppercase base)."""
+    return name_by_asset.get(pair["asset_id"], pair["asset_id"])
+
+
+def _rebuild_map(asset_map, pairs, name_by_asset):
+    """Rebuild the shared HL-name→{asset_id,symbol,native_symbol,market_type} map IN PLACE (clear+update,
+    not rebind, so the closures keep the same dict object). Keyed on the HL WS name (what `parse_message`
+    sees in `s`); the value keeps cc's canonical `asset_id`. Single-threaded per ws_loop → no lock."""
     asset_map.clear()
     asset_map.update({
-        p["asset_id"]: {
+        _hl_name(p, name_by_asset): {
+            "asset_id": p["asset_id"],
             "symbol": p["symbol"],
             "native_symbol": p.get("native_symbol") or "",
             "market_type": p.get("market_type") or "perp",
@@ -110,14 +119,14 @@ def _parse_hl_candle(raw, asset_map):
     d = msg.get("data")
     if not isinstance(d, dict):
         return []
-    info = asset_map.get(d.get("s"))  # s = coin name = cc asset_id
+    info = asset_map.get(d.get("s"))  # s = HL coin name → map → cc canonical asset_id
     ts = _ts_seconds(d.get("t"))      # t = bar-open time (ms)
     if info is None or ts is None:
         return []  # untracked coin / bad time → unplaceable, drop
     return [{
         "exchange": "hyperliquid",
         "market_type": info["market_type"],
-        "asset_id": d["s"],
+        "asset_id": info["asset_id"],
         "symbol": info["symbol"],
         "native_symbol": info["native_symbol"],
         "timeframe": "1m",
@@ -157,14 +166,11 @@ def _sub_frame(method, coin):
 
 
 def _check_sub_ceiling(coins, thread_name="hyperliquid/candle"):
-    """Warn as a shard's subscription count nears HL's per-connection candle limit. Returns the count
-    (tests). The lever when this fires is a larger HL_CANDLE_SHARDS (up to the 10-connection IP cap)."""
+    """Warn as the subscription count nears HL's documented per-IP ceiling. Returns the count (tests)."""
     n = len(coins)
     if n >= HL_SUB_WARN:
-        log.warning(
-            "[%s] Shard has %d candle subs, nearing the ~%d per-connection limit — raise HL_CANDLE_SHARDS",
-            thread_name, n, HL_SUB_PER_CONN_LIMIT,
-        )
+        log.warning("[%s] %d candle subs nearing the ~%d ceiling — shard across connections soon",
+                    thread_name, n, HL_SUB_CEILING)
     return n
 
 
@@ -173,31 +179,34 @@ def _check_sub_ceiling(coins, thread_name="hyperliquid/candle"):
 # ---------------------------------------------------------------------------
 
 
-def _shard_pairs(pairs, shard_index, shard_count):
-    """This shard's pairs: a stable strided slice of the asset_id-sorted universe (index `i` gets
-    coins i, i+count, i+2·count, …). Stable + balanced, so a resub with the same universe yields the
-    same partition on every connection."""
-    ordered = sorted((p for p in pairs if p.get("asset_id")), key=lambda p: p["asset_id"])
-    return ordered[shard_index::shard_count]
+def hl_coin_names(exchange) -> dict[str, str]:
+    """Map cc `asset_id` (ccxt's uppercase base) → HL's authoritative WS coin name (`info.name`). Differs
+    only for 1000× tokens (`KPEPE`→`kPEPE`, …). Rebuilt each resubscribe so a new listing's name is
+    picked up as ccxt reloads markets — a wrong name would make HL drop the whole connection."""
+    names = {}
+    for m in exchange.markets.values():
+        info = m.get("info")
+        if m.get("swap") and isinstance(info, dict) and info.get("name") and m.get("base"):
+            names[m["base"]] = info["name"]
+    return names
 
 
-def build_hl_candle_spec(shard_index: int = 0, shard_count: int = 1) -> WSFeedSpec:
-    """HL per-coin `candle` feed on the generic `ws.py` engine, for ONE shard of the universe (HL drops
-    a connection carrying ≥~80 candle subs, so the ~161-coin universe is split across `shard_count`
-    connections). `topics_for_pairs` returns this shard's coin *ids* (the engine diffs the id set across
-    resubs) and rebuilds this shard's asset map; the frame builders wrap each id in HL's candle-subscribe
-    JSON; `parse_message` resolves the id back to the row. All shards share the `candle_ws` sentinel."""
+def build_hl_candle_spec(exchange) -> WSFeedSpec:
+    """HL `candle` feed on the generic `ws.py` engine — one connection for the whole ~161-coin universe
+    (well inside HL's per-IP sub ceiling). `topics_for_pairs` resolves each pair to its HL WS coin name
+    (via ccxt `info.name`), rebuilds the shared `hl_name → {asset_id,…}` map, and returns the HL names
+    (the engine diffs that set across resubs); the frame builders wrap each in HL's candle-subscribe
+    JSON; `parse_message` routes the frame's `s` back through the map to the canonical row."""
     asset_map: dict[str, dict] = {}
 
     def topics_for_pairs(pairs):
-        shard = _shard_pairs(pairs, shard_index, shard_count)
-        _rebuild_map(asset_map, shard)
-        coins = [p["asset_id"] for p in shard]
-        _check_sub_ceiling(coins, thread_name=f"hyperliquid/candle-{shard_index}")
+        _rebuild_map(asset_map, pairs, hl_coin_names(exchange))
+        coins = list(asset_map)   # the HL WS names
+        _check_sub_ceiling(coins)
         return coins
 
     return WSFeedSpec(
-        name=f"candle-{shard_index}",
+        name="candle",
         loop_tf=CANDLE_WS,
         url=HL_WS_URL,
         topics_for_pairs=topics_for_pairs,
