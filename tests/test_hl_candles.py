@@ -40,13 +40,36 @@ def _candle_frame(coin="BTC", t=1_720_000_000_000, o="100", h="110", lo="90", c=
 # --- topics + framing ------------------------------------------------------
 
 def test_topics_for_pairs_returns_coin_ids_and_rebuilds_map():
-    spec = build_hl_candle_spec()
+    spec = build_hl_candle_spec()   # single shard (0 of 1) → the whole universe
     coins = spec.topics_for_pairs(_PAIRS)
-    assert coins == ["BTC", "AAVE"]  # coin ids (asset_id), not full subscribe messages
+    assert sorted(coins) == ["AAVE", "BTC"]  # coin ids (asset_id), not full subscribe messages
     # The map is now populated so parse_message can resolve — proven via a parse below.
     rows = spec.parse_message(_candle_frame("AAVE"))
     assert rows[0]["symbol"] == "AAVE/USDC:USDC"
     assert rows[0]["native_symbol"] == "28"
+
+
+def test_shard_partition_is_disjoint_and_complete():
+    from hl_candles import HL_CANDLE_SHARDS, _shard_pairs
+    universe = [{"symbol": str(i), "asset_id": f"C{i:03d}"} for i in range(161)]
+    seen = []
+    for s in range(HL_CANDLE_SHARDS):
+        shard = _shard_pairs(universe, s, HL_CANDLE_SHARDS)
+        assert len(shard) <= 40                      # comfortably under the ~70 per-conn limit
+        seen.extend(p["asset_id"] for p in shard)
+    # Every coin covered exactly once across the shards (disjoint + complete).
+    assert sorted(seen) == sorted(p["asset_id"] for p in universe)
+    assert len(seen) == len(set(seen)) == 161
+
+
+def test_each_shard_spec_subscribes_only_its_coins():
+    from hl_candles import HL_CANDLE_SHARDS
+    universe = [{"symbol": str(i), "asset_id": f"C{i:03d}", "native_symbol": str(i), "market_type": "perp"}
+                for i in range(161)]
+    covered = []
+    for s in range(HL_CANDLE_SHARDS):
+        covered.extend(build_hl_candle_spec(s, HL_CANDLE_SHARDS).topics_for_pairs(universe))
+    assert sorted(covered) == sorted(p["asset_id"] for p in universe)
 
 
 def test_subscribe_frames_wrap_each_coin_id():
@@ -137,11 +160,12 @@ def test_spec_sets_ping_frame_and_interval():
     assert spec.ping_interval_s == 30.0
 
 
-def test_ceiling_guard_warns_near_cap(caplog):
-    assert _check_sub_ceiling(["BTC"] * 161) == 161      # far under → no warning
+def test_ceiling_guard_warns_near_per_connection_limit(caplog):
+    assert _check_sub_ceiling(["BTC"] * 33) == 33        # a normal shard, far under → no warning
+    assert not caplog.records
     with caplog.at_level("WARNING"):
-        _check_sub_ceiling(["c"] * 950)
-    assert any("approaching the per-IP ceiling" in r.message for r in caplog.records)
+        _check_sub_ceiling(["c"] * 60)                    # a shard nearing the ~70 per-conn limit
+    assert any("per-connection limit" in r.message for r in caplog.records)
 
 
 # ===========================================================================
@@ -284,8 +308,9 @@ def test_run_wires_candle_ws_and_backfill_behind_flag():
     because run() blocks forever (matches the premium/liq wiring pins)."""
     from pathlib import Path
     src = (Path(hl_candles.__file__).parent / "main.py").read_text()
-    assert "from hl_candles import build_hl_candle_spec, hl_candle_backfill_loop" in src
+    assert "from hl_candles import HL_CANDLE_SHARDS, build_hl_candle_spec, hl_candle_backfill_loop" in src
     assert "config.has_candle_ws" in src
     assert "target=hl_candle_backfill_loop" in src
-    # The WS thread reuses the generic ws_loop engine with the HL candle spec.
-    assert "args=(build_hl_candle_spec(), config, dsn)" in src
+    # The WS threads reuse the generic ws_loop engine with a per-shard HL candle spec.
+    assert "build_hl_candle_spec(shard, HL_CANDLE_SHARDS)" in src
+    assert "range(HL_CANDLE_SHARDS)" in src
