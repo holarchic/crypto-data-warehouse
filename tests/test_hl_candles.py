@@ -245,3 +245,17 @@ def test_sweep_zero_gaps_only_fetches_trailing_share(monkeypatch):
     seen = _wire_sweep(monkeypatch, universe, scan, bars_per_fetch=3)
     _run_backfill_sweep(object(), _cfg(), _DummyConn(), None, 0, "t")
     assert len(seen) == 100 // BACKFILL_TRAILING_CYCLE   # 10 trailing coins, no gap fetches
+
+
+# --- run() wiring (source-pin — run() is a blocking daemon entry point) -------
+
+def test_run_wires_candle_ws_and_backfill_behind_flag():
+    """Both HL 1m threads are imported and launched only when has_candle_ws is set. Source-pinned
+    because run() blocks forever (matches the premium/liq wiring pins)."""
+    from pathlib import Path
+    src = (Path(hl_candles.__file__).parent / "main.py").read_text()
+    assert "from hl_candles import build_hl_candle_spec, hl_candle_backfill_loop" in src
+    assert "config.has_candle_ws" in src
+    assert "target=hl_candle_backfill_loop" in src
+    # The WS thread reuses the generic ws_loop engine with the HL candle spec.
+    assert "args=(build_hl_candle_spec(), config, dsn)" in src
