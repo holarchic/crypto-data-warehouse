@@ -240,6 +240,16 @@ def test_build_hl_snapshots_captures_1000x_token_via_upper_bridge():
     assert ctx_rows[0]["symbol"] == "KPEPE/USDC:USDC"
 
 
+def test_build_hl_snapshots_null_name_dropped_not_aborted():
+    # A present-but-null `name` must drop that one asset (parse-or-drop), NOT raise AttributeError from
+    # `.upper()` and abort the whole cycle. A valid coin in the same response still lands.
+    universe = [{"name": None}, {"name": "BTC"}]
+    ctxs = [_full_ctx(), _full_ctx()]
+    asset_to_pair = {"BTC": {"asset_id": "BTC", "symbol": "BTC/USDC:USDC"}}
+    oi_rows, ctx_rows = oi._build_hl_snapshots(universe, ctxs, asset_to_pair, "hyperliquid", 1.0)
+    assert [r["asset_id"] for r in ctx_rows] == ["BTC"]   # null-name asset dropped, BTC survives
+
+
 def test_build_hl_snapshots_length_mismatch_raises():
     import pytest
     with pytest.raises(ValueError, match="length mismatch"):
