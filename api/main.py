@@ -1,12 +1,11 @@
 import os
 from contextlib import asynccontextmanager
-from datetime import datetime
-from io import BytesIO
+from datetime import datetime, timezone
 
 import export
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Query
-from fastapi.responses import Response, StreamingResponse
+from fastapi.responses import Response
 from psycopg.rows import dict_row
 from psycopg_pool import ConnectionPool
 
@@ -388,9 +387,13 @@ def export_parquet(
     if spec is None:
         raise HTTPException(status_code=400, detail=f"unknown table {table!r}; valid: {sorted(export.FEED_SPECS)}")
     # TIMESTAMPTZ boundaries: a naive datetime would be read against the session tz and silently shift
-    # the window (a byte-contract hazard) — require tz-aware UTC.
+    # the window (a byte-contract hazard) — require tz-aware, then normalize to UTC so the query and the
+    # filename are unambiguously UTC (an accepted +offset input maps to the same instant but must not
+    # stamp a caller-local date).
     if start.tzinfo is None or end.tzinfo is None:
         raise HTTPException(status_code=400, detail="start and end must be timezone-aware (UTC)")
+    start = start.astimezone(timezone.utc)
+    end = end.astimezone(timezone.utc)
     if start >= end:
         raise HTTPException(status_code=400, detail="start must be < end")
 
@@ -422,10 +425,12 @@ def export_parquet(
     if not rows:
         return Response(status_code=204)
 
+    # The full parquet is already materialized (bounded by EXPORT_MAX_ROWS), so return it as one
+    # Response body — no chunked streaming, no extra BytesIO copy.
     data = export.rows_to_parquet(table, rows)
     filename = f"{table}_{start.date()}_{end.date()}.parquet"
-    return StreamingResponse(
-        BytesIO(data),
+    return Response(
+        content=data,
         media_type="application/vnd.apache.parquet",
         headers={"Content-Disposition": f'attachment; filename="{filename}"'},
     )

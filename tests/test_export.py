@@ -18,7 +18,8 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 
 # The real backtester seed schema (`hl-asset-ctxs.parquet`), read-verified 2026-07-06 against the
-# 240,336,969-row file. This hardcoded copy is the contract pin — names, types, AND order.
+# 240,336,969-row file. Names + types are the backtester-hash contract (it name-sorts, so order is not
+# pinned by the hash); cc writes seed order as a parity convention, and this copy pins that too.
 _SEED_SCHEMA = pa.schema(
     [
         ("coin", pa.string()),
@@ -65,10 +66,10 @@ def _read(data: bytes) -> pa.Table:
 
 
 def test_feed_schema_byte_matches_seed():
-    # names, types, AND order — the structural-hash parity pin.
+    # names + types must match the seed (the hash contract); order is checked too as a cc parity pin.
     schema = export.feed_schema("hl_asset_ctxs")
     assert schema.equals(_SEED_SCHEMA)
-    assert schema.names == _SEED_SCHEMA.names  # order explicit
+    assert schema.names == _SEED_SCHEMA.names  # seed order (convention, not a hash requirement)
 
 
 def test_select_columns_are_cc_names_not_seed_names():
@@ -137,6 +138,16 @@ def test_missing_mapped_column_fails_closed():
     raise AssertionError("expected KeyError on a row missing a mapped cc column")
 
 
+def test_unknown_column_kind_fails_closed():
+    # the transform is chosen by explicit `kind`, not inferred from the arrow type — an unregistered
+    # kind (e.g. a future feed's column left mis-declared) must raise, not silently mis-convert.
+    try:
+        export._column_array(export.Column("x", "x", "bogus"), [{"x": 1}])
+    except ValueError:
+        return
+    raise AssertionError("expected ValueError on an unknown column kind")
+
+
 # ---- endpoint source pins (ast — api/main.py can't import under the collector harness) ----
 
 _API_MAIN = Path(__file__).resolve().parents[1] / "api" / "main.py"
@@ -166,6 +177,12 @@ def test_endpoint_whitelists_table_via_feed_specs():
 def test_endpoint_rejects_naive_datetimes():
     body = _export_endpoint_source()
     assert "tzinfo is None" in body
+
+
+def test_endpoint_normalizes_bounds_to_utc():
+    # an accepted +offset input must map to UTC before the query/filename (no caller-local date stamp).
+    body = _export_endpoint_source()
+    assert "astimezone(timezone.utc)" in body
 
 
 def test_endpoint_rejects_reversed_window():
