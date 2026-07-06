@@ -18,8 +18,8 @@ from status import LOOP_SENTINEL_SYMBOL
 
 log = logging.getLogger(__name__)
 
-# Per-loop heartbeat pseudo-timeframes (config.LOOP_INTERVALS keys: funding, oi, liq_ws).
-# Their sentinel collection_status rows are checked for staleness like any
+# Per-loop heartbeat pseudo-timeframes (config.LOOP_INTERVALS keys: funding, oi, liq_ws, premium,
+# candle_ws). Their sentinel collection_status rows are checked for staleness like any
 # collector, but carry no candle series — so gap detection skips them.
 LOOP_TIMEFRAMES = frozenset(LOOP_INTERVALS)
 
@@ -517,8 +517,8 @@ def run():
     delta_threshold = int(os.environ.get("ALARMING_DELTA_THRESHOLD", "25"))
     sustain_cycles = int(os.environ.get("ALARMING_SUSTAIN_CYCLES", "2"))
 
-    # Candle TFs + per-loop heartbeat pseudo-TFs (funding/oi/liq_ws) — so compute_staleness
-    # flags a silently-dead loop (poll or WS) via the same staleness path.
+    # Candle TFs + per-loop heartbeat pseudo-TFs (funding/oi/liq_ws/premium/candle_ws) — so
+    # compute_staleness flags a silently-dead loop (poll or WS) via the same staleness path.
     timeframe_intervals = {**load_timeframe_intervals(), **LOOP_INTERVALS}
 
     _weekdays = ("Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun")
