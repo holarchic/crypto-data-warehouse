@@ -67,6 +67,13 @@ def test_row_mapping_close_short():
     assert hl._row("0xLIQ", _liq_fill(dir="Close Short"), "20260705")["liquidated_side"] == "short"
 
 
+def test_asset_id_is_hl_native_not_canonicalized():
+    # liquidations mirrors the seed's HL-native coin (SPEC:240/247, matches hl_asset_ctxs) — a 1000x
+    # token stays `kPEPE`, NOT the ccxt-canonical `KPEPE`, so the T-011 export is a seed passthrough.
+    r = hl._row("0xLIQ", _liq_fill(coin="kPEPE"), "20260705")
+    assert r["asset_id"] == "kPEPE"
+
+
 def test_liquidated_side_falls_back_to_side_when_dir_blank():
     # dir absent → fall back to side (A→long), with the anomaly logged.
     assert hl._row("0xLIQ", _liq_fill(dir=""), "20260705")["liquidated_side"] == "long"
@@ -152,6 +159,14 @@ def test_extract_rows_streams_lz4_and_emits_liquidated_side_only():
     assert len(rows) == 2
     assert {r["asset_id"] for r in rows} == {"BTC", "SOL"}
     assert next(r for r in rows if r["asset_id"] == "SOL")["liquidated_side"] == "short"
+
+
+def test_by_block_dict_missing_events_is_counted_not_silently_dropped():
+    # a by-block dict with no `events` list is format drift → counted, NOT a silent zero-row drop.
+    raw = (json.dumps({"block_number": 9}) + "\n").encode()  # no "events" key
+    stats = hl._new_stats()
+    rows = list(hl.extract_rows(_FakeBody(lz4.frame.compress(raw)), "20260705", stats))
+    assert rows == [] and stats["bad_lines"] == 1
 
 
 def test_malformed_fill_shape_is_counted_not_raised():
