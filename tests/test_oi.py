@@ -316,6 +316,10 @@ def _drive_one_cycle(monkeypatch, conn, universe, ctxs, pairs):
     monkeypatch.setattr(oi, "connect_db", lambda dsn: conn)
     monkeypatch.setattr(oi, "_get_active_pairs", lambda c, name: pairs)
     monkeypatch.setattr(oi, "_fetch_hl_meta_and_ctxs", lambda: (universe, ctxs))
+    # `db` is a conftest MagicMock, so `oi.safe_rollback` is a no-op unless another test file happens to
+    # un-stub it first (cross-file ordering) — pin it to the fake conn's rollback so the rollback test is
+    # order-independent (was: passed only in the full suite, failed running test_oi.py alone).
+    monkeypatch.setattr(oi, "safe_rollback", lambda c: c.rollback())
     hb = {"n": 0}
     monkeypatch.setattr(oi, "_heartbeat", lambda *a: hb.__setitem__("n", hb["n"] + 1))
 
