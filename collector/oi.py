@@ -260,7 +260,11 @@ def _build_hl_snapshots(universe, asset_ctxs, asset_to_pair, exchange, now_ts):
                 raise _CtxParseError(
                     f"non-dict meta/ctx ({type(meta).__name__}/{type(ctx).__name__})"
                 )
-            pair = asset_to_pair.get(meta.get("name", ""))
+            # `meta["name"]` is HL's native coin name (`kPEPE` for 1000× tokens); the active-pair map is
+            # keyed on cc's ccxt-canonical asset_id (`KPEPE`). HL names are uppercase but for the leading
+            # `k`, so `.upper()` bridges name→asset_id without adding ccxt to this raw-POST loop. Without
+            # it every 1000× token silently missed the lookup and was dropped from both tables.
+            pair = asset_to_pair.get(meta.get("name", "").upper())
             if pair is None:
                 continue  # not an active pair — not malformed, just not collected
             bundle = _parse_hl_ctx(ctx)
@@ -282,7 +286,10 @@ def _build_hl_snapshots(universe, asset_ctxs, asset_to_pair, exchange, now_ts):
             "oi_value_usd": oi_value_usd,
         })
         ctx_rows.append({
-            "asset_id": pair["asset_id"],
+            # HL-native name (= the backtester seed `coin`, e.g. `kPEPE`) so the T-011 export is a
+            # passthrough. Differs from `open_interest.asset_id` (ccxt-canonical `KPEPE`) only for 1000×
+            # tokens; `hl_asset_ctxs` is HL-only + seed-mirroring, `open_interest` is cross-venue.
+            "asset_id": meta["name"],
             "symbol": pair["symbol"],
             "timestamp": now_ts,
             **bundle,

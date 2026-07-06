@@ -225,6 +225,21 @@ def test_build_hl_snapshots_skips_unknown_assets():
     assert len(ctx_rows) == 1
 
 
+def test_build_hl_snapshots_captures_1000x_token_via_upper_bridge():
+    # Regression: HL names a 1000× token `kPEPE` (leading-k lowercased); the active-pair map is keyed on
+    # cc's ccxt-canonical `KPEPE`. The `.upper()` bridge must match it (else it's silently dropped from
+    # both tables — the pre-fix bug). Storage diverges by design: open_interest = canonical `KPEPE`
+    # (cross-venue), hl_asset_ctxs = HL-native `kPEPE` (= backtester seed coin, T-011 passthrough).
+    universe = [{"name": "kPEPE"}]
+    ctxs = [_full_ctx()]
+    asset_to_pair = {"KPEPE": {"asset_id": "KPEPE", "symbol": "KPEPE/USDC:USDC"}}
+    oi_rows, ctx_rows = oi._build_hl_snapshots(universe, ctxs, asset_to_pair, "hyperliquid", 1.0)
+    assert len(oi_rows) == 1 and len(ctx_rows) == 1
+    assert oi_rows[0]["asset_id"] == "KPEPE"    # ccxt-canonical (cross-venue open_interest)
+    assert ctx_rows[0]["asset_id"] == "kPEPE"   # HL-native = seed coin (hl_asset_ctxs)
+    assert ctx_rows[0]["symbol"] == "KPEPE/USDC:USDC"
+
+
 def test_build_hl_snapshots_length_mismatch_raises():
     import pytest
     with pytest.raises(ValueError, match="length mismatch"):
