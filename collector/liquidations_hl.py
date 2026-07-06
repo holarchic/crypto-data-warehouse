@@ -330,19 +330,27 @@ def run(start: str, end: str) -> int:
                 failures += 1
                 continue
             if len(keys) < 24:
-                log.warning("day %s lists %d hourly objects (<24) — may be upstream-partial", day, len(keys))
+                # A prior COMPLETE UTC day should list 24 hourly objects; fewer is an incomplete/partial
+                # day. Count it toward failures so the run exits non-zero (the gap is surfaced, not a
+                # silent exit-0 "success") — still ingest what IS there. Noise is bounded: an incomplete
+                # day only sits in the default 3-day lookback, then ages out.
+                log.warning("day %s lists %d hourly objects (<24) — incomplete/partial day", day, len(keys))
+                failures += 1
             day_ins = day_seen = 0
             for key in keys:
                 try:
                     ins, seen, conn = _process_key(s3, conn, key, day)
                     day_ins += ins
                     day_seen += seen
-                except (psycopg.Error, BotoCoreError, ClientError, RuntimeError) as e:
-                    # Expected object-level failures — isolate the bad object, DON'T abort the run:
-                    # DB errors (a non-connection error leaves the txn ABORTED → recover the conn before
-                    # the next key), S3 GETs, and a corrupt lz4 frame (`RuntimeError`). A run-fatal DB
-                    # outage is `_DBUnavailable` (not caught here → handled below); a genuine logic bug
-                    # (TypeError/KeyError/…) propagates → aborts loudly.
+                except (psycopg.OperationalError, BotoCoreError, ClientError, RuntimeError) as e:
+                    # Recoverable object-level failures — isolate the bad object, DON'T abort the run: a
+                    # transient/connection DB error (`OperationalError`; leaves the txn ABORTED → recover
+                    # the conn before the next key), an S3 GET error, or a corrupt lz4 frame
+                    # (`RuntimeError`). A run-fatal DB outage is `_DBUnavailable` (handled below). A
+                    # DETERMINISTIC DB defect (`ProgrammingError`/`DataError`/`IntegrityError` — schema
+                    # drift, bad SQL, an undefined table) or a genuine logic bug is NOT caught here → it
+                    # propagates and aborts the run loudly, rather than being masked as per-object noise
+                    # across every object of the day.
                     log.error("FAIL %s: %s", key, e)
                     failures += 1
                     conn = _recover_conn(conn)
