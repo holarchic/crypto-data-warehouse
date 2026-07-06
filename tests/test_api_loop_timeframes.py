@@ -36,9 +36,9 @@ def test_api_excludes_premium_sentinel():
     assert "premium" in _api_loop_timeframes()
 
 
-def test_api_excludes_candle_ws_and_backfill_sentinels():
-    # T-015.1: HL 1m is streamed, not polled — its two loop sentinels are its liveness surface and
+def test_api_excludes_candle_ws_sentinel():
+    # T-015.1: HL 1m is streamed (WS-only), not polled — its loop sentinel is its liveness surface and
     # must be excluded from candle-facing /status (no per-pair HL 1m status rows exist).
     tfs = _api_loop_timeframes()
     assert "candle_ws" in tfs
-    assert "candle_backfill" in tfs
+    assert "candle_backfill" not in tfs

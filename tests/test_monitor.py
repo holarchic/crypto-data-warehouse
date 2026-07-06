@@ -6,7 +6,6 @@ from collections import deque
 from datetime import date, datetime, timezone
 
 from config import (
-    CANDLE_BACKFILL,
     CANDLE_WS,
     FUNDING_LOOP,
     LIQUIDATION_WS,
@@ -143,7 +142,7 @@ def test_loop_timeframes_match_config():
     pins against name drift between the heartbeat writers and the monitor."""
     assert LOOP_TIMEFRAMES == set(LOOP_INTERVALS)
     assert {FUNDING_LOOP, OI_LOOP, LIQUIDATION_WS, PREMIUM_LOOP,
-            CANDLE_WS, CANDLE_BACKFILL} == set(LOOP_INTERVALS)
+            CANDLE_WS} == set(LOOP_INTERVALS)
 
 
 def test_compute_staleness_flags_dead_ws_loop():
