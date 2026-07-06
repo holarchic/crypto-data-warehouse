@@ -240,13 +240,13 @@ def _candle_table(timeframe: str) -> str:
     return CANDLE_TABLE_BY_TIMEFRAME.get(timeframe, "candles")
 
 # Per-loop heartbeat pseudo-timeframes — funding, OI, the liquidation-WS, the premium-poll, and the
-# HL candle-WS + candle-backfill sentinels (the keys of collector/config.py LOOP_INTERVALS). The API is
+# HL candle-WS sentinel (the keys of collector/config.py LOOP_INTERVALS). The API is
 # a separate container and cannot import collector/, so the
 # names are mirrored here (as TIMEFRAME_INTERVALS above is). Only the NAMES are needed —
 # the staleness intervals are the monitor's concern. CONTRACT: every candle-facing
 # collection_status query in this module excludes these sentinel rows; loop liveness is
 # surfaced by the monitor, not this API.
-LOOP_TIMEFRAMES = ("funding", "oi", "liq_ws", "premium", "candle_ws", "candle_backfill")
+LOOP_TIMEFRAMES = ("funding", "oi", "liq_ws", "premium", "candle_ws")
 
 
 @app.get("/status")

@@ -7,7 +7,7 @@ from candles import CANDLE_SEED_LIMIT, poll_limit
 from config import CANDLE_TABLES, ExchangeConfig, TimeframeConfig, load_config
 from dotenv import load_dotenv
 from funding import funding_loop
-from hl_candles import build_hl_candle_spec, hl_candle_backfill_loop
+from hl_candles import build_hl_candle_spec
 from liquidations import build_liq_spec
 from oi import oi_loop
 from premium_index import premium_index_loop
@@ -331,8 +331,9 @@ def run():
         threads.append(t)
         log.info("Started thread %s", t.name)
 
-    # HL 1m candle feed (T-015.1) — a WS candle stream (real-time primary, zero REST) + a REST
-    # gap-backfill sweep. STREAMED, not polled: 1m is deliberately NOT in supported_timeframes, so no
+    # HL 1m candle feed (T-015.1) — a WS-only candle stream (real-time, zero REST; a rare WS-drop gap is
+    # repaired out-of-band via T-011, never a live sweep — a live backfill was measured to starve HL's
+    # tight limiter). STREAMED, not polled: 1m is deliberately NOT in supported_timeframes, so no
     # per-symbol REST 1m collect_loop launches above (it would starve the unbackfillable dense OI).
     if config.has_candle_ws:
         # One connection for the whole HL universe (well inside HL's per-IP sub ceiling). The spec
@@ -341,16 +342,6 @@ def run():
             target=ws_loop,
             args=(build_hl_candle_spec(exchange), config, dsn),
             name=f"{config.name}-candle-ws",
-            daemon=True,
-        )
-        t.start()
-        threads.append(t)
-        log.info("Started thread %s", t.name)
-
-        t = threading.Thread(
-            target=hl_candle_backfill_loop,
-            args=(exchange, config, dsn, rate_limiter, fetch_candles),
-            name=f"{config.name}-candle-backfill",
             daemon=True,
         )
         t.start()

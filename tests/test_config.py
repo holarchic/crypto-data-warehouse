@@ -2,7 +2,6 @@
 
 import pytest
 from config import (
-    CANDLE_BACKFILL,
     CANDLE_TABLES,
     CANDLE_WS,
     LOOP_INTERVALS,
@@ -48,21 +47,18 @@ def test_has_premium_index_flag():
 
 
 def test_has_candle_ws_flag():
-    # T-015.1: HL candle WS is currently DISABLED (the REST backfill starved HL's 5m…1w limiter —
-    # re-enable WS-only after stripping the backfill). No venue has it on right now.
-    assert load_config("hyperliquid").has_candle_ws is False
+    # T-015.1: HL runs the WS-only 1m candle feed; no other venue does (Binance/Bybit poll 1m via REST).
+    assert load_config("hyperliquid").has_candle_ws is True
     assert load_config("binance").has_candle_ws is False
     assert load_config("bybit").has_candle_ws is False
     assert load_config("coinbase").has_candle_ws is False
 
 
-def test_candle_ws_loop_sentinels_registered():
-    # T-015.1: both streamed-feed sentinels must be in LOOP_INTERVALS so the monitor staleness-checks
-    # them (and the api LOOP_TIMEFRAMES mirror derives from this — see test_api_loop_timeframes).
+def test_candle_ws_loop_sentinel_registered():
+    # T-015.1: the WS-only feed's sentinel must be in LOOP_INTERVALS so the monitor staleness-checks it
+    # (and the api LOOP_TIMEFRAMES mirror derives from this — see test_api_loop_timeframes).
     assert CANDLE_WS == "candle_ws"
-    assert CANDLE_BACKFILL == "candle_backfill"
     assert CANDLE_WS in LOOP_INTERVALS
-    assert CANDLE_BACKFILL in LOOP_INTERVALS
 
 
 def test_hl_1m_streamed_not_polled():
