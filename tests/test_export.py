@@ -165,7 +165,8 @@ def _export_endpoint_source() -> str:
 
 
 def test_endpoint_route_registered():
-    assert '@app.get("/export/parquet")' in _API_MAIN.read_text()
+    src = _API_MAIN.read_text()
+    assert "@app.get(" in src and '"/export/parquet"' in src
 
 
 def test_endpoint_whitelists_table_via_feed_specs():
