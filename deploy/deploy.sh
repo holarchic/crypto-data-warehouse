@@ -49,9 +49,9 @@ info "Pulling base images"
 $COMPOSE pull db
 
 info "Building application images"
-# Include profile-gated services (discovery) so they don't run stale code after
+# Include profile-gated services (discovery, liquidations-hl) so they don't run stale code after
 # a git pull — `compose build` alone skips anything behind a profile flag.
-$COMPOSE --profile discovery build
+$COMPOSE --profile discovery --profile liquidations-hl build
 
 info "Starting services"
 $COMPOSE up -d
@@ -82,6 +82,8 @@ NEW_CRON="$EXISTING_CRON
 0 2 * * * cd $PROJECT_DIR && $COMPOSE --profile discovery run --rm discovery >> /var/log/candle-collector-discovery.log 2>&1
 # candle-collector: daily backup (03:00 UTC)
 0 3 * * * cd $PROJECT_DIR && ./scripts/backup.sh >> /var/log/candle-collector-backup.log 2>&1
+# candle-collector: daily HL Grade-A liquidation pull (04:00 UTC — T-009.3)
+0 4 * * * cd $PROJECT_DIR && $COMPOSE --profile liquidations-hl run --rm liquidations-hl >> /var/log/candle-collector-liquidations-hl.log 2>&1
 # candle-collector: backup retention — delete dumps older than 7 days (03:30 UTC)
 30 3 * * * find $PROJECT_DIR/backups -name '*.dump' -mtime +7 -delete 2>/dev/null
 # candle-collector: host monitor (every 5 min)

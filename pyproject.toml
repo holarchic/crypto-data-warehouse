@@ -17,6 +17,8 @@ dependencies = [
     "fastapi>=0.115.0",
     "uvicorn[standard]>=0.34.0",
     "pyarrow>=17",  # T-011.1 /export/parquet — same lib the backtester reads the seed + hashes with
+    "boto3>=1.43.40",
+    "lz4>=4.4.5",
 ]
 
 [tool.pytest.ini_options]

@@ -67,6 +67,12 @@ services:
         limits:
           memory: 512m
 
+  liquidations-hl:
+    deploy:
+      resources:
+        limits:
+          memory: 512m
+
   api:
     ports: !override
       - "8000:8000"
