@@ -372,7 +372,16 @@ def get_status_gaps(
     return {"exchange": exchange, "timeframe": timeframe, "gaps": rows, "total": len(rows)}
 
 
-@app.get("/export/parquet")
+@app.get(
+    "/export/parquet",
+    response_class=Response,  # raw parquet bytes, not the default JSONResponse
+    responses={
+        200: {"content": {"application/vnd.apache.parquet": {}}, "description": "Parquet feed window"},
+        204: {"description": "No rows in the window — skip (the backtester hash rejects an empty feed)"},
+        400: {"description": "Unknown table, or naive/reversed bounds"},
+        413: {"description": "Window exceeds EXPORT_MAX_ROWS — narrow it or use the bulk export script"},
+    },
+)
 def export_parquet(
     table: str,
     start: datetime,
