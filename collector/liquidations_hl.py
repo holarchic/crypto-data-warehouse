@@ -188,6 +188,11 @@ def _emit_line(line: bytes, day: str, stats: dict):
         stats["bad_lines"] += 1
         return
     for addr, fill in fills:
+        # the fill must be a dict — a malformed payload (e.g. a string where a fill object is expected)
+        # is a counted skip at the boundary, not an AttributeError that fails the whole object.
+        if not isinstance(fill, dict):
+            stats["bad_lines"] += 1
+            continue
         row = _row(addr, fill, day, stats)
         if row is not None:
             yield row
@@ -250,16 +255,24 @@ def _stream_insert(s3, conn, key: str, day: str) -> tuple[int, int]:
 
 
 def _process_key(s3, conn, key: str, day: str):
-    """`_stream_insert` with a single DB-reconnect-and-retry on a dropped connection (a one-shot must
-    survive a mid-run db blip; a partial batch already committed is idempotent on retry). Returns
-    `(inserted, seen, conn)` — conn may be a fresh handle after a reconnect."""
+    """`_stream_insert` with a single reconnect-and-retry on a dropped connection (a one-shot must survive
+    a mid-run db blip; a partial batch already committed is idempotent on retry). Retries ONLY on an actual
+    connection loss (`conn.closed`) — a non-connection `OperationalError` (a server/query error) is
+    re-raised for `run()` to roll back and count, not reconnected. `connect_db` exhaustion raises
+    `RuntimeError` (DB down), which `run()` treats as run-fatal. Returns `(inserted, seen, conn)`."""
     try:
         ins, seen = _stream_insert(s3, conn, key, day)
         return ins, seen, conn
-    except psycopg.OperationalError as e:
-        log.warning("db connection lost on %s — reconnecting once and retrying: %s", key, e)
-        conn = connect_db(build_dsn())
-        ins, seen = _stream_insert(s3, conn, key, day)  # a second failure propagates → run() fails non-zero
+    except psycopg.OperationalError:
+        if not conn.closed:
+            raise  # transient non-connection DB error → run() rolls back + counts (don't reconnect)
+        log.warning("db connection lost on %s — reconnecting once and retrying", key)
+        try:
+            conn.close()  # release the broken handle before replacing it
+        except Exception:  # noqa: BLE001 — closing an already-broken conn must never mask the retry
+            pass
+        conn = connect_db(build_dsn())  # RuntimeError on exhaustion → run()'s run-fatal handler
+        ins, seen = _stream_insert(s3, conn, key, day)  # a second failure propagates → run() counts it
         return ins, seen, conn
 
 
@@ -277,9 +290,10 @@ def run(start: str, end: str) -> int:
     a clean run, 1 if any object failed (surfaced, not silently swallowed — the idempotent lookback
     re-pulls a failed day on the next run)."""
     s3 = _s3()
-    conn = connect_db(build_dsn())
+    conn = None
     total_ins = total_seen = failures = 0
     try:
+        conn = connect_db(build_dsn())
         for day in _daterange(start, end):
             keys = list_keys(s3, day)
             if len(keys) < 24:
@@ -292,8 +306,8 @@ def run(start: str, end: str) -> int:
                     day_seen += seen
                 except (psycopg.Error, BotoCoreError, ClientError) as e:
                     # Expected object-level failures (DB / S3) — isolate the bad object, DON'T abort the
-                    # run. A non-OperationalError DB error leaves the txn ABORTED, so recover the conn
-                    # (rollback / reconnect) before the next key, else every later key fails follow-on.
+                    # run. A non-connection DB error leaves the txn ABORTED, so recover the conn (rollback,
+                    # or reconnect if closed) before the next key, else every later key fails follow-on.
                     # A genuine logic bug (not one of these classes) propagates → aborts loudly.
                     log.error("FAIL %s: %s", key, e)
                     failures += 1
@@ -301,8 +315,17 @@ def run(start: str, end: str) -> int:
             log.info("day %s: %d inserted / %d events / %d objects", day, day_ins, day_seen, len(keys))
             total_ins += day_ins
             total_seen += day_seen
+    except RuntimeError as e:
+        # connect_db exhausted its retries (initial connect or a mid-run reconnect) → the DB is down,
+        # a run-fatal condition. Exit non-zero cleanly; the next cron run's lookback re-pulls.
+        log.error("DB unreachable — aborting run %s..%s: %s", start, end, e)
+        return 1
     finally:
-        conn.close()
+        if conn is not None:
+            try:
+                conn.close()
+            except Exception:  # noqa: BLE001 — a close failure must not mask the run's real exit code
+                pass
     log.info("DONE %s..%s: %d inserted / %d seen / %d object failures", start, end, total_ins, total_seen, failures)
     return 1 if failures else 0
 
