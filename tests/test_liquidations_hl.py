@@ -8,6 +8,7 @@ these tests don't exercise); `lz4` is real so the streaming path is genuinely ex
 import datetime as dt
 import json
 from datetime import timezone
+from unittest.mock import MagicMock
 
 import liquidations_hl as hl
 import lz4.frame
@@ -210,6 +211,26 @@ def test_connect_converts_retry_exhaustion_to_db_unavailable(monkeypatch):
     except hl._DBUnavailable:
         return
     raise AssertionError("expected _DBUnavailable from connect_db exhaustion")
+
+
+# ---- run() exit-code semantics ----
+
+
+def _run_with(monkeypatch, n_keys: int):
+    monkeypatch.setattr(hl, "_s3", lambda: object())
+    monkeypatch.setattr(hl, "build_dsn", lambda: "dsn")
+    monkeypatch.setattr(hl, "connect_db", lambda dsn: MagicMock(closed=False))
+    monkeypatch.setattr(hl, "list_keys", lambda s3, day: [f"{day}/{h}.lz4" for h in range(n_keys)])
+    monkeypatch.setattr(hl, "_process_key", lambda s3, conn, key, day: (0, 0, conn))  # no per-key failures
+    return hl.run("20260705", "20260705")
+
+
+def test_complete_day_clean_run_returns_zero(monkeypatch):
+    assert _run_with(monkeypatch, 24) == 0  # 24 hourly objects, no failures → exit 0
+
+
+def test_incomplete_day_counts_as_failure(monkeypatch):
+    assert _run_with(monkeypatch, 23) == 1  # <24 objects → surfaced via non-zero exit, not a silent 0
 
 
 # ---- INSERT SQL contract ----
