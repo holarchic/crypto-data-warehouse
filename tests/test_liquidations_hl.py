@@ -126,12 +126,17 @@ def test_prefix_for_cutover():
 
 
 class _FakeBody:
-    def __init__(self, data: bytes):
+    """Emits FIXED small chunks regardless of the requested `chunk_size`, so a JSON line spans several
+    chunks — exercising `extract_rows`' rolling-buffer line split across chunk boundaries (mirrors S3
+    returning arbitrary small reads)."""
+
+    def __init__(self, data: bytes, emit_chunk: int = 16):
         self._data = data
+        self._emit = emit_chunk
 
     def iter_chunks(self, chunk_size):
-        for i in range(0, len(self._data), chunk_size):
-            yield self._data[i : i + chunk_size]
+        for i in range(0, len(self._data), self._emit):
+            yield self._data[i : i + self._emit]
 
 
 def test_extract_rows_streams_lz4_and_emits_liquidated_side_only():
@@ -142,11 +147,23 @@ def test_extract_rows_streams_lz4_and_emits_liquidated_side_only():
         json.dumps({"events": [["0xLIQ", _liq_fill(coin="SOL", dir="Close Short", oid=2, tid=2)]]}),  # by-block
     ]
     raw = ("\n".join(lines) + "\n").encode()
-    body = _FakeBody(lz4.frame.compress(raw))
+    body = _FakeBody(lz4.frame.compress(raw))  # 16-byte chunks force line splits across boundaries
     rows = list(hl.extract_rows(body, "20260705"))
     assert len(rows) == 2
     assert {r["asset_id"] for r in rows} == {"BTC", "SOL"}
     assert next(r for r in rows if r["asset_id"] == "SOL")["liquidated_side"] == "short"
+
+
+def test_malformed_fill_shape_is_counted_not_raised():
+    # a non-dict fill in each format must be a counted bad-line skip, never an AttributeError.
+    raw = (
+        json.dumps(["0xA", "not-a-dict-fill"]) + "\n"  # legacy, bad fill
+        + json.dumps({"events": [["0xB", 12345]]}) + "\n"  # by-block, bad fill
+    ).encode()
+    stats = hl._new_stats()
+    rows = list(hl.extract_rows(_FakeBody(lz4.frame.compress(raw)), "20260705", stats))
+    assert rows == []
+    assert stats["bad_lines"] == 2
 
 
 # ---- INSERT SQL contract ----
