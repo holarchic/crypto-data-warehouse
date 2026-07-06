@@ -103,10 +103,15 @@ def list_keys(s3, day: str) -> list[str]:
 
 
 def _iter_fills(line: bytes):
-    """Yield `(address, fill)` from a tape line in either on-disk format."""
+    """Yield `(address, fill)` from a tape line in either on-disk format. A by-block dict MUST carry an
+    `events` list — a dict without one is format drift and raises (the caller counts it as a bad line),
+    NOT a silent zero-row drop that would lose a whole block with no anomaly signal."""
     rec = json.loads(line)
     if isinstance(rec, dict):  # by-block
-        for ev in rec.get("events", []):
+        events = rec.get("events")
+        if not isinstance(events, list):
+            raise ValueError("by-block record missing an 'events' list")
+        for ev in events:
             yield ev[0], ev[1]
     else:  # legacy
         yield rec[0], rec[1]
@@ -162,6 +167,11 @@ def _row(addr: str, fill: dict, day: str, stats: dict | None = None) -> dict | N
         stats["side_fallback"] += 1  # dir was unexpected; liquidated_side came from the side fallback
     return {
         "ts": ts_ms / 1000.0,  # epoch SECONDS for to_timestamp — NOT ms
+        # asset_id is the HL-NATIVE coin (`kPEPE`/`kSHIB`), stored verbatim — NOT canonicalized to the
+        # ccxt-uppercase form. `liquidations` deliberately mirrors the seed's `coin` (SPEC:240/247, same
+        # convention as `hl_asset_ctxs`), so the T-011 export is a passthrough of hl-liquidations.parquet;
+        # canonicalizing here would break that byte-contract. (`open_interest` uses the canonical form —
+        # a documented per-table divergence, SPEC:441. Nothing joins liquidations cross-venue on asset_id.)
         "asset_id": coin,
         "liquidated_side": ls,
         "side": fill.get("side"),
@@ -184,7 +194,7 @@ def _emit_line(line: bytes, day: str, stats: dict):
     generic exception that would fail the whole object."""
     try:
         fills = list(_iter_fills(line))
-    except (json.JSONDecodeError, IndexError, KeyError, TypeError):
+    except (ValueError, IndexError, KeyError, TypeError):  # ValueError covers JSONDecodeError + drift
         stats["bad_lines"] += 1
         return
     for addr, fill in fills:
