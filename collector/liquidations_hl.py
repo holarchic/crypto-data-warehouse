@@ -264,12 +264,28 @@ def _stream_insert(s3, conn, key: str, day: str) -> tuple[int, int]:
     return inserted, seen
 
 
+class _DBUnavailable(Exception):
+    """The DB could not be reached (connect_db exhausted its retries) — a run-fatal condition, distinct
+    from an object-level failure. A dedicated type so `run()` classifies a DB outage separately from a
+    per-object `RuntimeError` (e.g. a corrupt lz4 frame), which must NOT be mislabelled as DB-down."""
+
+
+def _connect():
+    """`connect_db(build_dsn())`, converting its retry-exhaustion `RuntimeError` into `_DBUnavailable`
+    so the run-fatal DB-down path is a distinct, catchable type (not conflated with a corrupt-object
+    `RuntimeError` that should be a counted per-object failure)."""
+    try:
+        return connect_db(build_dsn())
+    except RuntimeError as e:
+        raise _DBUnavailable(str(e)) from e
+
+
 def _process_key(s3, conn, key: str, day: str):
     """`_stream_insert` with a single reconnect-and-retry on a dropped connection (a one-shot must survive
     a mid-run db blip; a partial batch already committed is idempotent on retry). Retries ONLY on an actual
     connection loss (`conn.closed`) — a non-connection `OperationalError` (a server/query error) is
-    re-raised for `run()` to roll back and count, not reconnected. `connect_db` exhaustion raises
-    `RuntimeError` (DB down), which `run()` treats as run-fatal. Returns `(inserted, seen, conn)`."""
+    re-raised for `run()` to roll back and count, not reconnected. Reconnect exhaustion raises
+    `_DBUnavailable` (run-fatal). Returns `(inserted, seen, conn)`."""
     try:
         ins, seen = _stream_insert(s3, conn, key, day)
         return ins, seen, conn
@@ -281,7 +297,7 @@ def _process_key(s3, conn, key: str, day: str):
             conn.close()  # release the broken handle before replacing it
         except Exception:  # noqa: BLE001 — closing an already-broken conn must never mask the retry
             pass
-        conn = connect_db(build_dsn())  # RuntimeError on exhaustion → run()'s run-fatal handler
+        conn = _connect()  # exhaustion → _DBUnavailable → run()'s run-fatal handler
         ins, seen = _stream_insert(s3, conn, key, day)  # a second failure propagates → run() counts it
         return ins, seen, conn
 
@@ -290,7 +306,7 @@ def _recover_conn(conn):
     """After an object-level DB failure, return a usable connection for the next key: a fresh one if the
     connection dropped, else the same one with its aborted transaction rolled back."""
     if conn.closed:
-        return connect_db(build_dsn())
+        return _connect()
     safe_rollback(conn)
     return conn
 
@@ -303,9 +319,16 @@ def run(start: str, end: str) -> int:
     conn = None
     total_ins = total_seen = failures = 0
     try:
-        conn = connect_db(build_dsn())
+        conn = _connect()
         for day in _daterange(start, end):
-            keys = list_keys(s3, day)
+            try:
+                keys = list_keys(s3, day)
+            except (BotoCoreError, ClientError) as e:
+                # A day-level S3 listing failure is an object-level (per-day) failure — count it and move
+                # to the next day, don't abort the whole run + remaining lookback days.
+                log.error("FAIL listing day %s: %s", day, e)
+                failures += 1
+                continue
             if len(keys) < 24:
                 log.warning("day %s lists %d hourly objects (<24) — may be upstream-partial", day, len(keys))
             day_ins = day_seen = 0
@@ -314,18 +337,19 @@ def run(start: str, end: str) -> int:
                     ins, seen, conn = _process_key(s3, conn, key, day)
                     day_ins += ins
                     day_seen += seen
-                except (psycopg.Error, BotoCoreError, ClientError) as e:
-                    # Expected object-level failures (DB / S3) — isolate the bad object, DON'T abort the
-                    # run. A non-connection DB error leaves the txn ABORTED, so recover the conn (rollback,
-                    # or reconnect if closed) before the next key, else every later key fails follow-on.
-                    # A genuine logic bug (not one of these classes) propagates → aborts loudly.
+                except (psycopg.Error, BotoCoreError, ClientError, RuntimeError) as e:
+                    # Expected object-level failures — isolate the bad object, DON'T abort the run:
+                    # DB errors (a non-connection error leaves the txn ABORTED → recover the conn before
+                    # the next key), S3 GETs, and a corrupt lz4 frame (`RuntimeError`). A run-fatal DB
+                    # outage is `_DBUnavailable` (not caught here → handled below); a genuine logic bug
+                    # (TypeError/KeyError/…) propagates → aborts loudly.
                     log.error("FAIL %s: %s", key, e)
                     failures += 1
                     conn = _recover_conn(conn)
             log.info("day %s: %d inserted / %d events / %d objects", day, day_ins, day_seen, len(keys))
             total_ins += day_ins
             total_seen += day_seen
-    except RuntimeError as e:
+    except _DBUnavailable as e:
         # connect_db exhausted its retries (initial connect or a mid-run reconnect) → the DB is down,
         # a run-fatal condition. Exit non-zero cleanly; the next cron run's lookback re-pulls.
         log.error("DB unreachable — aborting run %s..%s: %s", start, end, e)

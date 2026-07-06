@@ -181,6 +181,37 @@ def test_malformed_fill_shape_is_counted_not_raised():
     assert stats["bad_lines"] == 2
 
 
+# ---- error classification ----
+
+
+def test_corrupt_lz4_raises_runtimeerror_not_db_unavailable():
+    # a corrupt object is an object-level failure (run() counts it + continues) — it must surface as a
+    # RuntimeError, NOT be misclassified as the run-fatal _DBUnavailable (DB-down) path.
+    body = _FakeBody(b"this is not a valid lz4 frame at all")
+    try:
+        list(hl.extract_rows(body, "20260705"))
+    except hl._DBUnavailable:
+        raise AssertionError("a corrupt lz4 object must not be classified as DB-unavailable")
+    except RuntimeError:
+        return
+    raise AssertionError("expected a RuntimeError from a corrupt lz4 frame")
+
+
+def test_connect_converts_retry_exhaustion_to_db_unavailable(monkeypatch):
+    def _boom(_dsn):
+        raise RuntimeError("connect retries exhausted")
+
+    # Patch build_dsn too so the test is self-contained (build_dsn reads os.environ; whether the db
+    # module is stubbed leaks across the suite — the conftest-isolation fragility).
+    monkeypatch.setattr(hl, "build_dsn", lambda: "dummy-dsn")
+    monkeypatch.setattr(hl, "connect_db", _boom)
+    try:
+        hl._connect()
+    except hl._DBUnavailable:
+        return
+    raise AssertionError("expected _DBUnavailable from connect_db exhaustion")
+
+
 # ---- INSERT SQL contract ----
 
 
