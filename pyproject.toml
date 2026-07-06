@@ -16,6 +16,7 @@ dependencies = [
     "websocket-client>=1.8",  # T-009.1 WS collector infra (collector/ws.py)
     "fastapi>=0.115.0",
     "uvicorn[standard]>=0.34.0",
+    "pyarrow>=17",  # T-011.1 /export/parquet — same lib the backtester reads the seed + hashes with
 ]
 
 [tool.pytest.ini_options]

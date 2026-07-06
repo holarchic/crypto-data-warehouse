@@ -1,9 +1,12 @@
 import os
 from contextlib import asynccontextmanager
 from datetime import datetime
+from io import BytesIO
 
+import export
 from dotenv import load_dotenv
-from fastapi import FastAPI, Query
+from fastapi import FastAPI, HTTPException, Query
+from fastapi.responses import Response, StreamingResponse
 from psycopg.rows import dict_row
 from psycopg_pool import ConnectionPool
 
@@ -368,3 +371,61 @@ def get_status_gaps(
                 row[key] = row[key].isoformat()
 
     return {"exchange": exchange, "timeframe": timeframe, "gaps": rows, "total": len(rows)}
+
+
+@app.get("/export/parquet")
+def export_parquet(
+    table: str,
+    start: datetime,
+    end: datetime,
+    asset_id: str | None = None,
+):
+    # Forward-feed parquet export for the backtester's T-031 ingest (T-011.1). Thin wrapper: validate →
+    # parameterized range query → api/export.py owns the byte-contract (schema + NULL→NaN). `table`,
+    # its columns, and `ts_col` come from the FEED_SPECS literal (never user input), so they are safe
+    # to interpolate — same trust model as `_candle_table`; only values are parameterized.
+    spec = export.FEED_SPECS.get(table)
+    if spec is None:
+        raise HTTPException(status_code=400, detail=f"unknown table {table!r}; valid: {sorted(export.FEED_SPECS)}")
+    # TIMESTAMPTZ boundaries: a naive datetime would be read against the session tz and silently shift
+    # the window (a byte-contract hazard) — require tz-aware UTC.
+    if start.tzinfo is None or end.tzinfo is None:
+        raise HTTPException(status_code=400, detail="start and end must be timezone-aware (UTC)")
+    if start >= end:
+        raise HTTPException(status_code=400, detail="start must be < end")
+
+    cols = ", ".join(export.select_columns(table))
+    # Half-open [start, end): `< end` (NOT `<= end`) so consecutive windows never double-count the
+    # seam row — the backtester's row-content hash is duplicate-sensitive.
+    conditions = [f"{spec.ts_col} >= %(start)s", f"{spec.ts_col} < %(end)s"]
+    params: dict = {"start": start, "end": end, "limit": export.EXPORT_MAX_ROWS + 1}
+    if spec.venue_col is not None:
+        conditions.append(f"{spec.venue_col} = %(venue)s")
+        params["venue"] = spec.venue
+    if asset_id is not None:
+        conditions.append("asset_id = %(asset_id)s")
+        params["asset_id"] = asset_id
+    where = " AND ".join(conditions)
+    query = f"SELECT {cols} FROM {spec.db_table} WHERE {where} ORDER BY {spec.ts_col} LIMIT %(limit)s"
+
+    with pool.connection() as conn:
+        rows = conn.execute(query, params).fetchall()
+
+    # Reject (don't truncate) an over-cap window — a truncated parquet is a broken feed.
+    if len(rows) > export.EXPORT_MAX_ROWS:
+        raise HTTPException(
+            status_code=413,
+            detail=f"window too large (> {export.EXPORT_MAX_ROWS} rows) — narrow the range or use the bulk export script",
+        )
+    # Zero-row window → 204, NOT an empty parquet: the backtester's structural hash rejects an empty feed
+    # ("empty feed (no rows)"), so cc must not emit a hashable-but-empty file. 204 = "no data, skip".
+    if not rows:
+        return Response(status_code=204)
+
+    data = export.rows_to_parquet(table, rows)
+    filename = f"{table}_{start.date()}_{end.date()}.parquet"
+    return StreamingResponse(
+        BytesIO(data),
+        media_type="application/vnd.apache.parquet",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )

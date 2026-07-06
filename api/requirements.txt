@@ -3,3 +3,4 @@ uvicorn[standard]>=0.34.0
 psycopg>=3.2
 psycopg_pool>=3.2
 python-dotenv>=1.0.0
+pyarrow>=17
