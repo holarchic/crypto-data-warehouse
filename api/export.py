@@ -38,6 +38,7 @@ _ARROW_BY_KIND: dict[str, pa.DataType] = {
     "string": pa.string(),
     "epoch_ms": pa.int64(),  # cc timestamptz -> floor-to-ms epoch int64
     "float": pa.float64(),  # SQL NULL -> NaN value
+    "native_symbol": pa.string(),  # ccxt symbol -> exchange-native (BTC/USDT:USDT -> BTCUSDT)
 }
 
 
@@ -66,6 +67,8 @@ class FeedSpec:
     columns: tuple[Column, ...]  # seed order
     venue_col: str | None = None
     venue: str | None = None
+    symbol_like: str | None = None  # SQL LIKE on `symbol` to restrict to the seed universe (e.g.
+    #                                 binance OI seed is USDT-perps only, cc also holds USDC/coin-margined)
 
 
 # hl_asset_ctxs -> the backtester's hl-asset-ctxs.parquet seed. Column names/types verified 2026-07-06
@@ -91,8 +94,29 @@ _HL_ASSET_CTXS = FeedSpec(
     ),
 )
 
+# open_interest (binance USDT-perps) -> the backtester's binance-oi-metrics.parquet seed. Seed coin is the
+# Binance-**native** symbol (`BTCUSDT`, `1000PEPEUSDT` — the `1000×` prefix, not HL's `k`), verified
+# all-USDT across the seed's 694 coins, so cc's ccxt `symbol` is transformed to native (strip settle +
+# slash). Filter: exchange='binance' AND USDT-perp symbols only — cc also collects USDC/coin-margined OI
+# which the seed excludes, so `symbol_like` restricts to the seed universe. timestamp -> create_time_ms
+# (epoch-ms); open_interest -> sum_open_interest; oi_value_usd -> sum_open_interest_value.
+_BINANCE_OI = FeedSpec(
+    db_table="open_interest",
+    ts_col="timestamp",
+    columns=(
+        Column("coin", "symbol", "native_symbol"),
+        Column("create_time_ms", "timestamp", "epoch_ms"),
+        Column("sum_open_interest", "open_interest", "float"),
+        Column("sum_open_interest_value", "oi_value_usd", "float"),
+    ),
+    venue_col="exchange",
+    venue="binance",
+    symbol_like="%/USDT:USDT",
+)
+
 FEED_SPECS: dict[str, FeedSpec] = {
     "hl_asset_ctxs": _HL_ASSET_CTXS,
+    "binance_oi": _BINANCE_OI,
 }
 
 
@@ -120,6 +144,9 @@ def _column_array(col: Column, rows: list[dict]) -> pa.Array:
     would corrupt a legitimate 0.0."""
     if col.kind == "string":
         return pa.array([row[col.cc] for row in rows], type=col.arrow)
+    if col.kind == "native_symbol":
+        # ccxt symbol -> exchange-native: BTC/USDT:USDT -> BTCUSDT (drop the :settle, then the /).
+        return pa.array([row[col.cc].split(":")[0].replace("/", "") for row in rows], type=col.arrow)
     if col.kind == "epoch_ms":
         return pa.array([_to_ms(row[col.cc]) for row in rows], type=col.arrow)
     if col.kind == "float":

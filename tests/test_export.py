@@ -148,6 +148,54 @@ def test_unknown_column_kind_fails_closed():
     raise AssertionError("expected ValueError on an unknown column kind")
 
 
+# ---- binance_oi feed (open_interest -> binance-oi-metrics seed) ----
+
+# The real binance-oi-metrics.parquet schema (140,033,320 rows, 694 all-USDT coins), read-verified
+# 2026-07-06. coin is the Binance-native symbol; cc derives it from the ccxt `symbol` column.
+_OI_SEED_SCHEMA = pa.schema(
+    [
+        ("coin", pa.string()),
+        ("create_time_ms", pa.int64()),
+        ("sum_open_interest", pa.float64()),
+        ("sum_open_interest_value", pa.float64()),
+    ]
+)
+
+
+def _oi_row(**overrides) -> dict:
+    row = {
+        "symbol": "BTC/USDT:USDT",
+        "timestamp": datetime(2026, 7, 6, 12, 0, 0, tzinfo=timezone.utc),
+        "open_interest": 12345.0,
+        "oi_value_usd": 5.4e8,
+    }
+    row.update(overrides)
+    return row
+
+
+def test_binance_oi_feed_schema_matches_seed():
+    assert export.feed_schema("binance_oi").equals(_OI_SEED_SCHEMA)
+
+
+def test_binance_oi_select_columns_are_cc_names():
+    # coin derives from `symbol` (native transform), so the SELECT pulls symbol, not asset_id.
+    assert export.select_columns("binance_oi") == ["symbol", "timestamp", "open_interest", "oi_value_usd"]
+
+
+def test_native_symbol_transform_ccxt_to_binance_native():
+    data = export.rows_to_parquet(
+        "binance_oi", [_oi_row(symbol="BTC/USDT:USDT"), _oi_row(symbol="1000PEPE/USDT:USDT")]
+    )
+    # BTC/USDT:USDT -> BTCUSDT ; 1000PEPE/USDT:USDT -> 1000PEPEUSDT (matches the seed's native coins).
+    assert _read(data).column("coin").to_pylist() == ["BTCUSDT", "1000PEPEUSDT"]
+
+
+def test_binance_oi_roundtrip_schema_and_ms():
+    t = _read(export.rows_to_parquet("binance_oi", [_oi_row()]))
+    assert t.schema.equals(_OI_SEED_SCHEMA)
+    assert t.column("create_time_ms").to_pylist()[0] == int(_oi_row()["timestamp"].timestamp()) * 1000
+
+
 # ---- endpoint source pins (ast — api/main.py can't import under the collector harness) ----
 
 _API_MAIN = Path(__file__).resolve().parents[1] / "api" / "main.py"
@@ -207,3 +255,9 @@ def test_endpoint_caps_rows_with_413():
     body = _export_endpoint_source()
     assert "EXPORT_MAX_ROWS" in body
     assert "status_code=413" in body
+
+
+def test_endpoint_applies_symbol_like_universe_filter():
+    # a feed with `symbol_like` (binance_oi) restricts to the seed universe via a parameterized LIKE.
+    body = _export_endpoint_source()
+    assert "symbol LIKE %(symbol_like)s" in body

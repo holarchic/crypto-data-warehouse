@@ -414,6 +414,10 @@ def export_parquet(
     if spec.venue_col is not None:
         conditions.append(f"{spec.venue_col} = %(venue)s")
         params["venue"] = spec.venue
+    if spec.symbol_like is not None:
+        # Restrict to the seed's universe (e.g. binance OI seed is USDT-perps only).
+        conditions.append("symbol LIKE %(symbol_like)s")
+        params["symbol_like"] = spec.symbol_like
     if asset_id is not None:
         conditions.append("asset_id = %(asset_id)s")
         params["asset_id"] = asset_id
