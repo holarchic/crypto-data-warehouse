@@ -98,6 +98,16 @@ def test_bad_magnitude_lands_null():
     assert r is not None and r["px"] is None  # magnitude → NULL, row still lands
 
 
+def test_anomalies_counted_in_stats_not_logged_per_row():
+    stats = hl._new_stats()
+    hl._row("0xLIQ", _liq_fill(oid=None), "20260705", stats)  # malformed identity → dropped
+    assert stats["dropped"] == 1
+    list(hl._emit_line(b"{ not valid json", "20260705", stats))  # malformed line → bad_lines (no raise)
+    assert stats["bad_lines"] == 1
+    hl._row("0xLIQ", _liq_fill(dir="", side="A"), "20260705", stats)  # dir blank → side fallback used
+    assert stats["side_fallback"] == 1
+
+
 # ---- day selection + cutover ----
 
 
