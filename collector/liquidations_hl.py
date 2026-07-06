@@ -29,8 +29,9 @@ import boto3
 import lz4.frame
 import psycopg
 from botocore.config import Config
+from botocore.exceptions import BotoCoreError, ClientError
 
-from db import build_dsn, connect_db
+from db import build_dsn, connect_db, safe_rollback
 
 log = logging.getLogger(__name__)
 
@@ -127,37 +128,42 @@ def _int_or_none(x):
 
 
 def _liquidated_side(dir_: str, side: str) -> str | None:
-    """Normalized `long`/`short` from `dir` (authoritative); `side` is a logged-anomaly fallback."""
+    """Normalized `long`/`short` from `dir` (authoritative); `side` is a fallback (anomaly-counted by
+    the caller). Pure — no logging in this per-row helper."""
     if dir_ == "Close Long":
         return "long"
     if dir_ == "Close Short":
         return "short"
-    fb = _SIDE_FALLBACK.get(side)
-    if fb is not None:
-        log.warning("liquidated_side fell back to side=%r (dir=%r) — unexpected node_fills shape", side, dir_)
-    return fb
+    return _SIDE_FALLBACK.get(side)
 
 
-def _row(addr: str, fill: dict, day: str) -> dict | None:
+def _row(addr: str, fill: dict, day: str, stats: dict | None = None) -> dict | None:
     """A cc-shaped row from the LIQUIDATED-side fill, or None if this fill is not the liquidated side
-    or a required identity field is missing. `oid`/`tid` are DROP-not-default: they are the dedup key,
-    so a missing one is dropped as malformed (never `0`, which would collide two events)."""
+    (expected — the counterparty carries the same liquidation) or a required identity field is missing.
+    `oid`/`tid` are DROP-not-default: they are the dedup key, so a missing one is dropped as malformed
+    (never `0`, which would collide two events). Anomalies increment `stats` (summarized once per object,
+    not logged per row); a throwaway is used when None."""
+    if stats is None:
+        stats = _new_stats()
     liq = fill.get("liquidation")
     if not isinstance(liq, dict) or liq.get("liquidatedUser") != addr:
-        return None  # counterparty side, or not a liquidation
+        return None  # counterparty side, or not a liquidation — expected, not an anomaly
     ts_ms = _int_or_none(fill.get("time"))
     coin = fill.get("coin")
     oid = _int_or_none(fill.get("oid"))
     tid = _int_or_none(fill.get("tid"))
     if ts_ms is None or not coin or oid is None or tid is None:
-        log.warning("dropping malformed liquidation fill: coin=%r oid=%r tid=%r time=%r",
-                    coin, fill.get("oid"), fill.get("tid"), fill.get("time"))
+        stats["dropped"] += 1
         return None
     dir_ = fill.get("dir", "")
+    side = fill.get("side", "")
+    ls = _liquidated_side(dir_, side)
+    if ls is not None and dir_ not in ("Close Long", "Close Short"):
+        stats["side_fallback"] += 1  # dir was unexpected; liquidated_side came from the side fallback
     return {
         "ts": ts_ms / 1000.0,  # epoch SECONDS for to_timestamp — NOT ms
         "asset_id": coin,
-        "liquidated_side": _liquidated_side(dir_, fill.get("side", "")),
+        "liquidated_side": ls,
         "side": fill.get("side"),
         "dir": dir_ or None,
         "px": _num(fill.get("px")),
@@ -172,9 +178,27 @@ def _row(addr: str, fill: dict, day: str) -> dict | None:
     }
 
 
-def extract_rows(body, day: str):
+def _emit_line(line: bytes, day: str, stats: dict):
+    """Parse ONE tape line at the boundary (parse-don't-validate) and yield its liquidated-side rows.
+    A malformed line (bad JSON / unexpected shape) is a classified skip — counted in `stats`, never a
+    generic exception that would fail the whole object."""
+    try:
+        fills = list(_iter_fills(line))
+    except (json.JSONDecodeError, IndexError, KeyError, TypeError):
+        stats["bad_lines"] += 1
+        return
+    for addr, fill in fills:
+        row = _row(addr, fill, day, stats)
+        if row is not None:
+            yield row
+
+
+def extract_rows(body, day: str, stats: dict | None = None):
     """Stream-decompress one hourly object body, yielding cc-shaped liquidated-side rows. The rolling
-    buffer keeps at most one partial line resident, so a peak hour's raw fills never land whole."""
+    buffer keeps at most one partial line resident, so a peak hour's raw fills never land whole. `stats`
+    (a mutable counter dict) accrues per-object anomalies; a throwaway is used when None."""
+    if stats is None:
+        stats = _new_stats()
     dctx = lz4.frame.LZ4FrameDecompressor()
     buf = b""
     for chunk in body.iter_chunks(chunk_size=1 << 20):
@@ -183,24 +207,23 @@ def extract_rows(body, day: str):
         nl = buf.find(b"\n")
         while nl != -1:
             if nl > start:
-                for addr, fill in _iter_fills(buf[start:nl]):
-                    row = _row(addr, fill, day)
-                    if row is not None:
-                        yield row
+                yield from _emit_line(buf[start:nl], day, stats)
             start = nl + 1
             nl = buf.find(b"\n", start)
         buf = buf[start:]
     if buf.strip():
-        for addr, fill in _iter_fills(buf):
-            row = _row(addr, fill, day)
-            if row is not None:
-                yield row
+        yield from _emit_line(buf, day, stats)
+
+
+def _new_stats() -> dict:
+    return {"dropped": 0, "side_fallback": 0, "bad_lines": 0}
 
 
 def _stream_insert(s3, conn, key: str, day: str) -> tuple[int, int]:
     """GET + stream-extract one hourly object, flushing inserts in `BATCH_SIZE` chunks. Returns
     `(inserted, seen)`. Raises on a DB error (caller reconnects/retries)."""
     body = s3.get_object(Bucket=BUCKET, Key=key, RequestPayer="requester")["Body"]
+    stats = _new_stats()
     inserted = seen = 0
     batch: list[dict] = []
 
@@ -214,12 +237,15 @@ def _stream_insert(s3, conn, key: str, day: str) -> tuple[int, int]:
         conn.commit()
         batch.clear()
 
-    for row in extract_rows(body, day):
+    for row in extract_rows(body, day, stats):
         seen += 1
         batch.append(row)
         if len(batch) >= BATCH_SIZE:
             flush()
     flush()
+    if any(stats.values()):
+        log.info("anomalies key=%s dropped=%d side_fallback=%d bad_lines=%d",
+                 key, stats["dropped"], stats["side_fallback"], stats["bad_lines"])
     return inserted, seen
 
 
@@ -235,6 +261,15 @@ def _process_key(s3, conn, key: str, day: str):
         conn = connect_db(build_dsn())
         ins, seen = _stream_insert(s3, conn, key, day)  # a second failure propagates → run() fails non-zero
         return ins, seen, conn
+
+
+def _recover_conn(conn):
+    """After an object-level DB failure, return a usable connection for the next key: a fresh one if the
+    connection dropped, else the same one with its aborted transaction rolled back."""
+    if conn.closed:
+        return connect_db(build_dsn())
+    safe_rollback(conn)
+    return conn
 
 
 def run(start: str, end: str) -> int:
@@ -255,9 +290,14 @@ def run(start: str, end: str) -> int:
                     ins, seen, conn = _process_key(s3, conn, key, day)
                     day_ins += ins
                     day_seen += seen
-                except Exception as e:  # noqa: BLE001 — one bad object must not abort the run; counted + surfaced
+                except (psycopg.Error, BotoCoreError, ClientError) as e:
+                    # Expected object-level failures (DB / S3) — isolate the bad object, DON'T abort the
+                    # run. A non-OperationalError DB error leaves the txn ABORTED, so recover the conn
+                    # (rollback / reconnect) before the next key, else every later key fails follow-on.
+                    # A genuine logic bug (not one of these classes) propagates → aborts loudly.
                     log.error("FAIL %s: %s", key, e)
                     failures += 1
+                    conn = _recover_conn(conn)
             log.info("day %s: %d inserted / %d events / %d objects", day, day_ins, day_seen, len(keys))
             total_ins += day_ins
             total_seen += day_seen
