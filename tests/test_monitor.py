@@ -402,6 +402,32 @@ def test_compute_alarming_error_channel_catches_never_succeeded_bug():
     assert alarming[0]["symbol"] == "AAPL/USDT:USDT"
 
 
+def test_compute_alarming_excludes_transient_single_error():
+    """A healthy collector with a recent success and one transient error (e.g. a bybit
+    rate-limit blip that backfills losslessly) is NOT alarming — error_count=1 < threshold."""
+    rows = [{"exchange": "bybit", "symbol": "ARB/USDT:USDT", "timeframe": "1h",
+             "seconds_since_success": 60, "error_count": 1}]
+    assert compute_alarming(rows, TF_INTERVALS) == []
+
+
+def test_compute_alarming_error_channel_gate_is_at_threshold():
+    """Error channel fires at exactly error_threshold consecutive errors, not below."""
+    below = [{"exchange": "bybit", "symbol": "X/USDT:USDT", "timeframe": "5m",
+              "seconds_since_success": 60, "error_count": 2}]
+    at = [{"exchange": "bybit", "symbol": "X/USDT:USDT", "timeframe": "5m",
+           "seconds_since_success": 60, "error_count": 3}]
+    assert compute_alarming(below, TF_INTERVALS, error_threshold=3) == []
+    assert len(compute_alarming(at, TF_INTERVALS, error_threshold=3)) == 1
+
+
+def test_compute_alarming_error_threshold_is_configurable():
+    """A stricter threshold suppresses a mid-count collector; a looser one catches it."""
+    rows = [{"exchange": "bybit", "symbol": "X/USDT:USDT", "timeframe": "5m",
+             "seconds_since_success": 60, "error_count": 3}]
+    assert compute_alarming(rows, TF_INTERVALS, error_threshold=5) == []
+    assert len(compute_alarming(rows, TF_INTERVALS, error_threshold=2)) == 1
+
+
 def test_compute_alarming_time_channel_catches_gone_dark():
     """A previously-working collector gone dark past 4×interval (3000 > 1200), no errors."""
     rows = [{"exchange": "okx", "symbol": "ETH/USDT:USDT", "timeframe": "5m",
