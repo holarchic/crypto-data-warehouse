@@ -54,18 +54,24 @@ def compute_staleness(status_rows, timeframe_intervals):
     return stale
 
 
-def compute_alarming(status_rows, timeframe_intervals):
+def compute_alarming(status_rows, timeframe_intervals, error_threshold=3):
     """Candle collectors that are *alarming-stale* — the high-signal subset of staleness.
 
     Two channels, deliberately NOT a plain staleness filter (see SPEC Decision):
-      - error channel (`error_count > 0`): catches the new-symbol stuck-collector class, whose
-        rows never succeeded (`last_success` NULL → `seconds_since_success` NULL) — a lone
-        time gate would miss them.
+      - error channel (`error_count >= error_threshold`): catches the stuck-collector class,
+        whose rows fail every fetch and so never succeed (`last_success` NULL → `seconds_since_success`
+        NULL) — a lone time gate would miss them. `error_count` is CONSECUTIVE errors (reset to 0 on
+        any success), so the threshold gate separates a genuinely stuck collector (count climbs
+        monotonically) from a transient blip: a rate-limit wave (e.g. bybit `retCode 10006` when many
+        timeframe boundaries align) bumps hundreds of healthy pairs to `error_count=1` for a single
+        cycle, then clears on their next success. Gating at `>0` counted that wave as alarming and
+        paged on backfilled-losslessly noise (measured spikes to 356); `>=3` requires sustained
+        failure, restoring the design's baseline≈0 assumption.
       - time channel (`seconds_since_success > 4×interval`): a previously-working collector gone
         dark, past a gate well above the within-cycle collection cursor.
-    Excludes the benign new-listing floor (no errors, never succeeded) and the sub-4×interval
-    cursor. Loop-heartbeat pseudo-TFs are skipped — they page via their own presence alert and a
-    single dead loop must not pad this count.
+    Excludes the benign new-listing floor (no errors, never succeeded), the sub-4×interval cursor,
+    and the transient single-error blip. Loop-heartbeat pseudo-TFs are skipped — they page via their
+    own presence alert and a single dead loop must not pad this count.
     """
     alarming = []
     for row in status_rows:
@@ -76,7 +82,7 @@ def compute_alarming(status_rows, timeframe_intervals):
         if interval_s is None:
             continue
         since = row.get("seconds_since_success")
-        if row.get("error_count", 0) > 0 or (since is not None and since > 4 * interval_s):
+        if row.get("error_count", 0) >= error_threshold or (since is not None and since > 4 * interval_s):
             alarming.append(row)
     return alarming
 
@@ -372,7 +378,7 @@ _TF_SCAN_INTERVALS = {
 
 def monitor_loop(dsn, timeframe_intervals, webhook_url, poll_s=300, cooldown_s=3600,
                  healthcheck_url="", heartbeat_hour_utc=0, delta_threshold=25, sustain_cycles=2,
-                 heartbeat_weekday=0):
+                 heartbeat_weekday=0, error_threshold=3):
     """Main monitor loop. Checks staleness + gaps on each cycle.
 
     Also hits healthcheck_url every cycle (dead-man's switch) and posts a weekly status
@@ -418,7 +424,7 @@ def monitor_loop(dsn, timeframe_intervals, webhook_url, poll_s=300, cooldown_s=3
             # Signal B — candle alarming-mass: alert on a rolling-1h-median delta sustained N
             # cycles. The raw stale count swings benignly (HL 5m cursor + new-listing floor), so
             # it is logged for visibility but never pages on its own.
-            alarming = compute_alarming(rows, timeframe_intervals)
+            alarming = compute_alarming(rows, timeframe_intervals, error_threshold)
             decision = evaluate_alarming(
                 len(alarming), alarming_history, delta_threshold, sustain_cycles, alarming_consecutive
             )
@@ -516,6 +522,7 @@ def run():
     heartbeat_weekday = int(os.environ.get("HEARTBEAT_DAY_UTC", "0"))  # 0=Mon … 6=Sun; weekly status ping
     delta_threshold = int(os.environ.get("ALARMING_DELTA_THRESHOLD", "25"))
     sustain_cycles = int(os.environ.get("ALARMING_SUSTAIN_CYCLES", "2"))
+    error_threshold = int(os.environ.get("ALARMING_ERROR_THRESHOLD", "3"))
 
     # Candle TFs + per-loop heartbeat pseudo-TFs (funding/oi/liq_ws/premium/candle_ws) — so
     # compute_staleness flags a silently-dead loop (poll or WS) via the same staleness path.
@@ -523,15 +530,15 @@ def run():
 
     _weekdays = ("Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun")
     log.info(
-        "Monitor starting: poll=%ds cooldown=%ds webhook=%s healthcheck=%s heartbeat=weekly %s %02d:00 UTC alarming=+%d×%d cycles",
+        "Monitor starting: poll=%ds cooldown=%ds webhook=%s healthcheck=%s heartbeat=weekly %s %02d:00 UTC alarming=+%d×%d cycles error>=%d",
         poll_s, cooldown_s,
         "configured" if webhook_url else "none",
         "configured" if healthcheck_url else "none",
-        _weekdays[heartbeat_weekday % 7], heartbeat_hour_utc, delta_threshold, sustain_cycles,
+        _weekdays[heartbeat_weekday % 7], heartbeat_hour_utc, delta_threshold, sustain_cycles, error_threshold,
     )
     monitor_loop(dsn, timeframe_intervals, webhook_url, poll_s, cooldown_s,
                  healthcheck_url, heartbeat_hour_utc, delta_threshold, sustain_cycles,
-                 heartbeat_weekday=heartbeat_weekday)
+                 heartbeat_weekday=heartbeat_weekday, error_threshold=error_threshold)
 
 
 if __name__ == "__main__":
