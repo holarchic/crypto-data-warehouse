@@ -218,6 +218,45 @@ def get_oi_latest(asset_id: str):
     return rows
 
 
+@app.get("/liquidations")
+def get_liquidations(
+    venue: str | None = None,
+    asset_id: str | None = None,
+    start: datetime | None = None,
+    end: datetime | None = None,
+    limit: int = Query(default=1000, le=5000),
+):
+    # The liquidations read/monitoring endpoint (peer of /oi, /funding). All filters optional — a
+    # coin-agnostic recent-events view is the useful monitoring default ("is the HL tape landing?"). The
+    # no-filter path is a bounded recent read: TimescaleDB serves ORDER BY timestamp DESC LIMIT from the
+    # newest time-chunk(s), and the pool's statement_timeout caps it. `liquidations` keys on `venue` (not
+    # `exchange`). The bulk backtester path is /export/parquet?table=hl_liquidations.
+    conditions = []
+    params: dict = {"limit": limit}
+    if venue is not None:
+        conditions.append("venue = %(venue)s")
+        params["venue"] = venue
+    if asset_id is not None:
+        conditions.append("asset_id = %(asset_id)s")
+        params["asset_id"] = asset_id
+    if start is not None:
+        conditions.append("timestamp >= %(start)s")
+        params["start"] = start
+    if end is not None:
+        conditions.append("timestamp <= %(end)s")
+        params["end"] = end
+    where = (" WHERE " + " AND ".join(conditions)) if conditions else ""
+    query = f"SELECT * FROM liquidations{where} ORDER BY timestamp DESC LIMIT %(limit)s"
+
+    with pool.connection() as conn:
+        rows = conn.execute(query, params).fetchall()
+
+    for row in rows:
+        if row.get("timestamp"):
+            row["timestamp"] = row["timestamp"].isoformat()
+    return rows
+
+
 # ---------------------------------------------------------------------------
 # Status / health monitoring endpoints
 # ---------------------------------------------------------------------------

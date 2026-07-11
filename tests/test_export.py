@@ -257,6 +257,113 @@ def test_endpoint_caps_rows_with_413():
     assert "status_code=413" in body
 
 
+# ---- hl_liquidations feed (liquidations WHERE venue='hyperliquid' -> hl-liquidations seed) ----
+
+# The backtester's hl-liquidations.parquet schema (fetch_hl_node_fills_liquidations.py:70-85), 13 cols in order.
+_LIQ_SEED_SCHEMA = pa.schema(
+    [
+        ("time_ms", pa.int64()),
+        ("coin", pa.string()),
+        ("side", pa.string()),
+        ("dir", pa.string()),
+        ("px", pa.float64()),
+        ("sz", pa.float64()),
+        ("mark_px", pa.float64()),
+        ("closed_pnl", pa.float64()),
+        ("method", pa.string()),
+        ("liquidated_user", pa.string()),
+        ("oid", pa.int64()),
+        ("tid", pa.int64()),
+        ("day", pa.string()),
+    ]
+)
+
+
+def _liq_row(**overrides) -> dict:
+    """A full hl_liquidations cc dict row (the 13 mapped cc columns), with overrides."""
+    row = {
+        "timestamp": datetime(2026, 7, 6, 12, 0, 0, tzinfo=timezone.utc),
+        "asset_id": "BTC",
+        "side": "A",
+        "dir": "Close Long",
+        "px": 42000.0,
+        "sz": 1.5,
+        "mark_px": 42010.0,
+        "closed_pnl": -12.5,
+        "method": "market",
+        "liquidated_user": "0xabc",
+        "oid": 111,
+        "tid": 222,
+        "day": "20260706",
+    }
+    row.update(overrides)
+    return row
+
+
+def test_hl_liquidations_feed_schema_matches_seed():
+    assert export.feed_schema("hl_liquidations").equals(_LIQ_SEED_SCHEMA)
+
+
+def test_hl_liquidations_select_columns_are_cc_names():
+    assert export.select_columns("hl_liquidations") == [
+        "timestamp", "asset_id", "side", "dir", "px", "sz", "mark_px",
+        "closed_pnl", "method", "liquidated_user", "oid", "tid", "day",
+    ]
+
+
+def test_int_kind_passes_through_int64_not_datetime():
+    # oid/tid are the `int` kind: identity int64, NOT epoch-ms datetime-converted (the fan-out trap).
+    t = _read(export.rows_to_parquet("hl_liquidations", [_liq_row(oid=111, tid=222)]))
+    assert t.schema.field("oid").type == pa.int64()
+    assert t.column("oid").to_pylist() == [111]
+    assert t.column("tid").to_pylist() == [222]
+
+
+def test_hl_liquidations_asset_id_passthrough_native_coin():
+    # asset_id is the HL-native coin verbatim (kPEPE) == seed coin; no canonical/native transform.
+    data = export.rows_to_parquet("hl_liquidations", [_liq_row(asset_id="kPEPE")])
+    assert _read(data).column("coin").to_pylist() == ["kPEPE"]
+
+
+def test_hl_liquidations_optional_nulls_fill_seed_defaults():
+    # seed writes "" for a blank dir/method and 0.0 for a blank closed_pnl (:146,151,150) — NOT parquet-null/NaN.
+    t = _read(export.rows_to_parquet("hl_liquidations", [_liq_row(dir=None, method=None, closed_pnl=None)]))
+    assert t.column("dir").to_pylist() == [""]
+    assert t.column("method").to_pylist() == [""]
+    assert t.column("closed_pnl").to_pylist() == [0.0]
+    assert t.column("dir").null_count == 0  # a value, not a parquet-null (null-mask parity with the seed)
+    assert t.column("method").null_count == 0
+
+
+def test_hl_liquidations_closed_pnl_values_survive():
+    # a legit 0.0 must NOT be coerced (the on_null path is `v is None`, never `v or 0.0`); a negative survives.
+    t = _read(export.rows_to_parquet("hl_liquidations", [_liq_row(closed_pnl=0.0), _liq_row(closed_pnl=-1.5)]))
+    assert t.column("closed_pnl").to_pylist() == [0.0, -1.5]
+
+
+def test_hl_liquidations_required_null_raises():
+    # seed-required columns have no seed default: a cc NULL there is a row the seed never contains -> fail closed.
+    for col in ("side", "px", "sz", "mark_px", "oid", "tid"):
+        try:
+            export.rows_to_parquet("hl_liquidations", [_liq_row(**{col: None})])
+        except ValueError:
+            continue
+        raise AssertionError(f"expected ValueError on NULL {col!r}")
+
+
+def test_hl_liquidations_roundtrip_schema_and_ms():
+    t = _read(export.rows_to_parquet("hl_liquidations", [_liq_row()]))
+    assert t.schema.equals(_LIQ_SEED_SCHEMA)
+    assert t.column("time_ms").to_pylist()[0] == int(_liq_row()["timestamp"].timestamp()) * 1000
+
+
+def test_liquidations_endpoint_registered_reads_liquidations_table():
+    # /liquidations JSON range endpoint (monitoring surface) — source-pinned like the export endpoint.
+    src = _API_MAIN.read_text()
+    assert '"/liquidations"' in src
+    assert "FROM liquidations" in src
+
+
 def test_endpoint_applies_symbol_like_universe_filter():
     # a feed with `symbol_like` (binance_oi) restricts to the seed universe via a parameterized LIKE.
     body = _export_endpoint_source()

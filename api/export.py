@@ -37,18 +37,36 @@ EXPORT_MAX_ROWS = 150_000
 _ARROW_BY_KIND: dict[str, pa.DataType] = {
     "string": pa.string(),
     "epoch_ms": pa.int64(),  # cc timestamptz -> floor-to-ms epoch int64
-    "float": pa.float64(),  # SQL NULL -> NaN value
+    "float": pa.float64(),  # SQL NULL -> NaN value (default; overridable per column via on_null)
     "native_symbol": pa.string(),  # ccxt symbol -> exchange-native (BTC/USDT:USDT -> BTCUSDT)
+    "int": pa.int64(),  # BIGINT identity pass-through (e.g. liquidations oid/tid) — NOT epoch-converted
+}
+
+# The SQL-NULL policy is a per-column property (`Column.on_null`), because the byte-contract's missing-value
+# representation VARIES by column and seed: hl_asset_ctxs/binance_oi floats use NaN, but the liquidations seed
+# writes "" for a blank dir/method, 0.0 for a blank closed_pnl, and has NO default for its required
+# side/px/sz/mark_px/oid/tid (a NULL there is a row the seed never contains). `on_null` is a fill value, RAISE,
+# or _UNSET -> the kind default below. RAISE is the strict default for every non-float kind: a NULL in a
+# seed-required column must fail closed, never mint a NaN/parquet-null the extractor never emitted.
+RAISE = object()  # on_null sentinel: a SQL NULL in this column is a contract violation -> raise
+_UNSET = object()  # on_null unset -> use the kind default
+_KIND_NULL_DEFAULT: dict[str, object] = {
+    "float": nan,  # missing float -> NaN value (hl_asset_ctxs/binance_oi seed convention)
+    "string": RAISE,
+    "native_symbol": RAISE,
+    "epoch_ms": RAISE,  # cc timestamp is NOT NULL
+    "int": RAISE,  # a dedup-key int (oid/tid) going NULL is a contract violation
 }
 
 
 @dataclass(frozen=True)
 class Column:
-    """One seed column, its cc source, and its transform kind (pure data)."""
+    """One seed column, its cc source, its transform kind, and its SQL-NULL policy (pure data)."""
 
     seed: str  # parquet/seed column name
     cc: str  # cc DB column to SELECT
     kind: str  # ∈ _ARROW_BY_KIND — drives BOTH the arrow type and the cc->seed transform
+    on_null: object = _UNSET  # SQL NULL -> this fill value, or RAISE; _UNSET -> _KIND_NULL_DEFAULT[kind]
 
     @property
     def arrow(self) -> pa.DataType:
@@ -114,9 +132,41 @@ _BINANCE_OI = FeedSpec(
     symbol_like="%/USDT:USDT",
 )
 
+# liquidations (HL node_fills, venue='hyperliquid') -> the backtester's hl-liquidations.parquet seed. cc's writer
+# (collector/liquidations_hl.py) is DERIVED from the seed extractor (fetch_hl_node_fills_liquidations.py) but
+# stores SQL NULL where the seed writes per-column defaults, so the export owns parity via on_null: the seed
+# writes dir/method="" (:146,151) and closed_pnl=0.0 (:150) for a blank, and has NO default for the required
+# side/px/sz/mark_px/oid/tid -> those RAISE (a cc NULL there is a row the seed never contains; side/px/sz/mark_px
+# are nullable in cc, a fail-closed guard gated by a prod NULL-count pre-check). oid/tid are the `int` kind
+# (BIGINT identity, RAISE default). asset_id is the HL-native coin verbatim (a passthrough, :170-174). Only
+# venue='hyperliquid' (the Grade-A tape) is exported; the Grade-C WS rows have no seed. Seed schema verified
+# against fetch_hl_node_fills_liquidations.py:70-85 (13 cols, this order).
+_HL_LIQUIDATIONS = FeedSpec(
+    db_table="liquidations",
+    ts_col="timestamp",
+    columns=(
+        Column("time_ms", "timestamp", "epoch_ms"),
+        Column("coin", "asset_id", "string"),
+        Column("side", "side", "string"),
+        Column("dir", "dir", "string", on_null=""),
+        Column("px", "px", "float", on_null=RAISE),
+        Column("sz", "sz", "float", on_null=RAISE),
+        Column("mark_px", "mark_px", "float", on_null=RAISE),
+        Column("closed_pnl", "closed_pnl", "float", on_null=0.0),
+        Column("method", "method", "string", on_null=""),
+        Column("liquidated_user", "liquidated_user", "string"),
+        Column("oid", "oid", "int"),
+        Column("tid", "tid", "int"),
+        Column("day", "day", "string"),
+    ),
+    venue_col="venue",
+    venue="hyperliquid",
+)
+
 FEED_SPECS: dict[str, FeedSpec] = {
     "hl_asset_ctxs": _HL_ASSET_CTXS,
     "binance_oi": _BINANCE_OI,
+    "hl_liquidations": _HL_LIQUIDATIONS,
 }
 
 
@@ -136,22 +186,36 @@ def _to_ms(dt: datetime) -> int:
     return int(dt.timestamp()) * 1000 + dt.microsecond // 1000
 
 
-def _column_array(col: Column, rows: list[dict]) -> pa.Array:
-    """Build one seed column's arrow array from the dict rows, dispatching on `col.kind` (explicit,
-    NOT inferred from the arrow type). Direct-key access `row[col.cc]` (fail-closed: a missing key
-    raises, surfacing a spec/SELECT drift, vs `.get()` silently None-filling). Floats: NULL -> NaN
-    *value* (null_count 0, matching the seed), via `nan if v is None else v` — never `v or nan`, which
-    would corrupt a legitimate 0.0."""
-    if col.kind == "string":
-        return pa.array([row[col.cc] for row in rows], type=col.arrow)
+def _seed_value(col: Column, v: object) -> object:
+    """One cc value -> its seed representation for `col`. Resolves the SQL-NULL policy FIRST (a fill value /
+    RAISE / the kind default), THEN applies the non-null transform. The single source of the null policy;
+    dispatch is on `col.kind` (explicit, NOT inferred from the arrow type — int64 shares its type with
+    epoch_ms). NULL handling uses `v is None` (never `v or default`, which would corrupt a legitimate
+    0.0/"")."""
+    if v is None:
+        policy = col.on_null if col.on_null is not _UNSET else _KIND_NULL_DEFAULT[col.kind]
+        if policy is RAISE:
+            raise ValueError(
+                f"SQL NULL for seed column {col.seed!r} (cc {col.cc!r}) has no seed default "
+                f"— the writer must not land a NULL here"
+            )
+        return policy  # a fill value: nan (float) / "" (blank string) / 0.0 (closed_pnl)
+    if col.kind == "epoch_ms":
+        return _to_ms(v)
     if col.kind == "native_symbol":
         # ccxt symbol -> exchange-native: BTC/USDT:USDT -> BTCUSDT (drop the :settle, then the /).
-        return pa.array([row[col.cc].split(":")[0].replace("/", "") for row in rows], type=col.arrow)
-    if col.kind == "epoch_ms":
-        return pa.array([_to_ms(row[col.cc]) for row in rows], type=col.arrow)
-    if col.kind == "float":
-        return pa.array([nan if row[col.cc] is None else row[col.cc] for row in rows], type=col.arrow)
-    raise ValueError(f"unknown column kind {col.kind!r} for seed column {col.seed!r}")
+        return v.split(":")[0].replace("/", "")
+    return v  # string / float / int pass the value through
+
+
+def _column_array(col: Column, rows: list[dict]) -> pa.Array:
+    """Build one seed column's arrow array from the dict rows via `_seed_value`. Direct-key access
+    `row[col.cc]` is fail-closed (a missing key raises, surfacing a spec/SELECT drift, vs `.get()`
+    silently None-filling). An unregistered `kind` raises here (not a silent mis-convert) — the kind
+    is explicit, never inferred."""
+    if col.kind not in _ARROW_BY_KIND:
+        raise ValueError(f"unknown column kind {col.kind!r} for seed column {col.seed!r}")
+    return pa.array([_seed_value(col, row[col.cc]) for row in rows], type=col.arrow)
 
 
 def rows_to_parquet(table: str, rows: list[dict]) -> bytes:
