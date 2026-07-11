@@ -362,6 +362,8 @@ def test_liquidations_endpoint_registered_reads_liquidations_table():
     src = _API_MAIN.read_text()
     assert '"/liquidations"' in src
     assert "FROM liquidations" in src
+    # limit is bounded at BOTH ends (ge=1 rejects a non-positive LIMIT at the boundary, not in PostgreSQL).
+    assert "ge=1, le=5000" in src
 
 
 def test_endpoint_applies_symbol_like_universe_filter():
