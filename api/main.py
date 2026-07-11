@@ -224,7 +224,7 @@ def get_liquidations(
     asset_id: str | None = None,
     start: datetime | None = None,
     end: datetime | None = None,
-    limit: int = Query(default=1000, le=5000),
+    limit: int = Query(default=1000, ge=1, le=5000),
 ):
     # The liquidations read/monitoring endpoint (peer of /oi, /funding). All filters optional — a
     # coin-agnostic recent-events view is the useful monitoring default ("is the HL tape landing?"). The
