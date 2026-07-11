@@ -41,12 +41,22 @@ EXPORT_MAX_ROWS = 150_000
 # would over-abstract.
 RAISE = object()  # on_null sentinel: a SQL NULL in this column is a contract violation -> raise
 _UNSET = object()  # on_null unset -> use the kind's default null policy
-_KINDS: dict[str, tuple[pa.DataType, object]] = {
-    "string": (pa.string(), RAISE),
-    "epoch_ms": (pa.int64(), RAISE),  # cc timestamptz -> floor-to-ms epoch int64; cc timestamp is NOT NULL
-    "float": (pa.float64(), nan),  # SQL NULL -> NaN value (overridable per column via on_null)
-    "native_symbol": (pa.string(), RAISE),  # ccxt symbol -> exchange-native (BTC/USDT:USDT -> BTCUSDT)
-    "int": (pa.int64(), RAISE),  # BIGINT identity pass-through (oid/tid) — NOT epoch-converted
+
+
+@dataclass(frozen=True)
+class KindSpec:
+    """A column kind's seed arrow type + its default SQL-NULL policy (pure data, named fields)."""
+
+    arrow: pa.DataType
+    default_on_null: object  # a fill value (nan) or RAISE
+
+
+_KINDS: dict[str, KindSpec] = {
+    "string": KindSpec(pa.string(), RAISE),
+    "epoch_ms": KindSpec(pa.int64(), RAISE),  # cc timestamptz -> floor-to-ms epoch int64; ts is NOT NULL
+    "float": KindSpec(pa.float64(), nan),  # SQL NULL -> NaN value (overridable per column via on_null)
+    "native_symbol": KindSpec(pa.string(), RAISE),  # ccxt symbol -> exchange-native (BTC/USDT:USDT -> BTCUSDT)
+    "int": KindSpec(pa.int64(), RAISE),  # BIGINT identity pass-through (oid/tid) — NOT epoch-converted
 }
 
 
@@ -56,12 +66,12 @@ class Column:
 
     seed: str  # parquet/seed column name
     cc: str  # cc DB column to SELECT
-    kind: str  # ∈ _ARROW_BY_KIND — drives BOTH the arrow type and the cc->seed transform
-    on_null: object = _UNSET  # SQL NULL -> this fill value, or RAISE; _UNSET -> _KIND_NULL_DEFAULT[kind]
+    kind: str  # ∈ _KINDS — drives BOTH the arrow type and the cc->seed transform
+    on_null: object = _UNSET  # SQL NULL -> this fill value, or RAISE; _UNSET -> the kind's _KINDS default
 
     @property
     def arrow(self) -> pa.DataType:
-        return _KINDS[self.kind][0]
+        return _KINDS[self.kind].arrow
 
 
 @dataclass(frozen=True)
@@ -184,7 +194,7 @@ def _seed_value(col: Column, v: object) -> object:
     epoch_ms). NULL handling uses `v is None` (never `v or default`, which would corrupt a legitimate
     0.0/"")."""
     if v is None:
-        policy = col.on_null if col.on_null is not _UNSET else _KINDS[col.kind][1]
+        policy = col.on_null if col.on_null is not _UNSET else _KINDS[col.kind].default_on_null
         if policy is RAISE:
             raise ValueError(
                 f"SQL NULL for seed column {col.seed!r} (cc {col.cc!r}) has no seed default "
