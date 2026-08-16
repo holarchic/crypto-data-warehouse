@@ -6,7 +6,7 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
-BACKUP_DIR="${PROJECT_DIR}/backups"
+BACKUP_DIR="${BACKUP_DIR:-${PROJECT_DIR}/backups}"
 mkdir -p "$BACKUP_DIR"
 
 # -- Load webhook URL for failure alerts --------------------------------------
