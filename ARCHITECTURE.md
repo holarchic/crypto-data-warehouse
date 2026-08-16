@@ -100,7 +100,7 @@ PK: `(exchange, market_type, symbol, timeframe, timestamp)`
 | market_type | TEXT NOT NULL | `perp` or `spot` |
 | asset_id | TEXT NOT NULL | Canonical: `BTC` |
 | symbol | TEXT NOT NULL | ccxt-normalized: `BTC/USDT:USDT` |
-| timeframe | TEXT NOT NULL | 10 timeframes: 5m→1w |
+| timeframe | TEXT NOT NULL | 7 collected: 5m→12h (1d/3d/1w retained history only — collection dropped v0.23) |
 | timestamp | TIMESTAMPTZ NOT NULL | Candle open time, UTC |
 | open, high, low, close | DOUBLE PRECISION | |
 | volume | DOUBLE PRECISION | Base currency |

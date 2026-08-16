@@ -77,8 +77,9 @@ def test_load_config_timeframes_parsed():
     cfg = load_config("hyperliquid")
     tf_names = [tf.name for tf in cfg.timeframes]
     assert "5m" in tf_names
-    assert "1d" in tf_names
-    assert len(cfg.timeframes) == 10
+    assert "12h" in tf_names
+    assert "1d" not in tf_names  # 1d/3d/1w dropped v0.23 — derive on demand, not collected
+    assert len(cfg.timeframes) == 7
 
 
 # --- load_all_configs ---

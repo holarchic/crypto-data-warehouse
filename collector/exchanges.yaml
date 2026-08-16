@@ -20,9 +20,6 @@ timeframes:
   2h:   { interval_s: 7200,   buffer_s: 60 }
   4h:   { interval_s: 14400,  buffer_s: 60 }
   12h:  { interval_s: 43200,  buffer_s: 120 }
-  1d:   { interval_s: 86400,  buffer_s: 300 }
-  3d:   { interval_s: 259200, buffer_s: 300 }
-  1w:   { interval_s: 604800, buffer_s: 300 }
 
 exchanges:
   hyperliquid:
@@ -50,9 +47,6 @@ exchanges:
       - 2h
       - 4h
       - 12h
-      - 1d
-      - 3d
-      - 1w
 
   binance:
     ccxt_class: binanceusdm
@@ -97,9 +91,6 @@ exchanges:
       - 2h
       - 4h
       - 12h
-      - 1d
-      - 3d
-      - 1w
 
   bybit:
     ccxt_class: bybit
@@ -126,8 +117,6 @@ exchanges:
       - 2h
       - 4h
       - 12h
-      - 1d
-      - 1w
 
   okx:
     ccxt_class: okx
@@ -148,8 +137,6 @@ exchanges:
       - 2h
       - 4h
       - 12h
-      - 1d
-      - 1w
 
   coinbase:
     ccxt_class: coinbase
@@ -165,7 +152,6 @@ exchanges:
       - 30m
       - 1h
       - 2h
-      - 1d
 
   dydx:
     ccxt_class: dydx
@@ -181,4 +167,3 @@ exchanges:
       - 30m
       - 1h
       - 4h
-      - 1d
