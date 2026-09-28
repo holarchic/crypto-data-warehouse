@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
-# Deploy or update candle-collector.
-# Idempotent — safe to re-run for updates.
+# Fresh install / full redeploy of candle-collector. Idempotent, but NOT for routine code
+# updates: `compose pull db` + stack-wide `up -d` can recreate the db onto a moved
+# `latest-pg16`. Code updates follow AGENTS.md `## Deploy` (build + `up -d --no-deps <svc>`).
 #
 # Usage: ./deploy/deploy.sh
 #   Run from the project root (/opt/candle-collector).

@@ -88,7 +88,8 @@ Pass: returns ≥1 candle with all OHLCV fields populated, correct exchange/symb
 | Start prod | `docker compose -f docker-compose.yml -f docker-compose.prod.yml up -d` |
 | Stop prod | `docker compose -f docker-compose.yml -f docker-compose.prod.yml down` |
 | Prod logs | `docker compose -f docker-compose.yml -f docker-compose.prod.yml logs -f` |
-| Deploy/update | `./deploy/deploy.sh` |
+| Code update | `git pull` → `build <changed svcs>` → `up -d --no-deps <svcs>` (see AGENTS.md `## Deploy`) |
+| Fresh install / full redeploy | `./deploy/deploy.sh` — pulls `latest-pg16` + stack-wide `up -d`; can recreate the db |
 | Server setup | `./deploy/setup.sh [GCP_IP...]` |
 | Run discovery (prod) | `docker compose -f docker-compose.yml -f docker-compose.prod.yml --profile discovery run --rm discovery` |
 
