@@ -185,6 +185,7 @@ def test_timeframe_table_defaults_to_candles():
 def test_load_discovery_config_has_threshold():
     disc = load_discovery_config()
     assert disc["volume_threshold_usd"] == 1_000_000
+    assert disc["volume_keep_threshold_usd"] == 500_000
 
 
 def test_load_discovery_config_has_overrides():

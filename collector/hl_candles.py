@@ -4,7 +4,7 @@ HL's ~1 req/s shared info budget is reserved for the unbackfillable dense 1-min 
 1m path is off the table — a live REST backfill was deploy-measured (2026-07-05) to starve HL's tight
 single limiter (5m…1w per-bar coverage fell 161→33, HL having no priority-reserve lane). So this module
 is **WS-only**: HL's native WS `candle` subscription is the real-time source (zero REST). A rare WS-drop
-gap is repaired out-of-band via the T-011 export/backfill path, not a live-contending sweep. The insert
+gap is repaired out-of-band by a REST refetch (T-019), not a live-contending sweep. The insert
 UPSERTs (below), never the generic `ON CONFLICT DO NOTHING` — HL streams the *forming* bar continuously
 with no closed flag, so the row must converge to the bar's closed value (last-write-wins).
 
