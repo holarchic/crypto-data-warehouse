@@ -521,7 +521,7 @@ def run():
     heartbeat_hour_utc = int(os.environ.get("HEARTBEAT_HOUR_UTC", "0"))
     heartbeat_weekday = int(os.environ.get("HEARTBEAT_DAY_UTC", "0"))  # 0=Mon … 6=Sun; weekly status ping
     delta_threshold = int(os.environ.get("ALARMING_DELTA_THRESHOLD", "25"))
-    sustain_cycles = int(os.environ.get("ALARMING_SUSTAIN_CYCLES", "2"))
+    sustain_cycles = int(os.environ.get("ALARMING_SUSTAIN_CYCLES", "3"))
     error_threshold = int(os.environ.get("ALARMING_ERROR_THRESHOLD", "3"))
 
     # Candle TFs + per-loop heartbeat pseudo-TFs (funding/oi/liq_ws/premium/candle_ws) — so

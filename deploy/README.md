@@ -18,7 +18,7 @@
 | `MONITOR_INTERVAL_S` | Monitor cycle interval. Default `300` |
 | `ALERT_COOLDOWN_S` | Dedup window for staleness/gap alerts. Default `3600` |
 | `ALARMING_DELTA_THRESHOLD` | Alarming-collector count must exceed its rolling-1h median by this much to page. Default `25` |
-| `ALARMING_SUSTAIN_CYCLES` | Consecutive breaching cycles required before the alarming alert fires. Default `2` |
+| `ALARMING_SUSTAIN_CYCLES` | Consecutive breaching cycles required before the alarming alert fires. Default `3` — settlement rate-limit waves breach for ≤2 cycles |
 | `ALARMING_ERROR_THRESHOLD` | Consecutive `error_count` a collector must reach to enter the alarming count via the error channel. Default `3` — screens out transient single-cycle rate-limit blips that backfill losslessly |
 
 ## Local Dev Commands
