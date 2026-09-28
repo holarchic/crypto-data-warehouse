@@ -98,8 +98,9 @@ TimescaleDB auto-tunes `max_connections` low (~25 on 8GB). Override via `command
 
 ### Firewall
 
-- **Hetzner Cloud Firewall** (primary): SSH from any, port 8000 from GCP IPs only
-- **UFW** (defense-in-depth): same rules
+- **Hetzner Cloud Firewall** (`firewall-1`, primary, attached to the server): inbound SSH from any; port 8000 only from the server's own IP (effectively closed)
+- **API bind:** `127.0.0.1:8000` (`docker-compose.prod.yml`). Docker-published ports bypass UFW, so the loopback bind — not UFW — is what keeps the API off the public interface
+- **UFW** (defense-in-depth): SSH only
 - **Local access:** SSH tunnel — no firewall rule needed
 
 ### Cron jobs (installed by `deploy.sh`)
@@ -107,6 +108,5 @@ TimescaleDB auto-tunes `max_connections` low (~25 on 8GB). Override via `command
 | Schedule | Job |
 |----------|-----|
 | `0 2 * * *` | Daily discovery |
-| `0 3 * * *` | Daily backup |
-| `30 3 * * *` | Backup retention (>7 days) |
+| `0 4 * * *` | Daily HL Grade-A liquidation pull (last 3 complete days) |
 | `*/5 * * * *` | Host monitor |
