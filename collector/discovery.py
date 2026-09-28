@@ -1,6 +1,7 @@
 """Discovery service — finds qualifying pairs across all exchanges.
 
 Union qualification: $1M 24h volume on ANY exchange → collect on ALL exchanges where listed.
+Hysteresis: once collected, an asset stays in while its max volume holds at the keep threshold ($500k).
 Run as one-shot: `docker compose --profile discovery run --rm discovery`
 """
 
@@ -10,7 +11,7 @@ from collections import defaultdict
 
 from config import load_all_configs, load_discovery_config
 from dotenv import load_dotenv
-from status import deactivate_stale_pairs, upsert_discovery_pair
+from status import deactivate_stale_pairs, query_active_asset_ids, upsert_discovery_pair
 from symbols import resolve_asset_id
 
 from db import build_dsn, connect_db, create_exchange, safe_rollback
@@ -87,6 +88,15 @@ def fetch_exchange_tickers(exchange, config):
     return results
 
 
+def qualify_assets(max_volumes: dict[str, float], active_assets: set[str], threshold: float, keep_threshold: float) -> set[str]:
+    """Union qualification with hysteresis: an asset enters at `threshold` and, once active, stays
+    while its max volume holds at `keep_threshold` — so marginal assets don't flap in and out nightly."""
+    return {
+        asset_id for asset_id, vol in max_volumes.items()
+        if vol >= threshold or (asset_id in active_assets and vol >= keep_threshold)
+    }
+
+
 def discover():
     """Run discovery: fetch tickers from all exchanges, qualify pairs, write to collection_status."""
     load_dotenv()
@@ -95,9 +105,14 @@ def discover():
     configs = load_all_configs()
     discovery_config = load_discovery_config()
     threshold = discovery_config.get("volume_threshold_usd", 1_000_000)
+    # Clamped: a keep above entry would make staying harder than entering.
+    keep_threshold = min(discovery_config.get("volume_keep_threshold_usd", threshold), threshold)
     dsn = build_dsn()
 
-    log.info("Discovery starting: %d exchanges, volume threshold=$%s", len(configs), f"{threshold:,.0f}")
+    log.info(
+        "Discovery starting: %d exchanges, volume threshold=$%s (keep=$%s)",
+        len(configs), f"{threshold:,.0f}", f"{keep_threshold:,.0f}",
+    )
 
     # Phase 1: Fetch tickers from all exchanges
     # volumes[asset_id][exchange_name] = {symbol, market_type, native_symbol, volume}
@@ -124,16 +139,6 @@ def discover():
                 "volume": t["volume"],
             }
 
-    # Phase 2: Union qualification — max volume across any exchange >= threshold
-    qualifying_assets = set()
-    for asset_id, exchange_data in volumes.items():
-        max_vol = max(d["volume"] for d in exchange_data.values())
-        if max_vol >= threshold:
-            qualifying_assets.add(asset_id)
-
-    log.info("Qualifying assets: %d / %d total (threshold=$%s)", len(qualifying_assets), len(volumes), f"{threshold:,.0f}")
-
-    # Phase 3: Write to collection_status
     conn = connect_db(dsn)
     total_upserted = 0
     total_deactivated = 0
@@ -142,6 +147,16 @@ def discover():
     active_symbols_map = defaultdict(list)  # (exchange, timeframe) -> [symbols]
 
     try:
+        # Phase 2: Union qualification — max volume across any exchange, with hysteresis
+        max_volumes = {asset_id: max(d["volume"] for d in ex.values()) for asset_id, ex in volumes.items()}
+        qualifying_assets = qualify_assets(max_volumes, query_active_asset_ids(conn), threshold, keep_threshold)
+        kept = sum(1 for asset_id in qualifying_assets if max_volumes[asset_id] < threshold)
+        log.info(
+            "Qualifying assets: %d / %d total (threshold=$%s, %d kept by keep threshold)",
+            len(qualifying_assets), len(volumes), f"{threshold:,.0f}", kept,
+        )
+
+        # Phase 3: Write to collection_status
         for asset_id in sorted(qualifying_assets):
             for exchange_name, data in volumes[asset_id].items():
                 # Find the config for this exchange to get timeframes
@@ -176,7 +191,7 @@ def discover():
 
     except Exception:
         safe_rollback(conn)
-        log.exception("Discovery failed during DB writes")
+        log.exception("Discovery failed during DB phase")
         sys.exit(1)
     finally:
         conn.close()

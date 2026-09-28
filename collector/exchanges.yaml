@@ -4,6 +4,10 @@
 
 discovery:
   volume_threshold_usd: 1000000
+  # Hysteresis: an asset already collected stays in while its max 24h volume holds above this.
+  # A single threshold flaps marginal assets out on weekend volume dips, leaving permanent holes
+  # in their snapshot feeds (OI, HL contexts) and 1m gaps longer than the 1,000-bar re-seed.
+  volume_keep_threshold_usd: 500000
   symbol_overrides:
     BCHSV: BSV
     LUNA2: LUNA
@@ -33,8 +37,8 @@ exchanges:
     enabled: true
     has_funding: true
     has_oi: true
-    has_candle_ws: true             # HL WS-only 1m candle feed (T-015.1); zero live REST — a rare WS-drop
-    #                                 gap is repaired out-of-band via T-011, not a live-contending sweep
+    has_candle_ws: true             # HL WS-only 1m candle feed (T-015.1); zero live REST — a WS-drop gap
+    #                                 is repaired out-of-band via T-019, not a live-contending sweep
     oi_poll_interval_s: 60          # HL OI 1-min (T-007.1; bulk metaAndAssetCtxs)
     # 1m is intentionally NOT listed: it is STREAMED (has_candle_ws), not polled. Adding it here would
     # launch the per-symbol REST 1m collect_loop that starves the unbackfillable dense OI — the exact

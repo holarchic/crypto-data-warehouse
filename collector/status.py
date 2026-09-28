@@ -9,11 +9,13 @@ log = logging.getLogger(__name__)
 # "*", loop-pseudo-tf). Never a real ccxt symbol, so it can't collide with a candle pair.
 LOOP_SENTINEL_SYMBOL = "*"
 
+# Discovery owns (re)activation: the conflict update never touches `active`. A collector cycle runs
+# on a pair list fetched before discovery may have deactivated a pair; resurrecting it here would keep
+# the pair collected past its drop AND feed discovery's hysteresis a false "still active".
 UPSERT_SUCCESS_SQL = """
     INSERT INTO collection_status (exchange, market_type, symbol, timeframe, active, asset_id, last_timestamp, last_success, error_count)
     VALUES (%(exchange)s, %(market_type)s, %(symbol)s, %(timeframe)s, TRUE, %(asset_id)s, to_timestamp(%(last_timestamp)s), NOW(), 0)
     ON CONFLICT (exchange, market_type, symbol, timeframe) DO UPDATE SET
-        active = TRUE,
         asset_id = COALESCE(%(asset_id)s, collection_status.asset_id),
         last_timestamp = GREATEST(collection_status.last_timestamp, to_timestamp(%(last_timestamp)s)),
         last_success = NOW(),
@@ -60,6 +62,12 @@ QUERY_ACTIVE_PAIRS_SQL = """
     FROM collection_status
     WHERE exchange = %(exchange)s AND timeframe = %(timeframe)s AND active = TRUE
     ORDER BY symbol
+"""
+
+# Loop-heartbeat sentinel rows carry no asset_id, so the NULL filter keeps them out.
+QUERY_ACTIVE_ASSET_IDS_SQL = """
+    SELECT DISTINCT asset_id FROM collection_status
+    WHERE active = TRUE AND asset_id IS NOT NULL
 """
 
 UPSERT_LOOP_HEARTBEAT_SQL = """
@@ -140,6 +148,13 @@ def deactivate_stale_pairs(conn, exchange: str, timeframe: str, active_symbols: 
     with conn.cursor() as cur:
         cur.execute(DEACTIVATE_STALE_SQL, {"exchange": exchange, "timeframe": timeframe, "active_symbols": active_symbols})
         return cur.rowcount
+
+
+def query_active_asset_ids(conn) -> set[str]:
+    """Assets with an active pair on any exchange — discovery's hysteresis input."""
+    with conn.cursor() as cur:
+        cur.execute(QUERY_ACTIVE_ASSET_IDS_SQL)
+        return {asset_id for (asset_id,) in cur.fetchall()}
 
 
 def query_active_pairs(conn, exchange: str, timeframe: str) -> list[dict]:
