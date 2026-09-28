@@ -4,7 +4,16 @@
 # Changes from dev:
 #   - DB port 5432 NOT exposed to host
 #   - Memory limits on all containers
-#   - API port explicit (no env var override)
+#   - API bound to loopback only (access via SSH tunnel)
+
+# Collector logs: ~2 weeks at the busiest collector's rate (bybit ~4 MB/h raw). Rotated files are
+# gzipped, so 30 × 50 MB of raw log costs ~0.2 GB on disk per collector.
+x-collector-logging: &collector-logging
+  driver: json-file
+  options:
+    max-size: "50m"
+    max-file: "30"
+    compress: "true"
 
 services:
   db:
@@ -20,36 +29,42 @@ services:
           memory: 2g
 
   collector-hyperliquid:
+    logging: *collector-logging
     deploy:
       resources:
         limits:
           memory: 512m
 
   collector-binance:
+    logging: *collector-logging
     deploy:
       resources:
         limits:
           memory: 512m
 
   collector-bybit:
+    logging: *collector-logging
     deploy:
       resources:
         limits:
           memory: 512m
 
   collector-okx:
+    logging: *collector-logging
     deploy:
       resources:
         limits:
           memory: 512m
 
   collector-coinbase:
+    logging: *collector-logging
     deploy:
       resources:
         limits:
           memory: 512m
 
   collector-dydx:
+    logging: *collector-logging
     deploy:
       resources:
         limits:
@@ -75,8 +90,9 @@ services:
 
   api:
     ports: !override
-      - "8000:8000"
-    # !override replaces the base ports list (removes env var override)
+      - "127.0.0.1:8000:8000"
+    # !override replaces the base ports list. Loopback-only: Docker-published ports bypass UFW,
+    # so a 0.0.0.0 bind is internet-reachable whatever UFW says.
     deploy:
       resources:
         limits:
