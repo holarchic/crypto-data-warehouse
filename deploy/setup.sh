@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# One-time server provisioning for candle-collector.
+# One-time server provisioning for crypto-data-warehouse.
 # Run as root on a fresh Ubuntu 24.04 VM.
 #
 # Usage: ./deploy/setup.sh [CLIENT_IP_1] [CLIENT_IP_2] ...
@@ -94,7 +94,7 @@ ufw reload
 
 # -- Project directory --------------------------------------------------------
 
-PROJECT_DIR="/opt/candle-collector"
+PROJECT_DIR="/opt/crypto-data-warehouse"
 if [ ! -d "$PROJECT_DIR" ]; then
     mkdir -p "$PROJECT_DIR"
     info "Created $PROJECT_DIR"
@@ -113,6 +113,6 @@ echo "  UFW status:"
 ufw status numbered
 echo ""
 echo "Next steps:"
-echo "  1. Clone repo:  git clone https://github.com/holarchic/candle-collector.git $PROJECT_DIR"
+echo "  1. Clone repo:  git clone https://github.com/holarchic/crypto-data-warehouse.git $PROJECT_DIR"
 echo "  2. Create .env: cp $PROJECT_DIR/.env.example $PROJECT_DIR/.env && nano $PROJECT_DIR/.env"
 echo "  3. Deploy:      $PROJECT_DIR/deploy/deploy.sh"

@@ -1,16 +1,16 @@
 #!/usr/bin/env bash
-# Fresh install / full redeploy of candle-collector. Idempotent, but NOT for routine code
+# Fresh install / full redeploy of crypto-data-warehouse. Idempotent, but NOT for routine code
 # updates: `compose pull db` + stack-wide `up -d` can recreate the db onto a moved
 # `latest-pg16`. Code updates follow deploy/README.md § Code updates (build + `up -d --no-deps <svc>`).
 #
 # Usage: ./deploy/deploy.sh
-#   Run from the project root (/opt/candle-collector).
+#   Run from the project root (/opt/crypto-data-warehouse).
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 COMPOSE="docker compose -f docker-compose.yml -f docker-compose.prod.yml"
-REPO_URL="https://github.com/holarchic/candle-collector.git"
+REPO_URL="https://github.com/holarchic/crypto-data-warehouse.git"
 # DB backups are DISABLED (2026-08-22): on-box dumps were deleted and the backup +
 # retention cron (below) removed, pending an OFFSITE DR target (restic -> Backblaze B2
 # or a Hetzner Storage Box). On-box dumps on /mnt/pgvol gave no real DR and crowded the

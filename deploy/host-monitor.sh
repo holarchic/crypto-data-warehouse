@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Host-level health monitor for candle-collector.
+# Host-level health monitor for crypto-data-warehouse.
 # Runs via cron every 5 minutes. Sends Discord/webhook alerts for:
 #   - Disk usage — tiered 75% / 85% / 95% bands, per mount (/ and /mnt/pgvol)
 #   - Available memory <500MB

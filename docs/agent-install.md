@@ -1,6 +1,6 @@
-# Installing candle-collector: guide for coding agents
+# Installing crypto-data-warehouse: guide for coding agents
 
-You're installing candle-collector for a user. Do the steps in order. Each step ends with a check; don't move on until it passes.
+You're installing crypto-data-warehouse for a user. Do the steps in order. Each step ends with a check; don't move on until it passes.
 
 ## Ask the user first
 
@@ -26,13 +26,13 @@ You're installing candle-collector for a user. Do the steps in order. Each step 
 ## 2. Provision (server only)
 
 ```bash
-git clone https://github.com/holarchic/candle-collector.git /opt/candle-collector
-/opt/candle-collector/deploy/setup.sh
+git clone https://github.com/holarchic/crypto-data-warehouse.git /opt/crypto-data-warehouse
+/opt/crypto-data-warehouse/deploy/setup.sh
 ```
 
 It installs Docker, sets log rotation and enables UFW with SSH only. Check: `ufw status` lists only port 22. Tell the user to keep port 8000 closed in their provider's firewall too.
 
-Laptop: `git clone https://github.com/holarchic/candle-collector.git && cd candle-collector`.
+Laptop: `git clone https://github.com/holarchic/crypto-data-warehouse.git && cd crypto-data-warehouse`.
 
 ## 3. Configure
 
@@ -52,7 +52,7 @@ No exchange API keys are needed.
 ## 4. Start
 
 - Laptop: `docker compose up -d`
-- Server: `./deploy/deploy.sh`, from `/opt/candle-collector`. It builds the images, starts the stack with the production override, waits for the API and installs the cron jobs.
+- Server: `./deploy/deploy.sh`, from `/opt/crypto-data-warehouse`. It builds the images, starts the stack with the production override, waits for the API and installs the cron jobs.
 
 Check: `docker compose ps` shows `db`, `api`, `monitor` and six `collector-*` containers running. On a server, add `-f docker-compose.yml -f docker-compose.prod.yml` to every `docker compose` command.
 

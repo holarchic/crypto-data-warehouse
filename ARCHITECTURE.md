@@ -1,4 +1,4 @@
-# candle-collector Architecture
+# crypto-data-warehouse Architecture
 
 ## Components
 
