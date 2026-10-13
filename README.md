@@ -32,7 +32,9 @@ $ curl "localhost:8000/candles?exchange=binance&asset_id=BTC&timeframe=5m&limit=
 
 ## Why
 
-For anyone who needs crypto derivatives data for research or backtesting but doesn't want to pay a data vendor, or to wire up and babysit six exchange APIs by hand. It uses public endpoints only, so you need no exchange API keys. It runs unattended on a server you control and tells you when something breaks.
+For anyone who wants crypto derivatives data for research or backtesting without paying a data vendor or babysitting six exchange APIs by hand. I built it for my own backtests.
+
+Public endpoints only, so no exchange API keys. It runs unattended on a server you control and tells you when something breaks.
 
 **When not to use it:**
 
@@ -53,12 +55,12 @@ For anyone who needs crypto derivatives data for research or backtesting but doe
 
 Timeframes are 1m, 5m, 15m, 30m, 1h, 2h, 4h and 12h, where the exchange offers them.
 
-Every exchange starts with BTC. A daily discovery job adds each asset whose 24h volume tops $1M on any of the perp exchanges, collects it everywhere it's listed, and drops it when it falls below $500k. Thresholds are in `collector/exchanges.yaml`. The reference install currently tracks about 650 assets on Binance, 620 on Bybit, 400 on OKX and 170 on HyperLiquid. Coinbase and dYdX collect BTC only: discovery covers perps, and ccxt can't list dYdX's tickers.
+Every exchange starts with BTC. A daily discovery job adds any asset trading over $1M a day on one of the perp exchanges, collects it everywhere it's listed, and drops it once it falls below $500k (thresholds in `collector/exchanges.yaml`). The reference install is tracking about 650 assets on Binance, 620 on Bybit, 400 on OKX and 170 on HyperLiquid. Coinbase and dYdX are BTC only: discovery covers perps, and ccxt can't list dYdX's tickers.
 
 ## Data notes
 
 - **Timestamps** are UTC, at the candle's open.
-- **Bars are stored once closed** and never change. The exception is HyperLiquid 1m, which arrives over WebSocket: its latest bar updates until it closes.
+- **Bars are stored once closed** and never change. HyperLiquid 1m is the exception: it arrives over WebSocket, so the latest bar updates until it closes.
 - **Gaps:** short outages backfill on the next poll. `GET /status/gaps` lists any stretch where bars are missing, with the count.
 - **HyperLiquid 1m** history only reaches back about 5,000 bars (about 3.5 days), so an older 1m gap there can't be filled.
 - **Liquidations:** Binance and Bybit come from live streams, which start when you start collecting and have no history. HyperLiquid's come from its S3 archive, pulled once a day.
@@ -103,7 +105,7 @@ Thresholds: [`deploy/README.md`](deploy/README.md#monitor-env-vars).
 
 ## Requirements
 
-Docker with Compose v2, on anything that runs it: a VPS, a cloud VM or a home server. There are no Kubernetes manifests yet; contributions welcome.
+Docker with Compose v2, on anything that runs it, from a VPS to a box at home. No Kubernetes manifests yet (contributions welcome).
 
 Measured on the reference install (4 vCPU, 8 GB RAM, all six exchanges, about 700 assets):
 
