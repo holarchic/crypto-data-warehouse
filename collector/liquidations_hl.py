@@ -23,6 +23,7 @@ import argparse
 import datetime as dt
 import json
 import logging
+import os
 from datetime import timezone
 
 import boto3
@@ -378,6 +379,11 @@ def main() -> int:
     ap.add_argument("--start", help="first day YYYYMMDD (backfill); default = last 3 complete UTC days")
     ap.add_argument("--end", help="last day YYYYMMDD inclusive")
     args = ap.parse_args()
+    # Checked here, not as a compose `:?` interpolation: compose interpolates every service, so a
+    # required var on this opt-in job would block `docker compose up` for installs without AWS.
+    if not (os.environ.get("AWS_ACCESS_KEY_ID") and os.environ.get("AWS_SECRET_ACCESS_KEY")):
+        log.error("AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY must be set in .env (requester-pays S3)")
+        return 2
     if args.start and args.end:
         start, end = args.start, args.end
     elif args.start or args.end:
