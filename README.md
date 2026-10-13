@@ -68,6 +68,19 @@ Symbols use ccxt format (`BTC/USDT:USDT`); `asset_id` (`BTC`) joins them across 
 
 ## How it works
 
+```mermaid
+flowchart LR
+    Ex[Exchange APIs<br/>REST and WebSocket] --> Col[Collectors<br/>one per exchange]
+    Disc[Daily discovery] -->|pairs to collect| Col
+    S3[HyperLiquid S3 archive] --> Liq[Daily liquidation pull]
+    Col --> DB[(TimescaleDB)]
+    Liq --> DB
+    DB --> API[Read-only API]
+    API --> You[Your research<br/>and backtests]
+    DB --> Mon[Monitors]
+    Mon --> Alerts[Discord or Slack]
+```
+
 - **Collectors:** one container per exchange. Each polls on candle boundaries, stays inside the exchange's rate limit, and resumes from its last stored bar after a restart. Writes are idempotent.
 - **Storage:** TimescaleDB, compressed after 7 days. Candles are kept for 2 years, everything else for 1 year. 1m candles have their own table, so they can sit on a separate volume.
 - **API:** read-only FastAPI, plus a parquet export for bulk pulls.
