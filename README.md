@@ -1,14 +1,44 @@
 # candle-collector
 
-Your own crypto market-data warehouse. It collects candles, funding rates, open interest, liquidations and the premium index from six exchanges into TimescaleDB, and serves them over a read-only API. It's built to run unattended on a server you control.
+[![CI](https://github.com/holarchic/candle-collector/actions/workflows/ci.yml/badge.svg)](https://github.com/holarchic/candle-collector/actions/workflows/ci.yml)
+[![Release](https://img.shields.io/github/v/release/holarchic/candle-collector)](https://github.com/holarchic/candle-collector/releases)
+[![License: MIT](https://img.shields.io/github/license/holarchic/candle-collector)](LICENSE)
 
-## Who it's for
+Self-hosted crypto market-data warehouse: candles, funding, open interest and liquidations from six exchanges.
 
-Anyone who needs crypto derivatives data for research or backtesting but doesn't want to pay a data vendor, or to wire up and babysit six exchange APIs by hand. Every feed uses public endpoints, so you need no exchange API keys.
+> **Status:** running in production since April 2026, collecting about 700 assets. Pre-1.0: the schema may change between releases.
 
-## Attribution
+```console
+$ curl "localhost:8000/candles?exchange=binance&asset_id=BTC&timeframe=5m&limit=1"
+[
+  {
+    "exchange": "binance",
+    "market_type": "perp",
+    "asset_id": "BTC",
+    "symbol": "BTC/USDT:USDT",
+    "native_symbol": "BTCUSDT",
+    "timeframe": "5m",
+    "timestamp": "2026-10-13T19:10:00+00:00",
+    "open": 83213.9,
+    "high": 83238.7,
+    "low": 83157.4,
+    "close": 83157.4,
+    "volume": 100.932,
+    "quote_volume": null,
+    "trades": null
+  }
+]
+```
 
-For those who care about such things, the majority of the code in this repo was produced by Claude Opus 4.8 (Anthropic), with David (@holarchic) guiding Claude, providing insights, direction and critical review throughout the process.
+## Why
+
+For anyone who needs crypto derivatives data for research or backtesting but doesn't want to pay a data vendor, or to wire up and babysit six exchange APIs by hand. It uses public endpoints only, so you need no exchange API keys. It runs unattended on a server you control and tells you when something breaks.
+
+**When not to use it:**
+
+- You need tick-level trades or order books. Use a paid archive such as [Tardis.dev](https://tardis.dev), or stream them yourself with [cryptofeed](https://github.com/bmoscon/cryptofeed), which handles the connections but leaves storage to you.
+- You need years of history on day one. candle-collector starts with what each exchange returns in one call (up to 1,000 bars per timeframe) and collects forward. For deep Binance history, use its [bulk files](https://data.binance.vision).
+- You need a live feed. Data lands once a bar closes, so trading systems should keep their own real-time connection.
 
 ## What it collects
 
@@ -23,11 +53,22 @@ For those who care about such things, the majority of the code in this repo was 
 
 Timeframes are 1m, 5m, 15m, 30m, 1h, 2h, 4h and 12h, where the exchange offers them.
 
-Each exchange starts with BTC. A daily discovery job adds every pair trading over $1M a day and drops any that fall below $500k (thresholds in `collector/exchanges.yaml`). Symbols use ccxt format (`BTC/USDT:USDT`); `asset_id` (`BTC`) joins them across exchanges.
+Every exchange starts with BTC. A daily discovery job adds each asset whose 24h volume tops $1M on any of the perp exchanges, collects it everywhere it's listed, and drops it when it falls below $500k. Thresholds are in `collector/exchanges.yaml`. The reference install currently tracks about 650 assets on Binance, 620 on Bybit, 400 on OKX and 170 on HyperLiquid. Coinbase and dYdX collect BTC only: discovery covers perps, and ccxt can't list dYdX's tickers.
+
+## Data notes
+
+- **Timestamps** are UTC, at the candle's open.
+- **Bars are stored once closed** and never change. The exception is HyperLiquid 1m, which arrives over WebSocket: its latest bar updates until it closes.
+- **Gaps:** short outages backfill on the next poll. `GET /status/gaps` lists any stretch where bars are missing, with the count.
+- **HyperLiquid 1m** history only reaches back about 5,000 bars (about 3.5 days), so an older 1m gap there can't be filled.
+- **Liquidations:** Binance and Bybit come from live streams, which start when you start collecting and have no history. HyperLiquid's come from its S3 archive, pulled once a day.
+- **`quote_volume` and `trades`** are `null` where the exchange doesn't provide them.
+
+Symbols use ccxt format (`BTC/USDT:USDT`); `asset_id` (`BTC`) joins them across exchanges.
 
 ## How it works
 
-- **Collectors:** one container per exchange. Each polls on candle boundaries, stays inside the exchange's rate limit, and resumes from its last stored bar, so restarts and short outages backfill themselves. Writes are idempotent.
+- **Collectors:** one container per exchange. Each polls on candle boundaries, stays inside the exchange's rate limit, and resumes from its last stored bar after a restart. Writes are idempotent.
 - **Storage:** TimescaleDB, compressed after 7 days. Candles are kept for 2 years, everything else for 1 year. 1m candles have their own table, so they can sit on a separate volume.
 - **API:** read-only FastAPI, plus a parquet export for bulk pulls.
 
@@ -41,15 +82,26 @@ Set `WEBHOOK_URL` in `.env` to a Discord or Slack webhook and it tells you when 
 - **Host monitor**, every 5 minutes via cron: disk usage at 75%, 85% and 95% per mount, low memory, and stopped containers.
 - **Weekly heartbeat:** a summary message, so a silent channel means the alerting itself is down.
 - **Dead-man's switch:** set `HEALTHCHECK_PING_URL` (e.g. healthchecks.io) and the monitor pings it every cycle. If the pings stop, that service alerts you.
-- **On demand:** `GET /status` and `GET /status/gaps` show each collector's last success, error count and gaps.
+- **On demand:** `GET /status` shows each collector's last success, error count and staleness.
 
 Thresholds: [`deploy/README.md`](deploy/README.md#monitor-env-vars).
 
-## Hosting
+## Requirements
 
-It runs anywhere Docker Compose runs: a VPS, a cloud VM or a home server. The reference install runs all six exchanges on 4 vCPU and 8 GB RAM. 1m candles add about 19 GB a year after compression. There are no Kubernetes manifests yet; contributions welcome.
+Docker with Compose v2, on anything that runs it: a VPS, a cloud VM or a home server. There are no Kubernetes manifests yet; contributions welcome.
 
-On a server, always start it with the production override. It keeps Postgres off the network, binds the API to localhost and sets memory limits. Reach the API over an SSH tunnel. [`deploy/README.md`](deploy/README.md) covers provisioning, firewall, cron, backups and updates.
+Measured on the reference install (4 vCPU, 8 GB RAM, all six exchanges, about 700 assets):
+
+| | |
+|---|---|
+| Memory | about 2.5 GB across all containers, 1.5 GB of it the database |
+| Disk | database about 37 GB after six months; 1m candles add about 2.5 GB a month |
+| CPU | near idle, with short bursts at candle boundaries |
+
+It hasn't been tested on less. Start from 4 GB of RAM, and put the database on local SSD, not a network share.
+
+> [!WARNING]
+> This is a database. Back it up: `scripts/backup.sh` and `scripts/restore.sh`. To upgrade, follow [Code updates](deploy/README.md#code-updates); don't rerun `deploy/deploy.sh` on a live install, because it can recreate the database.
 
 ## Quick start
 
@@ -60,14 +112,26 @@ git clone https://github.com/holarchic/candle-collector
 cd candle-collector
 cp .env.example .env     # set POSTGRES_PASSWORD
 docker compose up -d
-curl "http://localhost:8000/candles?exchange=binance&asset_id=BTC&timeframe=5m&limit=5"
 ```
 
-The first 5m candles land within about five minutes. To collect beyond BTC, run discovery: `docker compose --profile discovery run --rm discovery`.
+`curl localhost:8000/health` returns `{"status":"ok"}`. The first 5m candles land within about five minutes; query them with the `curl` at the top of this page. To collect beyond BTC, run discovery: `docker compose --profile discovery run --rm discovery`.
 
-This compose file publishes Postgres (5432) and the API (8000) on every interface. Don't use it on a public server.
+> [!CAUTION]
+> This compose file publishes Postgres (5432) and the API (8000) on every interface. On a server, use the production override instead. It keeps Postgres off the network, binds the API to localhost and sets memory limits. [`deploy/README.md`](deploy/README.md) covers provisioning, firewall, cron and updates.
 
-HyperLiquid's liquidation history comes from a separate daily job (`--profile liquidations-hl`). It reads a requester-pays S3 bucket, so it needs AWS credentials in `.env`, and AWS bills you for the transfer.
+HyperLiquid liquidation history comes from a separate daily job (`--profile liquidations-hl`). It reads a requester-pays S3 bucket, so it needs AWS credentials in `.env`, and AWS bills you for the transfer.
+
+## Install with a coding agent
+
+Paste this into Claude Code, Codex, Cursor or similar:
+
+```text
+Install candle-collector for me by following
+https://raw.githubusercontent.com/holarchic/candle-collector/v0.24.0/docs/agent-install.md
+Ask me before anything that costs money, opens a public port, or deletes data.
+```
+
+The agent will ask whether you want a laptop trial or a server, check prerequisites, write `.env` (asking you for an alert webhook), start the stack, and verify that candles are landing. The full guide is [`docs/agent-install.md`](docs/agent-install.md).
 
 ## API
 
@@ -89,37 +153,18 @@ Example queries: [`deploy/README.md`](deploy/README.md#api-queries).
 - `collector/exchanges.yaml`: exchanges, timeframes, rate limits, discovery thresholds.
 - `.env`: Postgres credentials, alert webhook and thresholds, optional AWS credentials. See `.env.example`.
 
-## For coding agents
+## Disclaimer
 
-If you're installing this for a user, do these steps in order and run every check.
+The data is provided as is, without warranty, and may contain gaps or errors. Nothing here is financial advice. You're responsible for following each exchange's terms of service and rate limits.
 
-1. **Prerequisites.** `docker compose version` reports v2. On a laptop, ports 5432 and 8000 are free. For production, the host is a fresh Ubuntu 24.04 server.
-2. **Provision (server only).** As root: `git clone https://github.com/holarchic/candle-collector.git /opt/candle-collector && /opt/candle-collector/deploy/setup.sh`. It installs Docker, log rotation and UFW (SSH only). Tell the user to keep port 8000 closed in their provider's firewall too.
-3. **Configure.** `cp .env.example .env` and set `POSTGRES_PASSWORD` to a random value (`openssl rand -hex 24`). Ask the user for a Discord or Slack webhook for `WEBHOOK_URL`. Leave the AWS variables empty unless the user wants HyperLiquid liquidation history and accepts the S3 transfer cost. No exchange API keys are needed.
-4. **Start.** Laptop: `docker compose up -d`. Server: `./deploy/deploy.sh`, which builds, starts with the production override, waits for the API and installs the cron jobs.
-5. **Verify.**
-   - `curl -s localhost:8000/health` returns `{"status":"ok"}`.
-   - After 6 minutes, `curl -s "localhost:8000/candles?exchange=binance&asset_id=BTC&timeframe=5m&limit=1"` returns one candle with every OHLCV field set.
-   - `curl -s localhost:8000/status` shows the 5m rows with `"is_stale": false`.
-6. **Widen.** Run discovery (above). On a server, add `-f docker-compose.yml -f docker-compose.prod.yml`; cron repeats it daily.
+## Contributing and security
 
-Rules:
+Contributions are welcome: see [`CONTRIBUTING.md`](CONTRIBUTING.md). Report vulnerabilities privately: see [`SECURITY.md`](SECURITY.md).
 
-- Never publish ports 5432 or 8000 to the internet. Use an SSH tunnel.
-- Ship updates the way [`deploy/README.md`](deploy/README.md#code-updates) describes. Don't rerun `deploy.sh` on a live install: it can recreate the database.
-- Don't write to the database by hand. Schema changes go in `db/migrations/` and `db/init.sql`.
-- Without AWS credentials, the daily `liquidations-hl` cron job exits with code 2. That's expected; remove its crontab line if the user doesn't want the job.
+## Attribution
 
-## Limits
-
-- Not a live feed: data is up to one bar old.
-- HyperLiquid serves only about 5,000 bars of 1m history (about 3.5 days), so an older 1m gap there can't be backfilled.
-- Binance and Bybit liquidation streams start when you start collecting. There's no history.
-
-## Contributing
-
-Contributions are welcome. See [`CONTRIBUTING.md`](CONTRIBUTING.md).
+For those who care about such things, the majority of the code in this repo was produced by Claude Opus 4.8 (Anthropic), with David (@holarchic) guiding Claude, providing insights, direction and critical review throughout the process.
 
 ## License
 
-MIT
+[MIT](LICENSE)
