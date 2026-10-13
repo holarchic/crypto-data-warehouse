@@ -73,12 +73,10 @@ docker compose up -d && sleep 320 && curl -s "http://localhost:8000/candles?exch
 
 Pass: returns ≥1 candle with all OHLCV fields populated, correct exchange/symbol/timeframe.
 
-## Production (Hetzner)
+## Production
 
-- **Server:** Hetzner CX33 (x86) — 4 vCPU, 8GB RAM, 80GB disk (nbg1)
-- **IP:** <server-ip>
-- **SSH alias:** `ssh <server>` (configured in `~/.ssh/config` with key `~/.ssh/<your-key>`)
-- **API tunnel:** `ssh -L 8000:localhost:8000 <server>` then query `localhost:8000`
+- **Server:** one VPS. The reference install is a Hetzner CX33 (x86, 4 vCPU, 8 GB RAM, 80 GB disk) plus a Hetzner Cloud Volume mounted at `/mnt/pgvol` for the 1m candles tablespace
+- **API access:** SSH tunnel, `ssh -L 8000:localhost:8000 <server>`, then query `localhost:8000`
 - **Project dir:** `/opt/candle-collector`
 
 ### Production commands
@@ -88,10 +86,16 @@ Pass: returns ≥1 candle with all OHLCV fields populated, correct exchange/symb
 | Start prod | `docker compose -f docker-compose.yml -f docker-compose.prod.yml up -d` |
 | Stop prod | `docker compose -f docker-compose.yml -f docker-compose.prod.yml down` |
 | Prod logs | `docker compose -f docker-compose.yml -f docker-compose.prod.yml logs -f` |
-| Code update | `git pull` → `build <changed svcs>` → `up -d --no-deps <svcs>` (see AGENTS.md `## Deploy`) |
+| Code update | `git pull` → `build <changed svcs>` → `up -d --no-deps <svcs>` (see Code updates below) |
 | Fresh install / full redeploy | `./deploy/deploy.sh` — pulls `latest-pg16` + stack-wide `up -d`; can recreate the db |
 | Server setup | `./deploy/setup.sh [GCP_IP...]` |
 | Run discovery (prod) | `docker compose -f docker-compose.yml -f docker-compose.prod.yml --profile discovery run --rm discovery` |
+
+### Code updates
+
+- Code updates never touch the db container. `git pull`, then `build` only the services whose code or config changed, including the profile one-shots `discovery` and `liquidations-hl` (they bake in `collector/` and `exchanges.yaml`), then `up -d --no-deps <svc…>`.
+- Deploy mid-interval (e.g. xx:20 – xx:40), away from the 00/08/16 UTC funding settlements.
+- `deploy/deploy.sh` is for fresh installs and full redeploys only: its `compose pull db` and stack-wide `up -d` can recreate the db onto a moved `latest-pg16`.
 
 ### DB tuning
 
@@ -99,7 +103,7 @@ TimescaleDB auto-tunes `max_connections` low (~25 on 8GB). Override via `command
 
 ### Firewall
 
-- **Hetzner Cloud Firewall** (`firewall-1`, primary, attached to the server): inbound SSH from any; port 8000 only from the server's own IP (effectively closed)
+- **Provider firewall** (primary, e.g. Hetzner Cloud Firewall): inbound SSH; keep port 8000 closed
 - **API bind:** `127.0.0.1:8000` (`docker-compose.prod.yml`). Docker-published ports bypass UFW, so the loopback bind — not UFW — is what keeps the API off the public interface
 - **UFW** (defense-in-depth): SSH only
 - **Local access:** SSH tunnel — no firewall rule needed
