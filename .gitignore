@@ -39,3 +39,16 @@ data/
 
 # Claude Code session state
 .claude/
+
+# Local harness docs (never published)
+AGENTS.md
+CLAUDE.md
+STATUS.md
+NOTES.md
+TASKS.md
+LESSONS.md
+SPEC.md
+roadmap.md
+graduation-tracking.md
+plans/
+archive/
