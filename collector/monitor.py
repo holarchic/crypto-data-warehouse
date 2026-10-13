@@ -254,7 +254,7 @@ def send_webhook(url, text):
     payload = build_webhook_payload(text)
     headers = {
         "Content-Type": "application/json",
-        "User-Agent": "candle-collector-monitor/1.0 (+https://github.com/holarchic/candle-collector)",
+        "User-Agent": "candle-collector-monitor/1.0 (+https://github.com/holarchic/crypto-data-warehouse)",
     }
     req = urllib.request.Request(url, data=payload, headers=headers)
     try:

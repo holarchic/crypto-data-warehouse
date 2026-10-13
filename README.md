@@ -1,8 +1,8 @@
-# candle-collector
+# crypto-data-warehouse
 
-[![CI](https://github.com/holarchic/candle-collector/actions/workflows/ci.yml/badge.svg)](https://github.com/holarchic/candle-collector/actions/workflows/ci.yml)
-[![Release](https://img.shields.io/github/v/release/holarchic/candle-collector)](https://github.com/holarchic/candle-collector/releases)
-[![License: MIT](https://img.shields.io/github/license/holarchic/candle-collector)](LICENSE)
+[![CI](https://github.com/holarchic/crypto-data-warehouse/actions/workflows/ci.yml/badge.svg)](https://github.com/holarchic/crypto-data-warehouse/actions/workflows/ci.yml)
+[![Release](https://img.shields.io/github/v/release/holarchic/crypto-data-warehouse)](https://github.com/holarchic/crypto-data-warehouse/releases)
+[![License: MIT](https://img.shields.io/github/license/holarchic/crypto-data-warehouse)](LICENSE)
 
 Self-hosted crypto data warehouse: OHLCV, funding rate, open interest, liquidations. Binance, Bybit, HyperLiquid, OKX.
 
@@ -37,7 +37,7 @@ For anyone who needs crypto derivatives data for research or backtesting but doe
 **When not to use it:**
 
 - You need tick-level trades or order books. Use a paid archive such as [Tardis.dev](https://tardis.dev), or stream them yourself with [cryptofeed](https://github.com/bmoscon/cryptofeed), which handles the connections but leaves storage to you.
-- You need years of history on day one. candle-collector starts with what each exchange returns in one call (up to 1,000 bars per timeframe) and collects forward. For deep Binance history, use its [bulk files](https://data.binance.vision).
+- You need years of history on day one. crypto-data-warehouse starts with what each exchange returns in one call (up to 1,000 bars per timeframe) and collects forward. For deep Binance history, use its [bulk files](https://data.binance.vision).
 - You need a live feed. Data lands once a bar closes, so trading systems should keep their own real-time connection.
 
 ## What it collects
@@ -123,8 +123,8 @@ It hasn't been tested on less. Start from 4 GB of RAM, and put the database on l
 On a laptop:
 
 ```bash
-git clone https://github.com/holarchic/candle-collector
-cd candle-collector
+git clone https://github.com/holarchic/crypto-data-warehouse
+cd crypto-data-warehouse
 cp .env.example .env     # set POSTGRES_PASSWORD
 docker compose up -d
 ```
@@ -141,8 +141,8 @@ HyperLiquid liquidation history comes from a separate daily job (`--profile liqu
 Paste this into Claude Code, Codex, Cursor or similar:
 
 ```text
-Install candle-collector for me by following
-https://raw.githubusercontent.com/holarchic/candle-collector/v0.24.0/docs/agent-install.md
+Install crypto-data-warehouse for me by following
+https://raw.githubusercontent.com/holarchic/crypto-data-warehouse/v0.24.1/docs/agent-install.md
 Ask me before anything that costs money, opens a public port, or deletes data.
 ```
 

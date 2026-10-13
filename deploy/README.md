@@ -1,4 +1,4 @@
-# candle-collector — Ops & Deployment
+# crypto-data-warehouse — Ops & Deployment
 
 ## Environment
 
@@ -77,7 +77,7 @@ Pass: returns ≥1 candle with all OHLCV fields populated, correct exchange/symb
 
 - **Server:** one VPS. The reference install is a Hetzner CX33 (x86, 4 vCPU, 8 GB RAM, 80 GB disk) plus a Hetzner Cloud Volume mounted at `/mnt/pgvol` for the 1m candles tablespace
 - **API access:** SSH tunnel, `ssh -L 8000:localhost:8000 <server>`, then query `localhost:8000`
-- **Project dir:** `/opt/candle-collector`
+- **Project dir:** `/opt/crypto-data-warehouse`
 
 ### Production commands
 
