@@ -89,15 +89,16 @@ services:
     restart: "no"
 
   # HL Grade-A liquidation daily pull (T-009.3) — one-shot batch from the requester-pays node_fills S3
-  # tape, run by cron. `:?` fails fast if the scoped AWS creds are missing from .env.
+  # tape, run by cron. The job exits 2 if the AWS creds are missing from .env (checked in
+  # liquidations_hl.main, not `:?` here — compose interpolates every service, profiled or not).
   liquidations-hl:
     <<: *collector-common
     profiles: ["liquidations-hl"]
     command: ["python", "-m", "liquidations_hl"]
     environment:
       <<: *collector-env
-      AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID:?set AWS_ACCESS_KEY_ID in .env}
-      AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY:?set AWS_SECRET_ACCESS_KEY in .env}
+      AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID:-}
+      AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY:-}
     restart: "no"
 
   api:

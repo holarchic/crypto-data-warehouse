@@ -244,3 +244,16 @@ def test_insert_sql_shape():
     assert "to_timestamp(%(ts)s)" in sql  # seconds, not ms
     assert "'hyperliquid'" in sql and "'a'" in sql
     assert "ON CONFLICT (venue, asset_id, timestamp, oid, tid) DO NOTHING" in sql
+
+
+# ---- entrypoint ----
+
+
+def test_main_exits_2_without_aws_creds(monkeypatch):
+    monkeypatch.delenv("AWS_ACCESS_KEY_ID", raising=False)
+    monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "")
+    monkeypatch.setattr("sys.argv", ["liquidations_hl"])
+    run = MagicMock()
+    monkeypatch.setattr(hl, "run", run)
+    assert hl.main() == 2
+    run.assert_not_called()
