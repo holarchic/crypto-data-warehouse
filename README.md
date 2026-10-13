@@ -78,6 +78,8 @@ Module and table detail: [`ARCHITECTURE.md`](ARCHITECTURE.md).
 
 Set `WEBHOOK_URL` in `.env` to a Discord or Slack webhook and it tells you when something breaks.
 
+<img src="docs/images/discord-alerts.png" alt="Discord channel showing a weekly heartbeat and an alert for 255 stale Binance 1m collectors" width="640">
+
 - **Collector monitor**, every 5 minutes: alerts when a feed goes stale, when a gap appears, and when the number of failing collectors jumps above its recent baseline. Repeats are deduplicated.
 - **Host monitor**, every 5 minutes via cron: disk usage at 75%, 85% and 95% per mount, low memory, and stopped containers.
 - **Weekly heartbeat:** a summary message, so a silent channel means the alerting itself is down.
