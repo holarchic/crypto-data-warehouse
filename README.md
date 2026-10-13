@@ -4,7 +4,7 @@
 [![Release](https://img.shields.io/github/v/release/holarchic/candle-collector)](https://github.com/holarchic/candle-collector/releases)
 [![License: MIT](https://img.shields.io/github/license/holarchic/candle-collector)](LICENSE)
 
-Self-hosted crypto market-data warehouse: candles, funding, open interest and liquidations from six exchanges.
+Self-hosted crypto data warehouse: OHLCV, funding rate, open interest, liquidations. Binance, Bybit, HyperLiquid, OKX.
 
 > **Status:** running in production since April 2026, collecting about 700 assets. Pre-1.0: the schema may change between releases.
 
