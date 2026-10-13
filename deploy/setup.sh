@@ -2,8 +2,8 @@
 # One-time server provisioning for candle-collector.
 # Run as root on a fresh Ubuntu 24.04 VM.
 #
-# Usage: ./deploy/setup.sh [GCP_IP_1] [GCP_IP_2] ...
-#   GCP IPs are added to UFW allow rules for port 8000.
+# Usage: ./deploy/setup.sh [CLIENT_IP_1] [CLIENT_IP_2] ...
+#   Client IPs are added to UFW allow rules for port 8000.
 #   If none provided, only SSH is allowed (use SSH tunnel for API access).
 #
 # Idempotent — safe to re-run.
@@ -67,24 +67,24 @@ else
 fi
 
 # -- UFW firewall (defense-in-depth) ------------------------------------------
-# Primary firewall is Hetzner Cloud Firewall (hypervisor level).
+# Primary firewall is your provider's (e.g. Hetzner Cloud Firewall, hypervisor level).
 # UFW is a second layer. Docker manipulates iptables directly and can
-# bypass UFW — the Hetzner firewall is what you actually trust.
+# bypass UFW — the provider firewall is what you actually trust.
 
 info "Configuring UFW"
 ufw default deny incoming
 ufw default allow outgoing
 ufw allow 22/tcp comment "SSH"
 
-# Add GCP IPs for API access
-GCP_IPS=("$@")
-if [ ${#GCP_IPS[@]} -gt 0 ]; then
-    for ip in "${GCP_IPS[@]}"; do
+# Add client IPs for API access
+CLIENT_IPS=("$@")
+if [ ${#CLIENT_IPS[@]} -gt 0 ]; then
+    for ip in "${CLIENT_IPS[@]}"; do
         ufw allow from "$ip" to any port 8000 proto tcp comment "candle-collector API"
         info "UFW: allowed $ip -> port 8000"
     done
 else
-    warn "No GCP IPs provided. Port 8000 not opened in UFW."
+    warn "No client IPs provided. Port 8000 not opened in UFW."
     warn "Use SSH tunnel for API access: ssh -L 8000:localhost:8000 root@<server-ip>"
 fi
 
@@ -113,8 +113,6 @@ echo "  UFW status:"
 ufw status numbered
 echo ""
 echo "Next steps:"
-echo "  1. Generate deploy key:  ssh-keygen -t ed25519 -C 'deploy-key'"
-echo "  2. Add public key to GitHub repo -> Settings -> Deploy Keys"
-echo "  3. Clone repo:  git clone git@github.com:holarchic/candle-collector.git $PROJECT_DIR"
-echo "  4. Create .env: cp $PROJECT_DIR/.env.example $PROJECT_DIR/.env && nano $PROJECT_DIR/.env"
-echo "  5. Deploy:      $PROJECT_DIR/deploy/deploy.sh"
+echo "  1. Clone repo:  git clone https://github.com/holarchic/candle-collector.git $PROJECT_DIR"
+echo "  2. Create .env: cp $PROJECT_DIR/.env.example $PROJECT_DIR/.env && nano $PROJECT_DIR/.env"
+echo "  3. Deploy:      $PROJECT_DIR/deploy/deploy.sh"

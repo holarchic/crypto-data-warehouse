@@ -10,7 +10,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 COMPOSE="docker compose -f docker-compose.yml -f docker-compose.prod.yml"
-REPO_URL="git@github.com:holarchic/candle-collector.git"
+REPO_URL="https://github.com/holarchic/candle-collector.git"
 # DB backups are DISABLED (2026-08-22): on-box dumps were deleted and the backup +
 # retention cron (below) removed, pending an OFFSITE DR target (restic -> Backblaze B2
 # or a Hetzner Storage Box). On-box dumps on /mnt/pgvol gave no real DR and crowded the
