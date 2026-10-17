@@ -442,6 +442,37 @@ def test_compute_alarming_time_gate_is_strict():
     assert compute_alarming(rows, TF_INTERVALS) == []
 
 
+# The shared TF_INTERVALS fixture has no 1m; these tests pin the ALARMING_DARK_FLOOR_S floor.
+SHORT_TF_INTERVALS = {"1m": 60, "5m": 300, "15m": 900}
+
+
+def _dark_row(tf, since, errors=0):
+    return {"exchange": "binance", "symbol": "ETH/USDT:USDT", "timeframe": tf,
+            "seconds_since_success": since, "error_count": errors}
+
+
+def test_compute_alarming_1m_cursor_below_floor_is_not_alarming():
+    """Binance 1m is RTT-bound (~3–10 min a cycle): 900s since success is the cursor, not dark."""
+    assert compute_alarming([_dark_row("1m", 900)], SHORT_TF_INTERVALS) == []
+
+
+def test_compute_alarming_1m_floor_is_strict():
+    assert compute_alarming([_dark_row("1m", 1200)], SHORT_TF_INTERVALS) == []
+    assert len(compute_alarming([_dark_row("1m", 1201)], SHORT_TF_INTERVALS)) == 1
+
+
+def test_compute_alarming_1m_error_channel_ignores_floor():
+    """A 1m collector failing every fetch still counts via the error channel, success or not."""
+    assert len(compute_alarming([_dark_row("1m", 60, errors=3)], SHORT_TF_INTERVALS)) == 1
+
+
+def test_compute_alarming_floor_leaves_longer_tfs_at_4x_interval():
+    """15m keeps its own 3600s gate: the floor must not lower it to 1200."""
+    assert compute_alarming([_dark_row("15m", 1500)], SHORT_TF_INTERVALS) == []
+    assert compute_alarming([_dark_row("15m", 3600)], SHORT_TF_INTERVALS) == []
+    assert len(compute_alarming([_dark_row("15m", 3601)], SHORT_TF_INTERVALS)) == 1
+
+
 def test_compute_alarming_skips_loop_pseudo_tfs():
     """A dead funding/OI loop heartbeat is NOT counted here — it pages via the separate
     presence alert; padding the candle count would dilute the +delta signal."""
