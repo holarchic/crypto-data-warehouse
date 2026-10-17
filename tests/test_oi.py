@@ -122,8 +122,27 @@ def test_sleep_until_next_clamps_buffer_to_half_interval(monkeypatch):
     monkeypatch.setattr(oi.time, "time", lambda: 1000.0)
     monkeypatch.setattr(oi.time, "sleep", lambda s: slept.setdefault("s", s))
     oi._sleep_until_next(30, 30)
-    # next 30s boundary after 1000 is 1020, +min(30,15)=15 → 1035 → sleep 35s (< a full 60s)
-    assert slept["s"] == 35.0
+    # slots are k*30 + min(30,15) = …975, 1005, 1035; the next after 1000 is 1005 → sleep 5s
+    assert slept["s"] == 5.0
+
+
+def test_sleep_until_next_keeps_slot_after_overrunning_boundary(monkeypatch):
+    # A dense cycle started at slot 990 (=960+30) runs 37s, ending at 1027 — past the 1020
+    # boundary but before its 1050 slot. It must wait for 1050 (23s, 60s cadence), not skip
+    # to 1110 (83s, 120s cadence).
+    slept = {}
+    monkeypatch.setattr(oi.time, "time", lambda: 1027.0)
+    monkeypatch.setattr(oi.time, "sleep", lambda s: slept.setdefault("s", s))
+    oi._sleep_until_next(60, 30)
+    assert slept["s"] == 23.0
+
+
+def test_sleep_until_next_on_slot_waits_full_interval(monkeypatch):
+    slept = {}
+    monkeypatch.setattr(oi.time, "time", lambda: 1050.0)
+    monkeypatch.setattr(oi.time, "sleep", lambda s: slept.setdefault("s", s))
+    oi._sleep_until_next(60, 30)
+    assert slept["s"] == 60.0
 
 
 # --- Slice B: insert/commit/rollback discipline via a fake conn ---------------

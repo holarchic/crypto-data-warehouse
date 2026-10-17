@@ -4,7 +4,7 @@ import logging
 import threading
 import time
 
-from config import ExchangeConfig
+from config import ExchangeConfig, load_config
 from rate_limiter import (
     RateLimiter,
     WeightRateLimiter,
@@ -352,6 +352,12 @@ def test_build_rate_limiter_weight_path_wires_priority_reserve():
     )
     assert isinstance(lim, WeightRateLimiter)
     assert lim._priority_reserve == 100
+
+
+def test_build_rate_limiter_binance_config_keeps_reserve():
+    # The shipped binance reserve must survive the half-usable-cap neutralisation: a reserve
+    # ≥ 1000 silently drops to 0 and the dense lane disappears.
+    assert build_rate_limiter(load_config("binance"))._priority_reserve == 800
 
 
 def test_build_rate_limiter_interval_path_for_no_budget():
