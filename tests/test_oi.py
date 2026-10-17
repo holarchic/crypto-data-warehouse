@@ -116,8 +116,8 @@ def test_sleep_until_next_computes_boundary(monkeypatch):
 
 
 def test_sleep_until_next_clamps_buffer_to_half_interval(monkeypatch):
-    # 30s interval + 30s buffer would target the NEXT boundary (doubling the period);
-    # the clamp caps buffer at interval//2=15 → ~30s cadence, not ~60s.
+    # A 30s buffer on a 30s interval would fold the slot onto the boundary (1020, sleep 20);
+    # the clamp caps the buffer at interval//2=15 so the slot sits mid-period.
     slept = {}
     monkeypatch.setattr(oi.time, "time", lambda: 1000.0)
     monkeypatch.setattr(oi.time, "sleep", lambda s: slept.setdefault("s", s))

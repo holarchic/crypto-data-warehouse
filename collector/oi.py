@@ -147,9 +147,9 @@ def _sleep_until_next(interval_s, buffer_s):
     next *boundary* plus the buffer instead would skip a slot whenever a cycle ends after a
     boundary but before its buffer point — a 37s Binance dense cycle started at :30 ends at :07
     and would wait until the following :30, halving the unbackfillable dense cadence to 120s.
-    The buffer is clamped to half the interval so it can never push the target a full interval
-    past the boundary — at a sub-minute cadence (Bybit/OKX 30s) a raw 30s buffer would land on
-    the *next* boundary and silently double the poll period to ~60s."""
+    The buffer is clamped to half the interval so the slot stays mid-period: at a sub-minute
+    cadence (Bybit/OKX 30s) the shared 30s buffer equals the interval and would fold the slot
+    back onto the boundary itself, polling at the instant the venue rolls its data."""
     buffer_s = min(buffer_s, interval_s // 2)
     now = time.time()
     next_boundary = ((now - buffer_s) // interval_s + 1) * interval_s + buffer_s
