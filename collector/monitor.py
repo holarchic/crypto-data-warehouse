@@ -75,7 +75,7 @@ def compute_alarming(status_rows, timeframe_intervals, error_threshold=3):
       - time channel (`seconds_since_success > max(4×interval, ALARMING_DARK_FLOOR_S)`): a
         previously-working collector gone dark, past a gate well above the within-cycle
         collection cursor.
-    Excludes the benign new-listing floor (no errors, never succeeded), the sub-4×interval cursor,
+    Excludes the benign new-listing floor (no errors, never succeeded), the sub-gate cursor,
     and the transient single-error blip. Loop-heartbeat pseudo-TFs are skipped — they page via their
     own presence alert and a single dead loop must not pad this count.
     """
@@ -329,7 +329,7 @@ def fetch_status_rows(conn):
     """Fetch all active collection_status rows with derived seconds_since_success.
 
     One fetch feeds both staleness (gap-skip + loop-liveness presence) and the alarming
-    subset — alarming is NOT a subset of staleness (its 4×interval gate is below the staleness
+    subset — alarming is NOT a subset of staleness (its dark gate is below the staleness
     threshold for short TFs), so both compute over the same full row set.
     """
     with conn.cursor() as cur:
