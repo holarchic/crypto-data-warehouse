@@ -23,6 +23,11 @@ log = logging.getLogger(__name__)
 # collector, but carry no candle series — so gap detection skips them.
 LOOP_TIMEFRAMES = frozenset(LOOP_INTERVALS)
 
+# Floor on the alarming time gate. A REST candle loop fetches its pairs serially, so its cycle
+# is bound by per-pair RTT × pair count, not by the interval: ~680 Binance 1m pairs take ~3 min
+# (up to ~10 min at a settlement), far past 4×60s. Only 1m sits below the floor; 5m is at it.
+ALARMING_DARK_FLOOR_S = 1200
+
 # Result of one alarming-signal evaluation (named, not positional). `should_record` carries the
 # baseline-update invariant (record only non-breaching counts) so the caller doesn't re-derive it.
 AlarmingDecision = namedtuple("AlarmingDecision", ["baseline", "should_fire", "next_consecutive", "should_record"])
@@ -67,8 +72,9 @@ def compute_alarming(status_rows, timeframe_intervals, error_threshold=3):
         cycle, then clears on their next success. Gating at `>0` counted that wave as alarming and
         paged on backfilled-losslessly noise (measured spikes to 356); `>=3` requires sustained
         failure, restoring the design's baseline≈0 assumption.
-      - time channel (`seconds_since_success > 4×interval`): a previously-working collector gone
-        dark, past a gate well above the within-cycle collection cursor.
+      - time channel (`seconds_since_success > max(4×interval, ALARMING_DARK_FLOOR_S)`): a
+        previously-working collector gone dark, past a gate well above the within-cycle
+        collection cursor.
     Excludes the benign new-listing floor (no errors, never succeeded), the sub-4×interval cursor,
     and the transient single-error blip. Loop-heartbeat pseudo-TFs are skipped — they page via their
     own presence alert and a single dead loop must not pad this count.
@@ -82,7 +88,8 @@ def compute_alarming(status_rows, timeframe_intervals, error_threshold=3):
         if interval_s is None:
             continue
         since = row.get("seconds_since_success")
-        if row.get("error_count", 0) >= error_threshold or (since is not None and since > 4 * interval_s):
+        dark_gate_s = max(4 * interval_s, ALARMING_DARK_FLOOR_S)
+        if row.get("error_count", 0) >= error_threshold or (since is not None and since > dark_gate_s):
             alarming.append(row)
     return alarming
 
