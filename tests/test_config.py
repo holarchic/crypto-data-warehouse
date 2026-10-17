@@ -111,9 +111,9 @@ def test_oi_cadence_knobs_per_exchange():
     assert binance.oi_settlement_window_s == 900
     assert binance.oi_baseline_interval_s == 1800
     assert binance.oi_dense_concurrency == 6
-    # Dense-OI weight lane (T-007.4): binance reserves 600 for the priority dense burst — sized
-    # to the dense weight-RATE (~543/min at a mass settlement), not the in-flight count.
-    assert binance.rate_limit_priority_reserve == 600
+    # Dense-OI weight lane (T-007.4): binance reserves 800 for the priority dense burst — sized
+    # to the dense weight-RATE (~700/min at the 60s cadence), not the in-flight count.
+    assert binance.rate_limit_priority_reserve == 800
 
 
 def test_oi_cadence_defaults_for_non_oi_exchange():
