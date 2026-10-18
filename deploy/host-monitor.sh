@@ -82,7 +82,9 @@ disk_band_label() {
 
 disk_now=$(date +%s)
 for mount in "${DISK_MOUNTS[@]}"; do
-    pct=$(df "$mount" --output=pcent 2>/dev/null | tail -1 | tr -d ' %')
+    # Under pipefail a failed df fails the assignment; without `|| pct=""` that aborts the
+    # whole monitor instead of skipping this mount.
+    pct=$(df "$mount" --output=pcent 2>/dev/null | tail -1 | tr -d ' %') || pct=""
     [ -z "${pct:-}" ] && continue                      # mount absent / df failed — skip
     band=$(disk_band "$pct")
     state_file="$DISK_STATE_DIR/$(echo "$mount" | tr '/' '_')"
