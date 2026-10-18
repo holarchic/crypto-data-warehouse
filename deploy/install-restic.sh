@@ -18,6 +18,12 @@ if [ "$(uname -m)" != "x86_64" ]; then
     exit 1
 fi
 
+# The release ships bzip2-compressed, and Ubuntu's minimal server image has no bzip2.
+if ! command -v bunzip2 > /dev/null; then
+    echo "==> Installing bzip2"
+    DEBIAN_FRONTEND=noninteractive apt-get install -y -qq bzip2 > /dev/null
+fi
+
 tmp=$(mktemp -d)
 trap 'rm -rf "$tmp"' EXIT
 
