@@ -78,7 +78,7 @@ log "TimescaleDB ${TSDB_VERSION}, PostgreSQL ${PG_MAJOR}"
 
 log "Dumping candle_collector into the repository"
 restic_run backup --host "$SNAPSHOT_HOST" \
-    --tag "timescaledb-${TSDB_VERSION}" --tag "pg${PG_MAJOR}" \
+    --tag "${SNAPSHOT_TAG_TIMESCALEDB}${TSDB_VERSION}" --tag "${SNAPSHOT_TAG_PG}${PG_MAJOR}" \
     --stdin-filename "$SNAPSHOT_FILE" --stdin-from-command -- \
     env -u AWS_ACCESS_KEY_ID -u AWS_SECRET_ACCESS_KEY -u AWS_SESSION_TOKEN \
     "${DC[@]}" exec -T db pg_dump -U candles --format=custom --compress=0 candle_collector \

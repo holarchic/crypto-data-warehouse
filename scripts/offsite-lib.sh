@@ -9,6 +9,9 @@ BACKUP_OK_MARKER="${BACKUP_OK_MARKER:-/var/lib/candle-collector/backup-ok}"
 # Fixed rather than the hostname, so retention groups survive a host rebuild.
 SNAPSHOT_HOST="candle-collector"
 SNAPSHOT_FILE="candle_collector.dump"
+# Each snapshot carries one tag of each, <prefix><version>, naming the image to restore into.
+SNAPSHOT_TAG_TIMESCALEDB="timescaledb-"
+SNAPSHOT_TAG_PG="pg"
 
 # Runs restic with the env file's variables, which exist only in restic's process, never in
 # the caller's shell. Returns restic's status, and the caller decides how a failure is

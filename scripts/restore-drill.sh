@@ -103,6 +103,7 @@ def tag(snap, prefix):
         sys.exit("snapshot " + snap["short_id"] + " lacks one " + prefix + "<version> tag")
     return values[0]
 
+timescaledb_prefix, pg_prefix = sys.argv[1], sys.argv[2]
 snaps = json.load(sys.stdin)
 if not snaps:
     sys.exit("no snapshots for this host")
@@ -112,14 +113,14 @@ day = instant.date()
 fields = {
     "snapshot_id": snap["id"],
     "snapshot_time": instant.strftime("%Y-%m-%dT%H:%M:%SZ"),
-    "timescaledb_version": tag(snap, "timescaledb-"),
-    "pg_major": tag(snap, "pg"),
+    "timescaledb_version": tag(snap, timescaledb_prefix),
+    "pg_major": tag(snap, pg_prefix),
     "count_since": (day - timedelta(days=14)).isoformat(),
     "count_until": (day - timedelta(days=4)).isoformat(),
 }
 for key, value in fields.items():
     print(key + "=" + value)
-')
+' "$SNAPSHOT_TAG_TIMESCALEDB" "$SNAPSHOT_TAG_PG")
 SNAP_ID="" SNAP_TIME="" TSDB_VERSION="" PG_MAJOR="" SINCE="" UNTIL=""
 while IFS='=' read -r key value; do
     case "$key" in
