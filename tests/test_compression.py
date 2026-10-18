@@ -30,17 +30,27 @@ def test_compression_policies_for_all_tables():
         assert f"add_compression_policy('{table}'" in sql, f"Missing compression policy for {table}"
 
 
+def _sql_without_comments(path):
+    """The file's SQL with `--` comments removed, so a commented-out statement never counts."""
+    return re.sub(r"--[^\n]*", "", _read(path))
+
+
 def test_no_db_file_adds_retention():
     """The warehouse keeps all history: neither init.sql nor any migration (operators re-run them by
-    hand) may add a retention policy, or a re-run silently restores deletion."""
+    hand) may add a retention policy, or a re-run silently restores deletion. SQL function names
+    are case-insensitive, so the scan is too."""
     for path in [INIT_SQL, *sorted(MIGRATIONS.glob("*.sql"))]:
-        assert "add_retention_policy" not in _read(path), f"{path.name} adds a retention policy"
+        assert not re.search(r"add_retention_policy", _read(path), re.IGNORECASE), (
+            f"{path.name} adds a retention policy"
+        )
 
 
 def test_migration_013_removes_every_former_retention_policy():
     """013 clears every policy the old migrations set, idempotently, on tables init.sql creates."""
-    sql = _read(MIGRATION_013)
-    removed = set(re.findall(r"remove_retention_policy\('(\w+)', if_exists => TRUE\)", sql))
+    sql = _sql_without_comments(MIGRATION_013)
+    removed = set(re.findall(
+        r"remove_retention_policy\(\s*'(\w+)'\s*,\s*if_exists\s*=>\s*TRUE\s*\)", sql, re.IGNORECASE
+    ))
     created = set(re.findall(r"create_hypertable\('(\w+)'", _read(INIT_SQL)))
     assert removed == FORMER_RETENTION_TABLES
     assert FORMER_RETENTION_TABLES <= created

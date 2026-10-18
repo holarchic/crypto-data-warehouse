@@ -178,7 +178,7 @@ PK: `(exchange, symbol, timestamp)` — 1-month chunks.
 
 ### `open_interest` hypertable
 
-PK: `(exchange, symbol, timestamp)` — 1-month chunks.
+PK: `(exchange, symbol, timestamp)` — 1-week chunks (migration 007).
 
 | Column | Type | Notes |
 |--------|------|-------|
