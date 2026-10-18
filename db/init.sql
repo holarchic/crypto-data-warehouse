@@ -243,3 +243,11 @@ CREATE TABLE IF NOT EXISTS collection_status (
     last_error          TEXT,
     PRIMARY KEY (exchange, market_type, symbol, timeframe)
 );
+
+-- Nightly union max 24h volume per asset: discovery's keep-window history (migration 012).
+CREATE TABLE IF NOT EXISTS discovery_volumes (
+    run_date        DATE NOT NULL,
+    asset_id        TEXT NOT NULL,
+    max_volume_usd  DOUBLE PRECISION NOT NULL,
+    PRIMARY KEY (run_date, asset_id)
+);

@@ -1,6 +1,7 @@
-"""collection_status table helpers — upsert on every fetch cycle."""
+"""collection_status table helpers — upsert on every fetch cycle — plus discovery's volume history."""
 
 import logging
+from datetime import date
 
 log = logging.getLogger(__name__)
 
@@ -68,6 +69,20 @@ QUERY_ACTIVE_PAIRS_SQL = """
 QUERY_ACTIVE_ASSET_IDS_SQL = """
     SELECT DISTINCT asset_id FROM collection_status
     WHERE active = TRUE AND asset_id IS NOT NULL
+"""
+
+# The keep rule takes a max over the window, so a same-day re-run must not erase a higher reading.
+RECORD_DISCOVERY_VOLUME_SQL = """
+    INSERT INTO discovery_volumes (run_date, asset_id, max_volume_usd)
+    VALUES (%(run_date)s, %(asset_id)s, %(volume)s)
+    ON CONFLICT (run_date, asset_id) DO UPDATE SET
+        max_volume_usd = GREATEST(discovery_volumes.max_volume_usd, EXCLUDED.max_volume_usd)
+"""
+
+QUERY_RECENT_MAX_VOLUMES_SQL = """
+    SELECT asset_id, max(max_volume_usd) FROM discovery_volumes
+    WHERE run_date >= %(since)s
+    GROUP BY asset_id
 """
 
 UPSERT_LOOP_HEARTBEAT_SQL = """
@@ -155,6 +170,20 @@ def query_active_asset_ids(conn) -> set[str]:
     with conn.cursor() as cur:
         cur.execute(QUERY_ACTIVE_ASSET_IDS_SQL)
         return {asset_id for (asset_id,) in cur.fetchall()}
+
+
+def record_discovery_volumes(conn, run_date: date, volumes: dict[str, float]):
+    """Record tonight's union max volume per asset — the history discovery's keep window reads."""
+    rows = [{"run_date": run_date, "asset_id": asset_id, "volume": volume} for asset_id, volume in volumes.items()]
+    with conn.cursor() as cur:
+        cur.executemany(RECORD_DISCOVERY_VOLUME_SQL, rows)
+
+
+def query_recent_max_volumes(conn, since: date) -> dict[str, float]:
+    """Highest recorded union max volume per asset over the run dates from `since` on."""
+    with conn.cursor() as cur:
+        cur.execute(QUERY_RECENT_MAX_VOLUMES_SQL, {"since": since})
+        return {asset_id: volume for asset_id, volume in cur.fetchall()}
 
 
 def query_active_pairs(conn, exchange: str, timeframe: str) -> list[dict]:

@@ -4,10 +4,12 @@
 
 discovery:
   volume_threshold_usd: 1000000
-  # Hysteresis: an asset already collected stays in while its max 24h volume holds above this.
-  # A single threshold flaps marginal assets out on weekend volume dips, leaving permanent holes
-  # in their snapshot feeds (OI, HL contexts) and 1m gaps longer than the 1,000-bar re-seed.
+  # Hysteresis: an asset already collected stays in while its highest nightly max 24h volume over
+  # the last volume_keep_window_days runs (tonight included) holds above this. A single night's
+  # volume flaps marginal assets out on weekend dips, leaving permanent holes in their snapshot
+  # feeds (OI, HL contexts) and 1m gaps longer than the 1,000-bar re-seed.
   volume_keep_threshold_usd: 500000
+  volume_keep_window_days: 7
   symbol_overrides:
     BCHSV: BSV
     LUNA2: LUNA
