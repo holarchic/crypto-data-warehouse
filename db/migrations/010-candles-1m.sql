@@ -1,6 +1,6 @@
 -- v0.14 (SPEC): candles_1m — 1-minute OHLCV on a dedicated volume tablespace (T-015.2/.3)
 --
--- 1-minute candles for the highest-volume venues (Binance, Bybit) — the native resolution of
+-- 1-minute candles (Binance and Bybit by REST, HyperLiquid by WS) — the native resolution of
 -- 1-minute backtests, which candles' 5m floor can't serve. Identical column shape to
 -- `candles` (drift-guarded), but a SEPARATE hypertable pinned to the `ts_1m` tablespace (a
 -- Hetzner Cloud Volume) so 1m's ~5× row density (~19 GB/yr) lands on cheap block storage,

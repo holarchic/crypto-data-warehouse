@@ -36,13 +36,17 @@ fi
 
 # -- Backup -------------------------------------------------------------------
 
+cd "$PROJECT_DIR"
 TIMESTAMP=$(date -u +%Y%m%d-%H%M%S)
-FILENAME="candle_collector-${TIMESTAMP}.dump"
+# The name carries the TimescaleDB version, which a restore must match and the dump itself
+# does not record (scripts/restore.sh reads it from here).
+TSDB_VERSION=$(docker compose exec -T db psql -X -U candles -d candle_collector -Atc \
+    "SELECT extversion FROM pg_extension WHERE extname = 'timescaledb'")
+FILENAME="candle_collector-${TIMESTAMP}-timescaledb-${TSDB_VERSION}.dump"
 FILEPATH="${BACKUP_DIR}/${FILENAME}"
 
 echo "==> Backing up candle_collector to ${FILEPATH}"
 
-cd "$PROJECT_DIR"
 docker compose exec -T db pg_dump \
     -U candles \
     --format=custom \

@@ -11,7 +11,6 @@ ALTER TABLE candles SET (
 );
 SELECT add_compression_policy('candles', INTERVAL '7 days', if_not_exists => TRUE);
 
--- Funding rates compression
 ALTER TABLE funding_rates SET (
     timescaledb.compress,
     timescaledb.compress_segmentby = 'exchange, symbol',
@@ -19,7 +18,6 @@ ALTER TABLE funding_rates SET (
 );
 SELECT add_compression_policy('funding_rates', INTERVAL '7 days', if_not_exists => TRUE);
 
--- Open interest compression
 ALTER TABLE open_interest SET (
     timescaledb.compress,
     timescaledb.compress_segmentby = 'exchange, symbol',
