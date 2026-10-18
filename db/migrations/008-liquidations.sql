@@ -60,4 +60,3 @@ ALTER TABLE liquidations SET (
     timescaledb.compress_orderby = 'timestamp DESC'
 );
 SELECT add_compression_policy('liquidations', INTERVAL '7 days', if_not_exists => TRUE);
-SELECT add_retention_policy('liquidations', INTERVAL '1 year', if_not_exists => TRUE);

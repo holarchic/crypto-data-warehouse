@@ -63,4 +63,3 @@ ALTER TABLE candles_1m SET (
     timescaledb.compress_orderby = 'timestamp DESC'
 );
 SELECT add_compression_policy('candles_1m', INTERVAL '7 days', if_not_exists => TRUE);
-SELECT add_retention_policy('candles_1m', INTERVAL '2 years', if_not_exists => TRUE);

@@ -1,4 +1,4 @@
--- v0.6: Compression policies (>7 days) + retention safety nets
+-- v0.6: Compression policies (>7 days). No retention: every row is kept (migration 013).
 --
 -- Compression constraint: TimescaleDB does not allow INSERT into compressed
 -- chunks. Safe because collectors only insert current-period data (never
@@ -28,8 +28,3 @@ ALTER TABLE open_interest SET (
     timescaledb.compress_orderby = 'timestamp DESC'
 );
 SELECT add_compression_policy('open_interest', INTERVAL '7 days', if_not_exists => TRUE);
-
--- Retention safety nets (generous — prevents unbounded growth over years)
-SELECT add_retention_policy('candles', INTERVAL '2 years', if_not_exists => TRUE);
-SELECT add_retention_policy('funding_rates', INTERVAL '1 year', if_not_exists => TRUE);
-SELECT add_retention_policy('open_interest', INTERVAL '1 year', if_not_exists => TRUE);

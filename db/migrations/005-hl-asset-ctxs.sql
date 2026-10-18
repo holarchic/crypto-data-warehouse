@@ -38,4 +38,3 @@ ALTER TABLE hl_asset_ctxs SET (
     timescaledb.compress_orderby = 'timestamp DESC'
 );
 SELECT add_compression_policy('hl_asset_ctxs', INTERVAL '7 days', if_not_exists => TRUE);
-SELECT add_retention_policy('hl_asset_ctxs', INTERVAL '1 year', if_not_exists => TRUE);
