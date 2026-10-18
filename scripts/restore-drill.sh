@@ -30,7 +30,10 @@ fail() { echo "==> FATAL: $*" >&2; exit 1; }
 RUN_DIR=""
 CONTAINER_ID=""
 
+# A cleanup failure is reported, and fails a drill that otherwise passed: a leftover restore
+# holds as much disk as the database.
 cleanup() {
+    local status=$? leftover=0
     if [ "$KEEP" -eq 1 ]; then
         if [ -n "$CONTAINER_ID" ]; then
             log "Kept container ${CONTAINER} (remove with: docker rm -fv ${CONTAINER})"
@@ -42,10 +45,17 @@ cleanup() {
     fi
     if [ -n "$CONTAINER_ID" ]; then
         # -v: the image's PGDATA is an anonymous volume, as large as the restore.
-        docker rm -fv "$CONTAINER_ID" > /dev/null 2>&1 || true
+        if ! docker rm -fv "$CONTAINER_ID" > /dev/null; then
+            echo "==> WARNING: container ${CONTAINER_ID:0:12} and its volume remain: docker rm -fv ${CONTAINER_ID:0:12}" >&2
+            leftover=1
+        fi
     fi
-    if [ -n "$RUN_DIR" ]; then
-        rm -rf "$RUN_DIR"
+    if [ -n "$RUN_DIR" ] && ! rm -rf "$RUN_DIR"; then
+        echo "==> WARNING: ${RUN_DIR} remains" >&2
+        leftover=1
+    fi
+    if [ "$status" -eq 0 ] && [ "$leftover" -eq 1 ]; then
+        exit 1
     fi
 }
 trap cleanup EXIT
@@ -65,9 +75,15 @@ DUMP="$RUN_DIR/$SNAPSHOT_FILE"
 SNAPSHOT=$(restic_run snapshots --host "$SNAPSHOT_HOST" --json | python3 -c '
 import json, re, sys
 from datetime import datetime, timedelta, timezone
+from typing import NamedTuple
 
 TIME = re.compile(r"(\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d)(?:\.(\d+))?(Z|[+-]\d\d:\d\d)$")
 VERSION = re.compile(r"\d+(\.\d+)*$")
+
+class Taken(NamedTuple):
+    """When a snapshot was taken; orders by instant, then by the sub-second nanoseconds."""
+    instant: datetime
+    nanoseconds: int
 
 def taken(snap):
     # restic writes nanoseconds and a local offset; fromisoformat takes neither everywhere.
@@ -76,7 +92,7 @@ def taken(snap):
         sys.exit("snapshot " + snap["short_id"] + " has an unreadable time: " + snap["time"])
     offset = "+00:00" if m[3] == "Z" else m[3]
     instant = datetime.fromisoformat(m[1] + offset).astimezone(timezone.utc)
-    return instant, int((m[2] or "0").ljust(9, "0")[:9])
+    return Taken(instant=instant, nanoseconds=int((m[2] or "0").ljust(9, "0")[:9]))
 
 def tag(snap, prefix):
     values = [t[len(prefix):] for t in snap.get("tags") or [] if t.startswith(prefix)]
@@ -87,11 +103,12 @@ def tag(snap, prefix):
 snaps = json.load(sys.stdin)
 if not snaps:
     sys.exit("no snapshots for this host")
-snap = max(snaps, key=taken)
-day = taken(snap)[0].date()
+latest = max(({"taken": taken(s), "snap": s} for s in snaps), key=lambda dated: dated["taken"])
+snap, instant = latest["snap"], latest["taken"].instant
+day = instant.date()
 fields = {
     "snapshot_id": snap["id"],
-    "snapshot_time": taken(snap)[0].strftime("%Y-%m-%dT%H:%M:%SZ"),
+    "snapshot_time": instant.strftime("%Y-%m-%dT%H:%M:%SZ"),
     "timescaledb_version": tag(snap, "timescaledb-"),
     "pg_major": tag(snap, "pg"),
     "count_since": (day - timedelta(days=14)).isoformat(),
