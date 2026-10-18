@@ -122,6 +122,7 @@ def webhook_server():
     server, bodies = serve(204)
     yield f"http://127.0.0.1:{server.server_port}/hook", bodies
     server.shutdown()
+    server.server_close()
 
 
 @pytest.mark.parametrize(
@@ -146,6 +147,7 @@ def test_webhook_post_counts_only_a_2xx_answer_as_delivered(status):
         result = run_lib('webhook_post "$1" x', f"http://127.0.0.1:{server.server_port}/hook")
     finally:
         server.shutdown()
+        server.server_close()
     assert result.returncode == 1
 
 

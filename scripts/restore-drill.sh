@@ -64,6 +64,10 @@ trap cleanup EXIT
 psql_drill() { docker exec -i "$CONTAINER_ID" psql -X -v ON_ERROR_STOP=1 -U candles "$@"; }
 
 [ -f "$RESTIC_ENV_FILE" ] || fail "${RESTIC_ENV_FILE} not found"
+# Before the download, so a kept drill fails fast; `docker run --name` still settles a race.
+if docker container inspect "$CONTAINER" > /dev/null 2>&1; then
+    fail "container ${CONTAINER} exists (a kept drill?); remove it with: docker rm -fv ${CONTAINER}"
+fi
 BASE_DIR="${DRILL_DIR:-${TMPDIR:-/tmp}}"
 BASE_DIR=$(cd "$BASE_DIR" && pwd) || fail "DRILL_DIR ${BASE_DIR} is not a usable directory"
 RUN_DIR=$(mktemp -d "$BASE_DIR/restore-drill.XXXXXX")
