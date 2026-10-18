@@ -1,17 +1,25 @@
 """Discovery service — finds qualifying pairs across all exchanges.
 
 Union qualification: $1M 24h volume on ANY exchange → collect on ALL exchanges where listed.
-Hysteresis: once collected, an asset stays in while its max volume holds at the keep threshold ($500k).
+Hysteresis: once collected, an asset stays in while its highest nightly max volume over the keep
+window (7 runs) holds at the keep threshold ($500k), so a weekend dip doesn't drop it.
 Run as one-shot: `docker compose --profile discovery run --rm discovery`
 """
 
 import logging
 import sys
 from collections import defaultdict
+from datetime import date, datetime, timedelta, timezone
 
 from config import load_all_configs, load_discovery_config
 from dotenv import load_dotenv
-from status import deactivate_stale_pairs, query_active_asset_ids, upsert_discovery_pair
+from status import (
+    deactivate_stale_pairs,
+    query_active_asset_ids,
+    query_recent_max_volumes,
+    record_discovery_volumes,
+    upsert_discovery_pair,
+)
 from symbols import resolve_asset_id
 
 from db import build_dsn, connect_db, create_exchange, safe_rollback
@@ -88,12 +96,25 @@ def fetch_exchange_tickers(exchange, config):
     return results
 
 
-def qualify_assets(max_volumes: dict[str, float], active_assets: set[str], threshold: float, keep_threshold: float) -> set[str]:
-    """Union qualification with hysteresis: an asset enters at `threshold` and, once active, stays
-    while its max volume holds at `keep_threshold` — so marginal assets don't flap in and out nightly."""
+def keep_window_start(run_date: date, window_days: int) -> date:
+    """First run date of a keep window spanning `window_days` runs up to and including tonight."""
+    return run_date - timedelta(days=window_days - 1)
+
+
+def qualify_assets(
+    max_volumes: dict[str, float],
+    recent_max_volumes: dict[str, float],
+    active_assets: set[str],
+    threshold: float,
+    keep_threshold: float,
+) -> set[str]:
+    """Union qualification with hysteresis: an asset enters on tonight's volume at `threshold` and, once
+    active, stays while its highest volume over the keep window holds at `keep_threshold` — so marginal
+    assets don't flap out on a weekend dip. Only an asset some venue lists tonight can qualify."""
     return {
         asset_id for asset_id, vol in max_volumes.items()
-        if vol >= threshold or (asset_id in active_assets and vol >= keep_threshold)
+        if vol >= threshold
+        or (asset_id in active_assets and max(vol, recent_max_volumes.get(asset_id, 0)) >= keep_threshold)
     }
 
 
@@ -107,11 +128,14 @@ def discover():
     threshold = discovery_config.get("volume_threshold_usd", 1_000_000)
     # Clamped: a keep above entry would make staying harder than entering.
     keep_threshold = min(discovery_config.get("volume_keep_threshold_usd", threshold), threshold)
+    # Absent = tonight only, the single-night rule. Clamped: tonight is always in the window.
+    keep_window_days = max(discovery_config.get("volume_keep_window_days", 1), 1)
+    run_date = datetime.now(timezone.utc).date()
     dsn = build_dsn()
 
     log.info(
-        "Discovery starting: %d exchanges, volume threshold=$%s (keep=$%s)",
-        len(configs), f"{threshold:,.0f}", f"{keep_threshold:,.0f}",
+        "Discovery starting: %d exchanges, volume threshold=$%s (keep=$%s over %d nights)",
+        len(configs), f"{threshold:,.0f}", f"{keep_threshold:,.0f}", keep_window_days,
     )
 
     # Phase 1: Fetch tickers from all exchanges
@@ -149,11 +173,17 @@ def discover():
     try:
         # Phase 2: Union qualification — max volume across any exchange, with hysteresis
         max_volumes = {asset_id: max(d["volume"] for d in ex.values()) for asset_id, ex in volumes.items()}
-        qualifying_assets = qualify_assets(max_volumes, query_active_asset_ids(conn), threshold, keep_threshold)
+        # Before any upsert: a history failure rolls back with the universe untouched.
+        record_discovery_volumes(conn, run_date, max_volumes)
+        recent_max_volumes = query_recent_max_volumes(conn, keep_window_start(run_date, keep_window_days))
+        qualifying_assets = qualify_assets(
+            max_volumes, recent_max_volumes, query_active_asset_ids(conn), threshold, keep_threshold,
+        )
         kept = sum(1 for asset_id in qualifying_assets if max_volumes[asset_id] < threshold)
+        kept_by_window = sum(1 for asset_id in qualifying_assets if max_volumes[asset_id] < keep_threshold)
         log.info(
-            "Qualifying assets: %d / %d total (threshold=$%s, %d kept by keep threshold)",
-            len(qualifying_assets), len(volumes), f"{threshold:,.0f}", kept,
+            "Qualifying assets: %d / %d total (threshold=$%s, %d kept by keep threshold, %d by the %d-night max)",
+            len(qualifying_assets), len(volumes), f"{threshold:,.0f}", kept, kept_by_window, keep_window_days,
         )
 
         # Phase 3: Write to collection_status
