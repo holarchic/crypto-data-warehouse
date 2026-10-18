@@ -32,10 +32,10 @@ post_webhook() {
     local hostname
     hostname=$(hostname)
     if [ -n "$WEBHOOK_URL" ]; then
-        curl -sf -X POST "$WEBHOOK_URL" \
+        curl -sf --connect-timeout 5 --max-time 15 -X POST "$WEBHOOK_URL" \
             -H "Content-Type: application/json" \
             -d "{\"text\":\"🚨 candle-collector ($hostname): $message\"}" \
-            > /dev/null 2>&1 || true
+            > /dev/null 2>&1 || echo "[host-monitor] webhook post failed"
     fi
 }
 
@@ -114,14 +114,17 @@ done
 # Checked only once offsite backup is configured (the env file scripts/backup-offsite.sh
 # reads). A failed run pages from that script; this catches the runs that never start.
 # Its own reminder file, not the shared cooldown below, so a stale backup never mutes a
-# container-down page.
-RESTIC_ENV_FILE="${RESTIC_ENV_FILE:-/etc/candle-collector/restic.env}"
-BACKUP_OK_MARKER="${BACKUP_OK_MARKER:-/var/lib/candle-collector/backup-ok}"
+# container-down page. The env file and marker paths come from scripts/offsite-lib.sh; a
+# checkout without it skips this check, never the ones after it.
+if [ -f "$PROJECT_DIR/scripts/offsite-lib.sh" ]; then
+    # shellcheck source=scripts/offsite-lib.sh
+    . "$PROJECT_DIR/scripts/offsite-lib.sh"
+fi
 BACKUP_ALERT_FILE="${BACKUP_ALERT_FILE:-/tmp/candle-collector-backup-stale-alert}"
 BACKUP_STALE_SECONDS=$((26 * 3600))
 BACKUP_REMIND_SECONDS=$((6 * 3600))
 
-if [ -f "$RESTIC_ENV_FILE" ]; then
+if [ -f "${RESTIC_ENV_FILE:-}" ]; then
     backup_now=$(date +%s)
     last_ok=$(stat -c %Y "$BACKUP_OK_MARKER" 2>/dev/null || echo 0)
     if [ $(( backup_now - last_ok )) -ge "$BACKUP_STALE_SECONDS" ]; then
@@ -134,12 +137,13 @@ if [ -f "$RESTIC_ENV_FILE" ]; then
             fi
             echo "[host-monitor] Offsite backup stale: ${backup_age}"
             post_webhook "🟠 Offsite backup stale: ${backup_age}"
-            touch "$BACKUP_ALERT_FILE"
+            touch "$BACKUP_ALERT_FILE" \
+                || echo "[host-monitor] cannot write ${BACKUP_ALERT_FILE}; the stale page repeats every run"
         fi
     elif [ -f "$BACKUP_ALERT_FILE" ]; then
         echo "[host-monitor] Offsite backup recovered"
         post_webhook "✅ Offsite backup recovered"
-        rm -f "$BACKUP_ALERT_FILE"
+        rm -f "$BACKUP_ALERT_FILE" || echo "[host-monitor] cannot remove ${BACKUP_ALERT_FILE}"
     fi
 fi
 
