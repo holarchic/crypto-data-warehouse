@@ -32,7 +32,6 @@ ALTER TABLE candles SET (
     timescaledb.compress_orderby = 'timestamp DESC'
 );
 SELECT add_compression_policy('candles', INTERVAL '7 days', if_not_exists => TRUE);
-SELECT add_retention_policy('candles', INTERVAL '2 years', if_not_exists => TRUE);
 
 -- 1-minute OHLCV (Binance/Bybit), identical column shape to `candles`. On prod this lives on a
 -- dedicated Hetzner Cloud Volume tablespace (`ts_1m`) via db/migrations/010-candles-1m.sql; here
@@ -69,7 +68,6 @@ ALTER TABLE candles_1m SET (
     timescaledb.compress_orderby = 'timestamp DESC'
 );
 SELECT add_compression_policy('candles_1m', INTERVAL '7 days', if_not_exists => TRUE);
-SELECT add_retention_policy('candles_1m', INTERVAL '2 years', if_not_exists => TRUE);
 
 CREATE TABLE IF NOT EXISTS funding_rates (
     exchange        TEXT NOT NULL,
@@ -95,7 +93,6 @@ ALTER TABLE funding_rates SET (
     timescaledb.compress_orderby = 'timestamp DESC'
 );
 SELECT add_compression_policy('funding_rates', INTERVAL '7 days', if_not_exists => TRUE);
-SELECT add_retention_policy('funding_rates', INTERVAL '1 year', if_not_exists => TRUE);
 
 CREATE TABLE IF NOT EXISTS open_interest (
     exchange        TEXT NOT NULL,
@@ -120,7 +117,6 @@ ALTER TABLE open_interest SET (
     timescaledb.compress_orderby = 'timestamp DESC'
 );
 SELECT add_compression_policy('open_interest', INTERVAL '7 days', if_not_exists => TRUE);
-SELECT add_retention_policy('open_interest', INTERVAL '1 year', if_not_exists => TRUE);
 
 -- HyperLiquid per-asset context bundle (full metaAndAssetCtxs), 1-min cadence.
 -- Single-venue; columns mirror the backtester Grade-B seed (hl-asset-ctxs.parquet) 1:1.
@@ -154,7 +150,6 @@ ALTER TABLE hl_asset_ctxs SET (
     timescaledb.compress_orderby = 'timestamp DESC'
 );
 SELECT add_compression_policy('hl_asset_ctxs', INTERVAL '7 days', if_not_exists => TRUE);
-SELECT add_retention_policy('hl_asset_ctxs', INTERVAL '1 year', if_not_exists => TRUE);
 
 -- Liquidation events, all venues, two fidelity grades (HL node_fills Grade A +
 -- Binance/Bybit WS Grade C). Superset of the HL seed's 13 cols + venue/grade/
@@ -193,7 +188,6 @@ ALTER TABLE liquidations SET (
     timescaledb.compress_orderby = 'timestamp DESC'
 );
 SELECT add_compression_policy('liquidations', INTERVAL '7 days', if_not_exists => TRUE);
-SELECT add_retention_policy('liquidations', INTERVAL '1 year', if_not_exists => TRUE);
 
 -- Binance premium-index term structure (mark-vs-index spread), 5-min OHLC klines.
 -- Binance-only; a superset of the backtester's 1h binance-premium-index seed.
@@ -224,7 +218,6 @@ ALTER TABLE premium_index SET (
     timescaledb.compress_orderby = 'timestamp DESC'
 );
 SELECT add_compression_policy('premium_index', INTERVAL '7 days', if_not_exists => TRUE);
-SELECT add_retention_policy('premium_index', INTERVAL '1 year', if_not_exists => TRUE);
 
 CREATE TABLE IF NOT EXISTS collection_status (
     exchange            TEXT NOT NULL,

@@ -1,12 +1,19 @@
-"""Tests for compression/retention migration — pattern-level validation."""
+"""Tests for the compression migrations and the keep-all-history rule — pattern-level validation."""
 
 import pathlib
+import re
 
 MIGRATION = pathlib.Path(__file__).parent.parent / "db" / "migrations" / "004-compression-retention.sql"
 INIT_SQL = pathlib.Path(__file__).parent.parent / "db" / "init.sql"
+MIGRATIONS = pathlib.Path(__file__).parent.parent / "db" / "migrations"
+MIGRATION_013 = MIGRATIONS / "013-keep-all-history.sql"
 
 TABLES_WITH_COMPRESSION = ["candles", "funding_rates", "open_interest"]
-TABLES_WITH_RETENTION = ["candles", "funding_rates", "open_interest"]
+# The hypertables that carried a retention policy until migration 013 removed it.
+FORMER_RETENTION_TABLES = {
+    "candles", "candles_1m", "funding_rates", "open_interest",
+    "hl_asset_ctxs", "liquidations", "premium_index",
+}
 
 
 def _read(path):
@@ -23,10 +30,20 @@ def test_compression_policies_for_all_tables():
         assert f"add_compression_policy('{table}'" in sql, f"Missing compression policy for {table}"
 
 
-def test_retention_policies_for_all_tables():
-    sql = _read(MIGRATION)
-    for table in TABLES_WITH_RETENTION:
-        assert f"add_retention_policy('{table}'" in sql, f"Missing retention policy for {table}"
+def test_no_db_file_adds_retention():
+    """The warehouse keeps all history: neither init.sql nor any migration (operators re-run them by
+    hand) may add a retention policy, or a re-run silently restores deletion."""
+    for path in [INIT_SQL, *sorted(MIGRATIONS.glob("*.sql"))]:
+        assert "add_retention_policy" not in _read(path), f"{path.name} adds a retention policy"
+
+
+def test_migration_013_removes_every_former_retention_policy():
+    """013 clears every policy the old migrations set, idempotently, on tables init.sql creates."""
+    sql = _read(MIGRATION_013)
+    removed = set(re.findall(r"remove_retention_policy\('(\w+)', if_exists => TRUE\)", sql))
+    created = set(re.findall(r"create_hypertable\('(\w+)'", _read(INIT_SQL)))
+    assert removed == FORMER_RETENTION_TABLES
+    assert FORMER_RETENTION_TABLES <= created
 
 
 def test_candles_segmentby_includes_market_type():
@@ -40,16 +57,12 @@ def test_candles_segmentby_includes_market_type():
 
 
 def test_init_sql_has_compression_policies():
-    """New installs (init.sql) should also get compression + retention."""
+    """New installs (init.sql) should also get compression."""
     sql = _read(INIT_SQL)
     for table in TABLES_WITH_COMPRESSION:
         assert f"add_compression_policy('{table}'" in sql, f"init.sql missing compression policy for {table}"
 
 
-def test_init_sql_has_retention_policies():
-    sql = _read(INIT_SQL)
-    for table in TABLES_WITH_RETENTION:
-        assert f"add_retention_policy('{table}'" in sql, f"init.sql missing retention policy for {table}"
 
 
 # --- hl_asset_ctxs (migration 005) — HyperLiquid context bundle table --------
@@ -62,7 +75,6 @@ HL_CTX_CLAUSES = [
     "chunk_time_interval => INTERVAL '1 week'",
     "idx_hl_asset_ctxs_asset_ts",
     "add_compression_policy('hl_asset_ctxs'",
-    "add_retention_policy('hl_asset_ctxs'",
 ]
 
 # The 10 seed floats + keys, in the backtester seed's column order.
@@ -135,7 +147,6 @@ LIQ_CLAUSES = [
     "timescaledb.compress_segmentby = 'venue, asset_id'",
     "timescaledb.compress_orderby = 'timestamp DESC'",
     "add_compression_policy('liquidations'",
-    "add_retention_policy('liquidations'",
 ]
 
 # The HL seed's 13 columns + venue/grade/liquidated_side, in DDL order.
@@ -213,7 +224,6 @@ PREMIUM_CLAUSES = [
     "timescaledb.compress_segmentby = 'exchange, symbol'",
     "timescaledb.compress_orderby = 'timestamp DESC'",
     "add_compression_policy('premium_index'",
-    "add_retention_policy('premium_index'",
 ]
 
 # Identity cols + premium OHLC, in DDL order (native_symbol = seed `coin`).
@@ -293,7 +303,6 @@ CANDLES_1M_SHARED_CLAUSES = [
     "timescaledb.compress_segmentby = 'exchange, market_type, symbol, timeframe'",
     "timescaledb.compress_orderby = 'timestamp DESC'",
     "add_compression_policy('candles_1m', INTERVAL '7 days'",
-    "add_retention_policy('candles_1m', INTERVAL '2 years'",
 ]
 
 # Present ONLY in the migration (prod volume); init.sql must NOT carry them (fresh/dev has no volume).
