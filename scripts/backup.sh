@@ -27,7 +27,8 @@ trap 'send_alert "Backup failed — check /var/log/candle-collector-backup.log"'
 
 # -- Pre-flight: disk space check ---------------------------------------------
 
-avail_kb=$(df "$BACKUP_DIR" --output=avail 2>/dev/null | tail -1 | tr -d ' ' || df "$BACKUP_DIR" | tail -1 | awk '{print $4}')
+# POSIX output (-P, 1K blocks): GNU df's --output isn't on macOS.
+avail_kb=$(df -Pk "$BACKUP_DIR" | awk 'NR == 2 {print $4}')
 avail_gb=$((avail_kb / 1048576))
 if [ "$avail_gb" -lt 2 ]; then
     send_alert "Disk space too low for backup: ${avail_gb}GB available (need 2GB)"
@@ -53,12 +54,9 @@ docker compose exec -T db pg_dump \
     --compress=6 \
     candle_collector > "$FILEPATH"
 
-# Verify dump is readable
+# Read the whole archive, not just its table of contents, before older dumps are pruned.
 echo "==> Verifying backup..."
-pg_restore --list "$FILEPATH" > /dev/null 2>&1 || {
-    # pg_restore may not be on host — try in container
-    docker compose exec -T db pg_restore --list /dev/stdin < "$FILEPATH" > /dev/null
-}
+docker compose exec -T db pg_restore --file=/dev/null < "$FILEPATH"
 
 SIZE=$(du -h "$FILEPATH" | cut -f1)
 echo "==> Backup complete: ${FILEPATH} (${SIZE})"
