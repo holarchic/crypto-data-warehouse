@@ -5,25 +5,28 @@
 # the dump's TimescaleDB version. The restore is strict (--exit-on-error), and migration 013 runs
 # before the job scheduler restarts, so a dump taken before it brings no retention jobs back.
 #
-# Nothing changes until every check passes: no client session is connected (stop the
-# collectors, api and monitor first; TimescaleDB's own workers don't count, and DROP DATABASE
-# stops them), the dump's TimescaleDB version is available in the db image, and the archive
-# reads end to end. A dump that places candles_1m on the ts_1m tablespace needs that tablespace
-# in the db (migration 010).
+# Nothing changes until every check passes: no other restore is running; no client session is
+# connected (stop the collectors, api and monitor first; TimescaleDB's own workers don't count,
+# and DROP DATABASE stops them); the dump's TimescaleDB version is available in the db image;
+# the archive reads end to end; and every tablespace it places tables on exists (prod's ts_1m
+# comes from migration 010).
 #
-# Usage: ./scripts/restore.sh backups/candle_collector-20260329-120000.dump   (from the project root)
-#   TSDB_VERSION  the dump's TimescaleDB version (default: the one installed in candle_collector)
+# Usage: ./scripts/restore.sh backups/candle_collector-<time>-timescaledb-<version>.dump
+#   (from the project root). The dump's TimescaleDB version comes from that name, as
+#   scripts/backup.sh writes it; for a dump named otherwise, set TSDB_VERSION.
 set -euo pipefail
 
 if [ $# -lt 1 ]; then
     echo "Usage: $0 <backup-file>"
-    echo "Example: $0 backups/candle_collector-20260329-120000.dump"
+    echo "Example: $0 backups/candle_collector-20260329-120000-timescaledb-2.26.2.dump"
     exit 1
 fi
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 BACKUP_FILE="$1"
 CONTAINER_DUMP="/tmp/candle_collector-restore-$$.dump"
+# mkdir is atomic on every platform the script runs on, unlike flock (absent on macOS).
+LOCK_DIR="${TMPDIR:-/tmp}/candle-collector-restore.lock"
 
 if [ ! -f "$BACKUP_FILE" ]; then
     echo "Error: backup file not found: ${BACKUP_FILE}"
@@ -38,6 +41,7 @@ cleanup() {
     if ! docker compose exec -T db rm -f "$CONTAINER_DUMP" > /dev/null 2>&1; then
         echo "==> WARNING: ${CONTAINER_DUMP} may remain in the db container" >&2
     fi
+    rmdir "$LOCK_DIR" 2>/dev/null || true
 }
 
 echo "==> WARNING: This drops the candle_collector database and recreates it from the dump."
@@ -50,6 +54,9 @@ fi
 
 # -- Preflight: the database is untouched until all of this passes --------------------
 
+mkdir "$LOCK_DIR" 2>/dev/null || fail "another restore holds ${LOCK_DIR}; if none is running, remove it"
+trap cleanup EXIT
+
 sessions=$(db_sql -d postgres -At <<'SQL'
 SELECT count(*) FROM pg_stat_activity
 WHERE datname = 'candle_collector' AND backend_type = 'client backend' AND pid <> pg_backend_pid();
@@ -58,10 +65,10 @@ SQL
 [ "$sessions" = "0" ] || fail "${sessions} client session(s) on candle_collector; stop the collectors, api and monitor first"
 
 if [ -z "${TSDB_VERSION:-}" ]; then
-    TSDB_VERSION=$(db_sql -d candle_collector -At 2>/dev/null <<'SQL'
-SELECT extversion FROM pg_extension WHERE extname = 'timescaledb';
-SQL
-) || fail "cannot read the installed TimescaleDB version; set TSDB_VERSION to the dump's version"
+    case "$(basename "$BACKUP_FILE")" in
+        *-timescaledb-*.dump) TSDB_VERSION="$(basename "$BACKUP_FILE" .dump)"; TSDB_VERSION="${TSDB_VERSION##*-timescaledb-}" ;;
+        *) fail "the dump's name carries no TimescaleDB version; set TSDB_VERSION to the version it was taken at" ;;
+    esac
 fi
 available=$(db_sql -d postgres -At -v tsdb="$TSDB_VERSION" <<'SQL'
 SELECT count(*) FROM pg_available_extension_versions WHERE name = 'timescaledb' AND version = :'tsdb';
@@ -69,12 +76,21 @@ SQL
 )
 [ "$available" = "1" ] || fail "TimescaleDB ${TSDB_VERSION} is not available in this db image; the restore needs the dump's version"
 
-trap cleanup EXIT
 echo "==> Copying the dump into the db container..."
 docker compose cp "$BACKUP_FILE" "db:${CONTAINER_DUMP}"
-echo "==> Checking the archive reads end to end..."
-docker compose exec -T db pg_restore --file=/dev/null "$CONTAINER_DUMP" \
+echo "==> Checking the archive reads end to end, and the tablespaces it needs..."
+tablespaces=$(docker compose exec -T db sh -c \
+    'set -o pipefail; pg_restore --file=- "$1" | sed -n "s/^SET default_tablespace = \(.*\);\$/\1/p" | sort -u' \
+    _ "$CONTAINER_DUMP") \
     || fail "${BACKUP_FILE} is not a readable pg_dump archive; candle_collector is untouched"
+for tablespace in $tablespaces; do
+    [ "$tablespace" = "''" ] && continue
+    found=$(db_sql -d postgres -At -v ts="$tablespace" <<'SQL'
+SELECT count(*) FROM pg_tablespace WHERE spcname = :'ts';
+SQL
+)
+    [ "$found" = "1" ] || fail "the dump places tables on tablespace ${tablespace}, which this db lacks (on prod: migration 010); candle_collector is untouched"
+done
 
 echo "==> Recreating candle_collector (TimescaleDB ${TSDB_VERSION})..."
 db_sql -d postgres <<'SQL'

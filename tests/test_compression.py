@@ -30,11 +30,6 @@ def test_compression_policies_for_all_tables():
         assert f"add_compression_policy('{table}'" in sql, f"Missing compression policy for {table}"
 
 
-def _sql_without_comments(path):
-    """The file's SQL with `--` and `/* */` comments removed, so commented-out statements never count."""
-    return re.sub(r"--[^\n]*", "", re.sub(r"/\*.*?\*/", "", _read(path), flags=re.DOTALL))
-
-
 def test_no_db_file_adds_retention():
     """The warehouse keeps all history: neither init.sql nor any migration (operators re-run them by
     hand) may add a retention policy, or a re-run silently restores deletion. SQL function names
@@ -46,11 +41,16 @@ def test_no_db_file_adds_retention():
 
 
 def test_migration_013_removes_every_former_retention_policy():
-    """013 clears every policy the old migrations set, idempotently, on tables init.sql creates."""
-    sql = _sql_without_comments(MIGRATION_013)
-    removed = set(re.findall(
-        r"remove_retention_policy\(\s*'(\w+)'\s*,\s*if_exists\s*=>\s*TRUE\s*\)", sql, re.IGNORECASE
-    ))
+    """013 clears every policy the old migrations set, idempotently, on tables init.sql creates.
+    Apart from `--` comment lines, the file is exactly its removal statements, so no wrapping
+    (a block comment, a dollar-quoted string) can leave one inert while the names still match."""
+    statements = [
+        line for line in _read(MIGRATION_013).splitlines()
+        if line.strip() and not line.lstrip().startswith("--")
+    ]
+    pattern = re.compile(r"SELECT remove_retention_policy\('(\w+)', if_exists => TRUE\);")
+    assert all(pattern.fullmatch(line) for line in statements), statements
+    removed = {pattern.fullmatch(line).group(1) for line in statements}
     created = set(re.findall(r"create_hypertable\('(\w+)'", _read(INIT_SQL)))
     assert removed == FORMER_RETENTION_TABLES
     assert FORMER_RETENTION_TABLES <= created

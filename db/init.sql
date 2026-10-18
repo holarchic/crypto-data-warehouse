@@ -33,7 +33,7 @@ ALTER TABLE candles SET (
 );
 SELECT add_compression_policy('candles', INTERVAL '7 days', if_not_exists => TRUE);
 
--- 1-minute OHLCV (Binance/Bybit), identical column shape to `candles`. On prod this lives on a
+-- 1-minute OHLCV (Binance/Bybit by REST, HyperLiquid by WS), identical column shape to `candles`. On prod this lives on a
 -- dedicated Hetzner Cloud Volume tablespace (`ts_1m`) via db/migrations/010-candles-1m.sql; here
 -- (fresh/dev installs with no volume) it is created in the DEFAULT tablespace. Chunk interval is
 -- 1 DAY (density-driven, vs candles' 1 week). See db/migrations/010-candles-1m.sql.
