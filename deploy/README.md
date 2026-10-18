@@ -184,8 +184,9 @@ db_sql() { "${DC[@]}" exec -T db psql -X -v ON_ERROR_STOP=1 -U candles "$@"; }
 
 **Credentials.** Keep them in `/root/restore/` until step 7. A `/etc/candle-collector/restic.env` would let the 05:30 job back up a half-restored database. Keep every writer stopped until step 7.
 
-1. **Storage first.**
-   - Run `setup.sh`.
+1. **Checkout and storage first.**
+   - Clone the repo into the project dir and `cd` into it. Every command below runs from there.
+   - Run `./deploy/setup.sh`, then write `.env` from `.env.example`. New secrets are fine.
    - Mount the volume at `/mnt/pgvol` (fstab) before anything starts the db container. Docker's bind mount doesn't pick up a mount made after the container starts.
    - Create empty `/mnt/pgvol/pgdata_1m` and `/mnt/pgvol/restore`, owned by uid 70 (the image's `postgres`).
 2. **Credentials and snapshot.**
@@ -195,9 +196,11 @@ db_sql() { "${DC[@]}" exec -T db psql -X -v ON_ERROR_STOP=1 -U candles "$@"; }
 3. **Image before first start.** On first start, the image installs TimescaleDB in every database at its own version, and the restore needs the snapshot's.
    - `docker pull timescale/timescaledb:<ver>-pg<major>`
    - `docker tag timescale/timescaledb:<ver>-pg<major> timescale/timescaledb:latest-pg16`
-   - Clone the repo into the project dir and write `.env` from `.env.example`. New secrets are fine.
 4. **Start only the db and stage the dump.**
    - `"${DC[@]}" up -d db`
+   - Wait for the real server. The image's first-start init server is up briefly on the socket only, so check over TCP:
+     `for _ in $(seq 90); do "${DC[@]}" exec -T db pg_isready -q -h 127.0.0.1 -U candles -d postgres && break; sleep 2; done`
+     Then rerun that `pg_isready` once on its own; it must succeed before going on.
    - `db_sql -d postgres -c "CREATE TABLESPACE ts_1m LOCATION '/mnt/pgvol/pgdata_1m'"` creates the tablespace, once; it outlives any database.
    - `restic_env dump <snapshot id> /candle_collector.dump > /mnt/pgvol/restore/candle_collector.dump` puts the dump on the volume, which the db container sees at the same path.
 5. **Fresh database.** If anything below fails, start again here.
