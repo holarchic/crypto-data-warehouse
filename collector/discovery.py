@@ -129,7 +129,10 @@ def discover():
     # Clamped: a keep above entry would make staying harder than entering.
     keep_threshold = min(discovery_config.get("volume_keep_threshold_usd", threshold), threshold)
     # Absent = tonight only, the single-night rule. Clamped: tonight is always in the window.
-    keep_window_days = max(discovery_config.get("volume_keep_window_days", 1), 1)
+    keep_window_days = discovery_config.get("volume_keep_window_days", 1)
+    if isinstance(keep_window_days, bool) or not isinstance(keep_window_days, int):
+        raise ValueError(f"volume_keep_window_days must be an integer number of nights, got {keep_window_days!r}")
+    keep_window_days = max(keep_window_days, 1)
     run_date = datetime.now(timezone.utc).date()
     dsn = build_dsn()
 

@@ -5,7 +5,7 @@ import re
 from datetime import date, datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock, call, patch
 
 import discovery
 import pytest
@@ -33,7 +33,7 @@ def test_active_asset_below_keep_is_dropped():
     assert qualify_assets({"A": 400_000}, {}, {"A"}, ENTRY, KEEP) == set()
 
 
-def test_keep_equal_to_entry_is_a_single_threshold():
+def test_keep_equal_to_entry_with_no_history_is_a_single_threshold():
     volumes = {"active_dip": 900_000, "active_high": 1_200_000, "new_dip": 900_000}
     assert qualify_assets(volumes, {}, {"active_dip", "active_high"}, ENTRY, ENTRY) == {"active_high"}
 
@@ -95,7 +95,10 @@ def test_collector_success_write_never_reactivates_a_pair():
 # --- discover() wiring: status/db are conftest stubs, so each run patches fresh mocks -----------
 
 RUN_DATE = date(2026, 10, 18)
-CONFIG = {"volume_threshold_usd": ENTRY, "volume_keep_threshold_usd": KEEP, "volume_keep_window_days": 7}
+
+
+def _config(**overrides):
+    return {"volume_threshold_usd": ENTRY, "volume_keep_threshold_usd": KEEP, "volume_keep_window_days": 7, **overrides}
 
 
 class _FixedClock:
@@ -114,28 +117,31 @@ def _ticker(asset_id, volume):
             "native_symbol": f"{asset_id}USDT", "volume": volume}
 
 
-# OLD is active and dips to $300k tonight; NEW enters at $2M (its max across venues).
-TICKERS = {
-    "binance": [_ticker("OLD", 300_000), _ticker("NEW", 2_000_000)],
-    "bybit": [_ticker("NEW", 1_500_000)],
-}
+def _tickers(venue):
+    """OLD is active and dips to $300k tonight; NEW enters at $2M (its max across venues)."""
+    return {
+        "binance": [_ticker("OLD", 300_000), _ticker("NEW", 2_000_000)],
+        "bybit": [_ticker("NEW", 1_500_000)],
+    }[venue]
 
 
 def _run_discover(discovery_config, recent_max_volumes, record_error=None, query_error=None):
-    """Run discover() with every IO patched. `calls` records the order of status/db calls."""
+    """Run discover() with every IO patched. `calls.mock_calls` is the ordered trace of status/db calls,
+    connection commits and close included (`conn` is `calls.conn`)."""
     calls = MagicMock()
-    conn = MagicMock()
+    conn = calls.conn
     calls.record.side_effect = record_error
     calls.query_recent.side_effect = query_error
     calls.query_recent.return_value = recent_max_volumes
     calls.query_active.return_value = {"OLD"}
+    calls.deactivate.return_value = 0
     exit_code = None
     with (
         patch.object(discovery, "datetime", _FixedClock),
         patch.object(discovery, "load_all_configs", return_value=[_venue("binance"), _venue("bybit")]),
         patch.object(discovery, "load_discovery_config", return_value=discovery_config),
         patch.object(discovery, "create_exchange"),
-        patch.object(discovery, "fetch_exchange_tickers", side_effect=lambda _ex, config: TICKERS[config.name]),
+        patch.object(discovery, "fetch_exchange_tickers", side_effect=lambda _ex, config: _tickers(config.name)),
         patch.object(discovery, "build_dsn"),
         patch.object(discovery, "connect_db", return_value=conn),
         patch.object(discovery, "safe_rollback", calls.rollback),
@@ -152,34 +158,61 @@ def _run_discover(discovery_config, recent_max_volumes, record_error=None, query
     return calls, conn, exit_code
 
 
+def _upsert(conn, asset_id, exchange, timeframe, volume):
+    return call.upsert(conn, exchange=exchange, market_type="perp", symbol=f"{asset_id}/USDT:USDT",
+                       timeframe=timeframe, asset_id=asset_id, native_symbol=f"{asset_id}USDT", volume=volume)
+
+
 def _upserted(calls):
     return {(c.kwargs["asset_id"], c.kwargs["exchange"]) for c in calls.upsert.call_args_list}
 
 
 def test_discover_keeps_an_active_asset_on_history_and_records_before_any_upsert():
-    calls, conn, exit_code = _run_discover(CONFIG, recent_max_volumes={"OLD": 800_000})
+    calls, conn, exit_code = _run_discover(_config(), recent_max_volumes={"OLD": 800_000})
 
     assert exit_code is None
-    names = [c[0] for c in calls.mock_calls]
-    assert names.index("record") < names.index("query_recent") < names.index("upsert")
-    calls.record.assert_called_once_with(conn, RUN_DATE, {"OLD": 300_000, "NEW": 2_000_000})
-    calls.query_recent.assert_called_once_with(conn, date(2026, 10, 12))
-    assert _upserted(calls) == {("OLD", "binance"), ("NEW", "binance"), ("NEW", "bybit")}
-    assert conn.commit.call_count == 2
+    both, new_only = ["NEW/USDT:USDT", "OLD/USDT:USDT"], ["NEW/USDT:USDT"]
+    assert calls.mock_calls == [
+        call.record(conn, RUN_DATE, {"OLD": 300_000, "NEW": 2_000_000}),
+        call.query_recent(conn, date(2026, 10, 12)),
+        call.query_active(conn),
+        _upsert(conn, "NEW", "binance", "5m", 2_000_000),
+        _upsert(conn, "NEW", "binance", "1h", 2_000_000),
+        _upsert(conn, "NEW", "bybit", "5m", 1_500_000),
+        _upsert(conn, "NEW", "bybit", "1h", 1_500_000),
+        _upsert(conn, "OLD", "binance", "5m", 300_000),
+        _upsert(conn, "OLD", "binance", "1h", 300_000),
+        call.conn.commit(),
+        call.deactivate(conn, "binance", "5m", both),
+        call.deactivate(conn, "binance", "1h", both),
+        call.deactivate(conn, "bybit", "5m", new_only),
+        call.deactivate(conn, "bybit", "1h", new_only),
+        call.conn.commit(),
+        call.conn.close(),
+    ]
 
 
-def test_discover_without_a_window_key_reads_tonight_only():
-    config = {k: v for k, v in CONFIG.items() if k != "volume_keep_window_days"}
+@pytest.mark.parametrize("window", ["absent", 0])
+def test_discover_without_a_usable_window_reads_tonight_only(window):
+    config = _config(volume_keep_window_days=window)
+    if window == "absent":
+        del config["volume_keep_window_days"]
     calls, conn, _exit_code = _run_discover(config, recent_max_volumes={})
 
     calls.query_recent.assert_called_once_with(conn, RUN_DATE)
     assert _upserted(calls) == {("NEW", "binance"), ("NEW", "bybit")}
 
 
+@pytest.mark.parametrize("bad", ["7", 7.5, True, None])
+def test_discover_rejects_a_malformed_window(bad):
+    with pytest.raises(ValueError, match="volume_keep_window_days"):
+        _run_discover(_config(volume_keep_window_days=bad), recent_max_volumes={})
+
+
 @pytest.mark.parametrize("failing", ["record", "query"])
 def test_discover_history_failure_rolls_back_before_touching_the_universe(failing):
     error = RuntimeError('relation "discovery_volumes" does not exist')
-    calls, conn, exit_code = _run_discover(CONFIG, {}, **{f"{failing}_error": error})
+    calls, conn, exit_code = _run_discover(_config(), {}, **{f"{failing}_error": error})
 
     assert exit_code == 1
     calls.rollback.assert_called_once_with(conn)
