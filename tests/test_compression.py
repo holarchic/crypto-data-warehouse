@@ -31,8 +31,8 @@ def test_compression_policies_for_all_tables():
 
 
 def _sql_without_comments(path):
-    """The file's SQL with `--` comments removed, so a commented-out statement never counts."""
-    return re.sub(r"--[^\n]*", "", _read(path))
+    """The file's SQL with `--` and `/* */` comments removed, so commented-out statements never count."""
+    return re.sub(r"--[^\n]*", "", re.sub(r"/\*.*?\*/", "", _read(path), flags=re.DOTALL))
 
 
 def test_no_db_file_adds_retention():
@@ -59,9 +59,7 @@ def test_migration_013_removes_every_former_retention_policy():
 def test_candles_segmentby_includes_market_type():
     """Candles PK includes market_type — segmentby must too."""
     sql = _read(MIGRATION)
-    # Find the ALTER TABLE candles block
     candles_idx = sql.index("ALTER TABLE candles")
-    # Look for segmentby in the next ~200 chars
     segment = sql[candles_idx:candles_idx + 300]
     assert "market_type" in segment, "candles segmentby must include market_type (part of PK)"
 
