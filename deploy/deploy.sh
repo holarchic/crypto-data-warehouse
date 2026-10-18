@@ -11,10 +11,6 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 COMPOSE="docker compose -f docker-compose.yml -f docker-compose.prod.yml"
 REPO_URL="https://github.com/holarchic/crypto-data-warehouse.git"
-# DB backups are DISABLED (2026-08-22): on-box dumps were deleted and the backup +
-# retention cron (below) removed, pending an OFFSITE DR target (restic -> Backblaze B2
-# or a Hetzner Storage Box). On-box dumps on /mnt/pgvol gave no real DR and crowded the
-# DB tablespace. To re-enable: BACKUP_DIR=/mnt/pgvol/backups + restore the two cron lines.
 
 # -- Helpers ------------------------------------------------------------------
 
@@ -87,6 +83,8 @@ NEW_CRON="$EXISTING_CRON
 0 2 * * * cd $PROJECT_DIR && $COMPOSE --profile discovery run --rm discovery >> /var/log/candle-collector-discovery.log 2>&1
 # candle-collector: daily HL Grade-A liquidation pull (04:00 UTC — T-009.3)
 0 4 * * * cd $PROJECT_DIR && $COMPOSE --profile liquidations-hl run --rm liquidations-hl >> /var/log/candle-collector-liquidations-hl.log 2>&1
+# candle-collector: nightly offsite backup (05:30 UTC; a no-op until the restic env file exists)
+30 5 * * * $PROJECT_DIR/scripts/backup-offsite.sh >> /var/log/candle-collector-backup.log 2>&1
 # candle-collector: host monitor (every 5 min)
 */5 * * * * $PROJECT_DIR/deploy/host-monitor.sh 2>/dev/null
 "
