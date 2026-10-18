@@ -64,7 +64,7 @@ A WS-drop gap (no history replay on reconnect) is repaired **out-of-band by a da
 
 ### collector/discovery.py — daily universe selection
 
-A one-shot (`python -m discovery`, cron 02:00 UTC via the profile-gated `discovery` compose service). Fetches perp tickers per exchange, keeps the highest-volume symbol per `asset_id`, then `qualify_assets` (pure, unit-tested) applies union qualification with hysteresis: an asset enters when its max 24h volume across venues reaches `volume_threshold_usd` and, once active (`status.query_active_asset_ids`), stays while that max holds at `volume_keep_threshold_usd`. Qualifying assets are upserted on every venue that lists them; pairs that drop out are deactivated (`active=FALSE`, history kept).
+A one-shot (`python -m discovery`, cron 02:00 UTC via the profile-gated `discovery` compose service). Fetches perp tickers per exchange, keeps the highest-volume symbol per `asset_id`, then records each asset's max 24h volume across venues for the UTC run date (`status.record_discovery_volumes` → `discovery_volumes`) and reads the per-asset maximum over the last `volume_keep_window_days` run dates (`status.query_recent_max_volumes`, window start from `keep_window_start`). `qualify_assets` (pure, unit-tested) applies union qualification with hysteresis: an asset enters when tonight's max reaches `volume_threshold_usd` and, once active (`status.query_active_asset_ids`), stays while the higher of tonight's max and its window maximum holds at `volume_keep_threshold_usd`; an asset no venue lists tonight never qualifies. The history write and read precede every upsert in the run's first transaction, so a failure there rolls back and exits 1 with `collection_status` untouched. Qualifying assets are upserted on every venue that lists them; pairs that drop out are deactivated (`active=FALSE`, history kept).
 
 ### monitor (collector/monitor.py)
 
@@ -84,7 +84,7 @@ FastAPI read-only REST API. Queries PostgreSQL, serves downstream consumers. Can
 
 ### db/
 
-Schema migrations and TimescaleDB hypertable setup. Candles hypertable partitioned on timestamp, 1-week chunks; `candles_1m` (1m only) on the `ts_1m` volume tablespace, 1-day chunks (migration 010, operator-applied). Compression (>7d) and retention policies (2y candles + candles_1m, 1y funding/OI).
+Schema migrations and TimescaleDB hypertable setup. Candles hypertable partitioned on timestamp, 1-week chunks; `candles_1m` (1m only) on the `ts_1m` volume tablespace, 1-day chunks (migration 010, operator-applied). Compression (>7d) and retention policies (2y candles + candles_1m, 1y funding/OI). `discovery_volumes` (migration 012) is a plain table with no policies.
 
 ## Data Flow
 
@@ -133,6 +133,16 @@ the monitor's staleness check is the only consumer that acts on them.
 | discovered_at | TIMESTAMPTZ | When first discovered |
 | deactivated_at | TIMESTAMPTZ | When dropped below threshold |
 | active, last_timestamp, last_success, error_count, last_error | — | Health tracking |
+
+### `discovery_volumes`
+
+PK: `(run_date, asset_id)` — a plain table (not a hypertable), migration 012. One row per asset in a night's fetched perp tickers (~920/night), no retention. The keep window reads it by `run_date` range; a same-day re-run keeps the higher reading (`GREATEST` on conflict).
+
+| Column | Type | Notes |
+|--------|------|-------|
+| run_date | DATE NOT NULL | UTC date of the discovery run |
+| asset_id | TEXT NOT NULL | Canonical base asset |
+| max_volume_usd | DOUBLE PRECISION NOT NULL | Max 24h volume across perp venues that night |
 
 ### `funding_rates` hypertable
 
