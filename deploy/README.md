@@ -35,7 +35,7 @@
 | DB shell | `docker compose exec db psql -U candles candle_collector` |
 | Apply migration | `docker compose exec db psql -U candles candle_collector < db/migrations/004-compression-retention.sql` |
 | Backup DB (local dump) | `./scripts/backup.sh` |
-| Restore DB (local dump into the running database; not the offsite recovery path) | `./scripts/restore.sh backups/<file>.dump`. Restoring a TimescaleDB dump into the existing database fails on TimescaleDB's catalog tables; use the fresh-target steps in Disaster recovery |
+| Restore DB (local dump) | Stop the collectors, api and monitor, then `./scripts/restore.sh backups/<file>.dump`. It recreates `candle_collector` from the dump with the Disaster recovery steps: a fresh database, a strict restore, and migration 013 before the scheduler restarts |
 | Verify compression | `./scripts/verify-compression.sh` |
 
 ## API Queries

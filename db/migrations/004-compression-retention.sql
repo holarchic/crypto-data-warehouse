@@ -1,9 +1,7 @@
 -- v0.6: Compression policies (>7 days). No retention: every row is kept (migration 013).
 --
--- Compression constraint: TimescaleDB does not allow INSERT into compressed
--- chunks. Safe because collectors only insert current-period data (never
--- backfill >7 days old). If backfill is ever needed, manually decompress
--- the target chunk first: SELECT decompress_chunk('<chunk_name>');
+-- Compressed chunks still accept writes, at extra cost per write. Collectors write
+-- current-period data, so compression after 7 days rarely meets one.
 
 -- Candles compression: segmentby = PK minus timestamp
 ALTER TABLE candles SET (
