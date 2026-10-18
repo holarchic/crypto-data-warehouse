@@ -90,6 +90,8 @@ Pass: returns ≥1 candle with all OHLCV fields populated, correct exchange/symb
 | Fresh install / full redeploy | `./deploy/deploy.sh` — pulls `latest-pg16` + stack-wide `up -d`; can recreate the db |
 | Server setup | `./deploy/setup.sh [CLIENT_IP...]` |
 | Run discovery (prod) | `docker compose -f docker-compose.yml -f docker-compose.prod.yml --profile discovery run --rm discovery` |
+| Offsite backup now | `./scripts/backup-offsite.sh` (see Offsite backups) |
+| List offsite snapshots | `(set -a; . /etc/candle-collector/restic.env; set +a; restic snapshots)` |
 
 ### Code updates
 
@@ -114,4 +116,85 @@ TimescaleDB auto-tunes `max_connections` low (~25 on 8GB). Override via `command
 |----------|-----|
 | `0 2 * * *` | Daily discovery |
 | `0 4 * * *` | Daily HL Grade-A liquidation pull (last 3 complete days) |
+| `30 5 * * *` | Nightly offsite backup (does nothing until configured, see below) |
 | `*/5 * * * *` | Host monitor |
+
+## Offsite backups
+
+`scripts/backup-offsite.sh` streams `pg_dump` from the db container into a [restic](https://restic.net) repository in an S3-compatible bucket every night at 05:30 UTC. That slot is clear of discovery, the HL pull and the compression jobs.
+
+- **No local copy:** the dump never touches local disk.
+- **Encrypted:** restic encrypts the repository with its password.
+- **Dedup:** the dump is uncompressed, so restic dedups the unchanged history night to night.
+- **Retention:** 7 daily, 5 weekly and 12 monthly snapshots, then `restic check`.
+- **Paging:** a failed run pages through `WEBHOOK_URL`. `host-monitor.sh` pages when the last success is more than 26 h old.
+- **RPO:** about 24 h.
+
+### Setup
+
+1. **Bucket.** Create a private bucket for the backups alone. Add a lifecycle rule that deletes hidden (noncurrent) versions after 30 days.
+2. **Key.** Create a key restricted to that bucket that can list, read and write but **not delete file versions**. On Backblaze B2 that's `listBuckets,listFiles,readFiles,writeFiles`.
+   - restic's S3 backend removes files by hiding them, so prune and lock cleanup work.
+   - A stolen key can hide files but can't destroy versions, which leaves 30 days to recover.
+3. **Credentials.** Write them to `/etc/candle-collector/` (directory `700`, files `600`), outside the checkout:
+
+   ```bash
+   # /etc/candle-collector/restic.env
+   RESTIC_REPOSITORY=s3:https://<s3-endpoint>/<bucket>/candle-collector
+   RESTIC_PASSWORD_FILE=/etc/candle-collector/restic-password
+   AWS_ACCESS_KEY_ID=<key id>
+   AWS_SECRET_ACCESS_KEY=<key>
+   ```
+
+   `restic-password` holds a long random password (`openssl rand -base64 48`). **Keep a copy of the password and repository off the server**, in a password manager. A lost server takes its copy with it, and without the password the backups can't be read.
+4. **Install restic and initialise the repository:**
+
+   ```bash
+   ./deploy/install-restic.sh
+   (set -a; . /etc/candle-collector/restic.env; set +a; restic init)
+   ./scripts/backup-offsite.sh   # the first run, by hand
+   ```
+5. **Cron.** Add the cron line from `deploy.sh`. `host-monitor.sh` pages "never succeeded" until the first run completes.
+
+### Restore drill
+
+`scripts/restore-drill.sh` restores the latest snapshot into a throwaway TimescaleDB container on any machine with Docker, restic and a copy of the env file, and never touches prod. It:
+
+- runs the strict restore;
+- checks that job owners match table owners, a restored compression job runs, and a new `candles_1m` chunk lands in `ts_1m`;
+- prints row counts from `scripts/drill-counts.sql` over a window.
+
+Run the same SQL on prod just before and just after the backup being drilled, with the bounds the drill prints. Each restored count must fall between the two.
+
+```bash
+RESTIC_ENV_FILE=~/.config/candle-collector/restic.env DRILL_DIR=<dir with ~25 GB free> scripts/restore-drill.sh
+```
+
+### Disaster recovery
+
+The drill's fresh-target steps, against a new host's db container. `DC` is `(docker compose -f docker-compose.yml -f docker-compose.prod.yml)`. Steps 4–6 run as `candles` in `"${DC[@]}" exec -T db psql -X -v ON_ERROR_STOP=1 -U candles`.
+
+1. **Base host.** `setup.sh` and `deploy.sh` on the new host. Mount the volume at `/mnt/pgvol`, with an empty `/mnt/pgvol/pgdata_1m` owned by the db container's `postgres` user. Then stop everything except `db`, so nothing writes during the restore.
+2. **Credentials.** `./deploy/install-restic.sh`. Put `restic.env` and `restic-password` back in `/etc/candle-collector/` from the off-server copy.
+   - A new key from the bucket's account works too. Only the password must be the original.
+3. **Image.** Read the latest snapshot's tags (`restic snapshots --latest 1`). The db image's TimescaleDB must equal its `timescaledb-<ver>` tag, so pin `timescale/timescaledb:<ver>-pg<major>` if `latest-pg16` has moved.
+4. **Fresh database.** `deploy.sh` left a database built from `init.sql`, so replace it from the `postgres` database:
+   - `DROP DATABASE candle_collector;`
+   - `CREATE TABLESPACE ts_1m LOCATION '/mnt/pgvol/pgdata_1m';`
+   - `CREATE DATABASE candle_collector TEMPLATE template0;`
+5. **Extension.** In `candle_collector`, run `CREATE EXTENSION timescaledb VERSION '<ver>';` and then `SELECT timescaledb_pre_restore();`.
+6. **Restore.**
+   - Fetch the dump onto the volume, which the db container sees at the same path:
+     `restic dump latest /candle_collector.dump > /mnt/pgvol/restore/candle_collector.dump`.
+   - Then `"${DC[@]}" exec -T db pg_restore -U candles -d candle_collector --exit-on-error /mnt/pgvol/restore/candle_collector.dump`.
+   - Then `SELECT timescaledb_post_restore();`.
+   - Any restore error: start again from step 4.
+7. **Bring it back.** Start the rest with `up -d --no-deps <services>`, and delete the dump.
+
+**Stuck repository lock.** Each run clears stale locks itself. Before a manual `restic unlock --remove-all`, check that no backup or drill is running: `pgrep restic` on the server, and any machine running a drill.
+
+**Compromised server.**
+1. Revoke the bucket key first.
+2. With the account's master key, restore each file's last version from before the compromise. Unhiding isn't enough if files were overwritten.
+3. Run `restic check --read-data`, which flags any altered pack, since restic's file names are content hashes.
+4. Issue a new key.

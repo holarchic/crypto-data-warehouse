@@ -118,7 +118,7 @@ Measured on the reference install (4 vCPU, 8 GB RAM, all six exchanges, about 70
 It hasn't been tested on less. Start from 4 GB of RAM, and put the database on local SSD, not a network share.
 
 > [!WARNING]
-> This is a database. Back it up: `scripts/backup.sh` and `scripts/restore.sh`. To upgrade, follow [Code updates](deploy/README.md#code-updates); don't rerun `deploy/deploy.sh` on a live install, because it can recreate the database.
+> This is a database. Back it up: `scripts/backup-offsite.sh` keeps nightly encrypted snapshots in a bucket off the server ([Offsite backups](deploy/README.md#offsite-backups)), and `scripts/backup.sh` makes a local dump. To upgrade, follow [Code updates](deploy/README.md#code-updates); don't rerun `deploy/deploy.sh` on a live install, because it can recreate the database.
 
 ## Quick start
 
