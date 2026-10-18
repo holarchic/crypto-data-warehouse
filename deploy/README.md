@@ -172,7 +172,7 @@ RESTIC_ENV_FILE=~/.config/candle-collector/restic.env DRILL_DIR=<base dir with ~
 
 ### Disaster recovery
 
-The drill's fresh-target steps on a new host. Do **not** use `deploy.sh` or `scripts/restore.sh` here. `deploy.sh` starts every writer and re-pulls `latest-pg16`. `restore.sh` restores a local dump into an existing database and is not this procedure.
+The drill's fresh-target steps on a new host. Do **not** use `deploy.sh` or `scripts/restore.sh` here. `deploy.sh` starts every writer and re-pulls `latest-pg16`. `scripts/restore.sh` runs these steps for a local dump on a running local stack; on a new host, follow them by hand.
 
 ```bash
 DC=(docker compose -f docker-compose.yml -f docker-compose.prod.yml)

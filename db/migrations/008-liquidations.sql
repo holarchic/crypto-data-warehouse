@@ -23,8 +23,9 @@
 --
 -- ROLLOUT (no migration runner — applied manually): apply this BEFORE the .2/.3 writers
 -- ship. The HL writer pulls D-1 (a still-uncompressed chunk), so its ON CONFLICT never
--- touches a compressed chunk. Replaying HL data older than 7 days would cross into a
--- compressed chunk — decompress the target chunks first (`decompress_chunk`), as in 004.
+-- touches a compressed chunk. Replaying HL data older than 7 days writes into compressed
+-- chunks, which TimescaleDB accepts at extra cost per write; `decompress_chunk` the targets
+-- first for a large replay.
 
 CREATE TABLE IF NOT EXISTS liquidations (
     timestamp        TIMESTAMPTZ NOT NULL,

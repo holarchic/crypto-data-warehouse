@@ -133,7 +133,7 @@ PK: `(exchange, market_type, symbol, timeframe, timestamp)`
 
 ### `candles_1m` hypertable
 
-Identical column shape + PK to `candles`, holding ONLY `1m` (Binance + Bybit). A **separate hypertable pinned to the `ts_1m` tablespace** (a Hetzner Cloud Volume) so 1m's ~5× density (~1.4M rows/day, ~19 GB/yr compressed) sits on cheap block storage off the 34 GB root disk — without migrating the in-place `candles` data. Chunk interval **1 day** (vs candles' 1 week — density: a 1-week chunk would be ~3.8 GB uncompressed, half of RAM). Compress >7d, no retention. On prod the chunks live in `ts_1m` (migration 010, applied after the operator mounts the volume); `init.sql` (fresh/dev, no volume) creates it in the **default** tablespace — the drift guard compares column/PK/policy shape, not the tablespace clause. Readers treat `candles` + `candles_1m` as one series split by TF; the T-011 export unions them.
+Identical column shape + PK to `candles`, holding ONLY `1m` (Binance + Bybit by REST, HyperLiquid by WS). A **separate hypertable pinned to the `ts_1m` tablespace** (a Hetzner Cloud Volume) so 1m's ~5× density (~1.4M rows/day, ~19 GB/yr compressed) sits on cheap block storage off the 34 GB root disk — without migrating the in-place `candles` data. Chunk interval **1 day** (vs candles' 1 week — density: a 1-week chunk would be ~3.8 GB uncompressed, half of RAM). Compress >7d, no retention. On prod the chunks live in `ts_1m` (migration 010, applied after the operator mounts the volume); `init.sql` (fresh/dev, no volume) creates it in the **default** tablespace — the drift guard compares column/PK/policy shape, not the tablespace clause. Readers treat `candles` + `candles_1m` as one series split by TF; the T-011 export unions them.
 
 ### `collection_status`
 

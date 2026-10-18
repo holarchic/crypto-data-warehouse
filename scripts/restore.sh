@@ -2,14 +2,17 @@
 # Restore candle_collector from a pg_dump custom-format file into the local compose db, the way
 # the disaster-recovery runbook does (deploy/README.md § Disaster recovery). TimescaleDB can't
 # restore over an existing database, so the database is dropped and recreated from template0 at
-# the running TimescaleDB version. The restore is strict (--exit-on-error), and migration 013 runs
+# the dump's TimescaleDB version. The restore is strict (--exit-on-error), and migration 013 runs
 # before the job scheduler restarts, so a dump taken before it brings no retention jobs back.
 #
-# Every writer must be stopped first (collectors, api, monitor): the script refuses while any
-# other session is connected. A dump that places candles_1m on the ts_1m tablespace needs that
-# tablespace to exist in the db (migration 010).
+# Nothing changes until every check passes: no client session is connected (stop the
+# collectors, api and monitor first; TimescaleDB's own workers don't count, and DROP DATABASE
+# stops them), the dump's TimescaleDB version is available in the db image, and the archive
+# reads end to end. A dump that places candles_1m on the ts_1m tablespace needs that tablespace
+# in the db (migration 010).
 #
 # Usage: ./scripts/restore.sh backups/candle_collector-20260329-120000.dump   (from the project root)
+#   TSDB_VERSION  the dump's TimescaleDB version (default: the one installed in candle_collector)
 set -euo pipefail
 
 if [ $# -lt 1 ]; then
@@ -20,7 +23,7 @@ fi
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 BACKUP_FILE="$1"
-CONTAINER_DUMP="/tmp/candle_collector-restore.dump"
+CONTAINER_DUMP="/tmp/candle_collector-restore-$$.dump"
 
 if [ ! -f "$BACKUP_FILE" ]; then
     echo "Error: backup file not found: ${BACKUP_FILE}"
@@ -30,6 +33,12 @@ fi
 fail() { echo "==> FATAL: $*" >&2; exit 1; }
 # Statements go in on stdin, so psql variables (-v) interpolate.
 db_sql() { docker compose exec -T db psql -X -v ON_ERROR_STOP=1 -U candles "$@"; }
+# A staged dump left behind is reported; the exit status stays the run's own.
+cleanup() {
+    if ! docker compose exec -T db rm -f "$CONTAINER_DUMP" > /dev/null 2>&1; then
+        echo "==> WARNING: ${CONTAINER_DUMP} may remain in the db container" >&2
+    fi
+}
 
 echo "==> WARNING: This drops the candle_collector database and recreates it from the dump."
 echo "    Backup file: ${BACKUP_FILE}"
@@ -39,26 +48,40 @@ if [ "$CONFIRM" != "yes" ]; then
     exit 0
 fi
 
-sessions=$(db_sql -d postgres -At <<'SQL'
-SELECT count(*) FROM pg_stat_activity WHERE datname = 'candle_collector' AND pid <> pg_backend_pid();
-SQL
-)
-[ "$sessions" = "0" ] || fail "${sessions} other session(s) on candle_collector; stop the collectors, api and monitor first"
-tsdb_version=$(db_sql -d postgres -At <<'SQL'
-SELECT default_version FROM pg_available_extensions WHERE name = 'timescaledb';
-SQL
-)
+# -- Preflight: the database is untouched until all of this passes --------------------
 
+sessions=$(db_sql -d postgres -At <<'SQL'
+SELECT count(*) FROM pg_stat_activity
+WHERE datname = 'candle_collector' AND backend_type = 'client backend' AND pid <> pg_backend_pid();
+SQL
+)
+[ "$sessions" = "0" ] || fail "${sessions} client session(s) on candle_collector; stop the collectors, api and monitor first"
+
+if [ -z "${TSDB_VERSION:-}" ]; then
+    TSDB_VERSION=$(db_sql -d candle_collector -At 2>/dev/null <<'SQL'
+SELECT extversion FROM pg_extension WHERE extname = 'timescaledb';
+SQL
+) || fail "cannot read the installed TimescaleDB version; set TSDB_VERSION to the dump's version"
+fi
+available=$(db_sql -d postgres -At -v tsdb="$TSDB_VERSION" <<'SQL'
+SELECT count(*) FROM pg_available_extension_versions WHERE name = 'timescaledb' AND version = :'tsdb';
+SQL
+)
+[ "$available" = "1" ] || fail "TimescaleDB ${TSDB_VERSION} is not available in this db image; the restore needs the dump's version"
+
+trap cleanup EXIT
 echo "==> Copying the dump into the db container..."
 docker compose cp "$BACKUP_FILE" "db:${CONTAINER_DUMP}"
-trap 'docker compose exec -T db rm -f "$CONTAINER_DUMP" > /dev/null 2>&1 || true' EXIT
+echo "==> Checking the archive reads end to end..."
+docker compose exec -T db pg_restore --file=/dev/null "$CONTAINER_DUMP" \
+    || fail "${BACKUP_FILE} is not a readable pg_dump archive; candle_collector is untouched"
 
-echo "==> Recreating candle_collector (TimescaleDB ${tsdb_version})..."
+echo "==> Recreating candle_collector (TimescaleDB ${TSDB_VERSION})..."
 db_sql -d postgres <<'SQL'
 DROP DATABASE IF EXISTS candle_collector;
 CREATE DATABASE candle_collector TEMPLATE template0;
 SQL
-db_sql -d candle_collector -v tsdb="$tsdb_version" <<'SQL'
+db_sql -d candle_collector -v tsdb="$TSDB_VERSION" <<'SQL'
 CREATE EXTENSION timescaledb VERSION :'tsdb';
 SELECT timescaledb_pre_restore();
 SQL
