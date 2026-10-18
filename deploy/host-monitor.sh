@@ -17,33 +17,29 @@ PROJECT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 ALERT_FILE="/tmp/candle-collector-host-alert"
 COOLDOWN_SECONDS=3600
 
-# -- Load webhook URL ---------------------------------------------------------
+# -- Webhook --------------------------------------------------------------------
+# A checkout without scripts/webhook-lib.sh still runs every check below; it just can't page.
 
-ENV_FILE="$PROJECT_DIR/.env"
-WEBHOOK_URL="${WEBHOOK_URL:-}"
-if [ -z "$WEBHOOK_URL" ] && [ -f "$ENV_FILE" ]; then
-    WEBHOOK_URL=$(grep -E '^WEBHOOK_URL=' "$ENV_FILE" | cut -d= -f2- | tr -d '"' || true)
+if [ -f "$PROJECT_DIR/scripts/webhook-lib.sh" ]; then
+    # shellcheck source=scripts/webhook-lib.sh
+    . "$PROJECT_DIR/scripts/webhook-lib.sh"
+    load_webhook_url "$PROJECT_DIR"
+else
+    webhook_post() { return 1; }
 fi
 
 # -- Helpers ------------------------------------------------------------------
 
+# Non-zero when the page wasn't delivered, so reminder state can wait for one that was.
 post_webhook() {
-    local message="$1"
-    local hostname
-    hostname=$(hostname)
-    if [ -n "$WEBHOOK_URL" ]; then
-        curl -sf --connect-timeout 5 --max-time 15 -X POST "$WEBHOOK_URL" \
-            -H "Content-Type: application/json" \
-            -d "{\"text\":\"🚨 candle-collector ($hostname): $message\"}" \
-            > /dev/null 2>&1 || echo "[host-monitor] webhook post failed"
-    fi
+    webhook_post "🚨 candle-collector ($(hostname)): $1"
 }
 
 # Memory/container alerts: post + arm the shared ALERT_FILE hourly cooldown.
 send_alert() {
     local message="$1"
     echo "[host-monitor] ALERT: $message"
-    post_webhook "$message"
+    post_webhook "$message" || echo "[host-monitor] webhook post failed"
     touch "$ALERT_FILE"
 }
 
@@ -51,7 +47,7 @@ send_alert() {
 disk_alert() {
     local message="$1"
     echo "[host-monitor] $message"
-    post_webhook "$message"
+    post_webhook "$message" || echo "[host-monitor] webhook post failed"
 }
 
 # -- Disk usage (tiered, per mount) -------------------------------------------
@@ -117,16 +113,19 @@ done
 # reads). A failed run pages from that script; this catches the runs that never start.
 # Its own reminder file, not the shared cooldown below, so a stale backup never mutes a
 # container-down page. The env file and marker paths come from scripts/offsite-lib.sh; a
-# checkout without it skips this check, never the ones after it.
+# checkout without it skips this check, never the ones after it. Reminder state moves only
+# on a delivered page, so an undelivered one is retried next run.
+offsite_lib_loaded=0
 if [ -f "$PROJECT_DIR/scripts/offsite-lib.sh" ]; then
     # shellcheck source=scripts/offsite-lib.sh
     . "$PROJECT_DIR/scripts/offsite-lib.sh"
+    offsite_lib_loaded=1
 fi
 BACKUP_ALERT_FILE="${BACKUP_ALERT_FILE:-/tmp/candle-collector-backup-stale-alert}"
 BACKUP_STALE_SECONDS=$((26 * 3600))
 BACKUP_REMIND_SECONDS=$((6 * 3600))
 
-if [ -f "${RESTIC_ENV_FILE:-}" ]; then
+if [ "$offsite_lib_loaded" -eq 1 ] && [ -f "$RESTIC_ENV_FILE" ]; then
     backup_now=$(date +%s)
     last_ok=$(stat -c %Y "$BACKUP_OK_MARKER" 2>/dev/null || echo 0)
     if [ $(( backup_now - last_ok )) -ge "$BACKUP_STALE_SECONDS" ]; then
@@ -138,14 +137,20 @@ if [ -f "${RESTIC_ENV_FILE:-}" ]; then
                 backup_age="last success $(( (backup_now - last_ok) / 3600 ))h ago"
             fi
             echo "[host-monitor] Offsite backup stale: ${backup_age}"
-            post_webhook "🟠 Offsite backup stale: ${backup_age}"
-            touch "$BACKUP_ALERT_FILE" \
-                || echo "[host-monitor] cannot write ${BACKUP_ALERT_FILE}; the stale page repeats every run"
+            if post_webhook "🟠 Offsite backup stale: ${backup_age}"; then
+                touch "$BACKUP_ALERT_FILE" \
+                    || echo "[host-monitor] cannot write ${BACKUP_ALERT_FILE}; the stale page repeats every run"
+            else
+                echo "[host-monitor] webhook post failed; retrying next run"
+            fi
         fi
     elif [ -f "$BACKUP_ALERT_FILE" ]; then
         echo "[host-monitor] Offsite backup recovered"
-        post_webhook "✅ Offsite backup recovered"
-        rm -f "$BACKUP_ALERT_FILE" || echo "[host-monitor] cannot remove ${BACKUP_ALERT_FILE}"
+        if post_webhook "✅ Offsite backup recovered"; then
+            rm -f "$BACKUP_ALERT_FILE" || echo "[host-monitor] cannot remove ${BACKUP_ALERT_FILE}"
+        else
+            echo "[host-monitor] webhook post failed; retrying next run"
+        fi
     fi
 fi
 

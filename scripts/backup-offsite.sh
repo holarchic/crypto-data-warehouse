@@ -26,25 +26,17 @@ if [ ! -f "$RESTIC_ENV_FILE" ]; then
     exit 0
 fi
 
-# -- Load webhook URL for failure alerts --------------------------------------
+# -- Failure alerts -------------------------------------------------------------
 
-ENV_FILE="$PROJECT_DIR/.env"
-WEBHOOK_URL="${WEBHOOK_URL:-}"
-if [ -z "$WEBHOOK_URL" ] && [ -f "$ENV_FILE" ]; then
-    WEBHOOK_URL=$(grep -E '^WEBHOOK_URL=' "$ENV_FILE" | cut -d= -f2- | tr -d '"' || true)
-fi
+# shellcheck source=scripts/webhook-lib.sh
+. "$SCRIPT_DIR/webhook-lib.sh"
+load_webhook_url "$PROJECT_DIR"
 
 send_alert() {
     local message="$1"
-    local hostname
-    hostname=$(hostname)
     echo "==> ALERT: $message" >&2
-    if [ -n "$WEBHOOK_URL" ]; then
-        curl -sf --connect-timeout 5 --max-time 15 -X POST "$WEBHOOK_URL" \
-            -H "Content-Type: application/json" \
-            -d "{\"text\":\"🚨 candle-collector offsite backup ($hostname): $message\"}" \
-            > /dev/null 2>&1 || echo "==> Webhook post failed" >&2
-    fi
+    webhook_post "🚨 candle-collector offsite backup ($(hostname)): $message" \
+        || echo "==> Webhook post failed" >&2
 }
 
 fail() {

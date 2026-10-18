@@ -9,25 +9,17 @@ PROJECT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 BACKUP_DIR="${BACKUP_DIR:-${PROJECT_DIR}/backups}"
 mkdir -p "$BACKUP_DIR"
 
-# -- Load webhook URL for failure alerts --------------------------------------
+# -- Failure alerts -------------------------------------------------------------
 
-ENV_FILE="$PROJECT_DIR/.env"
-WEBHOOK_URL=""
-if [ -f "$ENV_FILE" ]; then
-    WEBHOOK_URL=$(grep -E '^WEBHOOK_URL=' "$ENV_FILE" | cut -d= -f2- | tr -d '"' || true)
-fi
+# shellcheck source=scripts/webhook-lib.sh
+. "$SCRIPT_DIR/webhook-lib.sh"
+load_webhook_url "$PROJECT_DIR"
 
 send_alert() {
     local message="$1"
-    local hostname
-    hostname=$(hostname)
     echo "==> ALERT: $message" >&2
-    if [ -n "$WEBHOOK_URL" ]; then
-        curl -sf -X POST "$WEBHOOK_URL" \
-            -H "Content-Type: application/json" \
-            -d "{\"text\":\"🚨 candle-collector backup ($hostname): $message\"}" \
-            > /dev/null 2>&1 || true
-    fi
+    webhook_post "🚨 candle-collector backup ($(hostname)): $message" \
+        || echo "==> Webhook post failed" >&2
 }
 
 # Alert on any failure
