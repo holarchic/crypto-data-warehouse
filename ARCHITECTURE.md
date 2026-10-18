@@ -84,7 +84,7 @@ FastAPI read-only REST API. Queries PostgreSQL, serves downstream consumers. Can
 
 ### db/
 
-Schema migrations and TimescaleDB hypertable setup. Candles hypertable partitioned on timestamp, 1-week chunks; `candles_1m` (1m only) on the `ts_1m` volume tablespace, 1-day chunks (migration 010, operator-applied). Compression (>7d) and retention policies (2y candles + candles_1m, 1y funding/OI). `discovery_volumes` (migration 012) is a plain table with no policies.
+Schema migrations and TimescaleDB hypertable setup. Candles hypertable partitioned on timestamp, 1-week chunks; `candles_1m` (1m only) on the `ts_1m` volume tablespace, 1-day chunks (migration 010, operator-applied). Compression (>7d) on every hypertable, and no retention: all history is kept (migration 013 removed the old policies, and no file in `db/` adds one). `discovery_volumes` (migration 012) is a plain table with no policies.
 
 ### Offsite backup (scripts/backup-offsite.sh, host cron)
 
@@ -133,7 +133,7 @@ PK: `(exchange, market_type, symbol, timeframe, timestamp)`
 
 ### `candles_1m` hypertable
 
-Identical column shape + PK to `candles`, holding ONLY `1m` (Binance + Bybit). A **separate hypertable pinned to the `ts_1m` tablespace** (a Hetzner Cloud Volume) so 1m's ~5× density (~1.4M rows/day, ~19 GB/yr compressed) sits on cheap block storage off the 34 GB root disk — without migrating the in-place `candles` data. Chunk interval **1 day** (vs candles' 1 week — density: a 1-week chunk would be ~3.8 GB uncompressed, half of RAM). Compress >7d, retention 2y (the volume holds it, no shorter-retention compromise). On prod the chunks live in `ts_1m` (migration 010, applied after the operator mounts the volume); `init.sql` (fresh/dev, no volume) creates it in the **default** tablespace — the drift guard compares column/PK/policy shape, not the tablespace clause. Readers treat `candles` + `candles_1m` as one series split by TF; the T-011 export unions them.
+Identical column shape + PK to `candles`, holding ONLY `1m` (Binance + Bybit). A **separate hypertable pinned to the `ts_1m` tablespace** (a Hetzner Cloud Volume) so 1m's ~5× density (~1.4M rows/day, ~19 GB/yr compressed) sits on cheap block storage off the 34 GB root disk — without migrating the in-place `candles` data. Chunk interval **1 day** (vs candles' 1 week — density: a 1-week chunk would be ~3.8 GB uncompressed, half of RAM). Compress >7d, no retention. On prod the chunks live in `ts_1m` (migration 010, applied after the operator mounts the volume); `init.sql` (fresh/dev, no volume) creates it in the **default** tablespace — the drift guard compares column/PK/policy shape, not the tablespace clause. Readers treat `candles` + `candles_1m` as one series split by TF; the T-011 export unions them.
 
 ### `collection_status`
 
@@ -207,13 +207,13 @@ ccxt-canonical id — so the T-011 parquet export is a passthrough.
 
 ### `liquidations` hypertable
 
-All-venue liquidation events, two fidelity grades: HL `node_fills` (Grade A, untruncated tape, `.3`) + Binance/Bybit WS (Grade C, forward directional sidecar, no historical seed, `.2`). **One** table (not per-venue) — a superset of the HL seed's 13 columns + `venue`/`grade`/`liquidated_side`; HL rows fill all seed columns, Grade-C rows leave the HL-specific ones NULL. 1-week chunks; compress after 7 days segmentby `venue, asset_id`; retention 1 year. `asset_id` holds the seed's `coin` value (T-011 export aliases it). Full column list in SPEC.
+All-venue liquidation events, two fidelity grades: HL `node_fills` (Grade A, untruncated tape, `.3`) + Binance/Bybit WS (Grade C, forward directional sidecar, no historical seed, `.2`). **One** table (not per-venue) — a superset of the HL seed's 13 columns + `venue`/`grade`/`liquidated_side`; HL rows fill all seed columns, Grade-C rows leave the HL-specific ones NULL. 1-week chunks; compress after 7 days segmentby `venue, asset_id`; no retention. `asset_id` holds the seed's `coin` value (T-011 export aliases it). Full column list in SPEC.
 
 **Dedup (the one structural subtlety):** a UNIQUE INDEX `(venue, asset_id, timestamp, oid, tid)`, **not** a PK — a PK is NOT NULL but `oid`/`tid` are NULL for Grade-C rows, and a hypertable needs the partition column in any unique key. HL rows carry non-null `oid`/`tid`, so distinct pairs preserve real same-ms clustered events (the backtester's structural hash is duplicate-sensitive) while an exact re-pull dedups via `ON CONFLICT DO NOTHING` (idempotency for the daily HL batch). Grade-C rows (NULL `oid`/`tid`, Postgres NULLS DISTINCT) never conflict → all land. The index's `(venue, asset_id, timestamp)` prefix serves range queries + the export. Table exists (migration 008); the writers are `.2`/`.3`.
 
 ### `premium_index` hypertable
 
-Binance-only premium-index term structure (mark-vs-index spread), 5-min OHLC klines (`premiumIndexKlines`), 1-week chunks, compress after 7 days segmentby `(exchange, symbol)`, retention 1 year. A **superset** of the backtester's 1h `binance-premium-index` seed (downsamples to 1h for the T-011 export). Migration 009. PK: `(exchange, symbol, timestamp)`.
+Binance-only premium-index term structure (mark-vs-index spread), 5-min OHLC klines (`premiumIndexKlines`), 1-week chunks, compress after 7 days segmentby `(exchange, symbol)`, no retention. A **superset** of the backtester's 1h `binance-premium-index` seed (downsamples to 1h for the T-011 export). Migration 009. PK: `(exchange, symbol, timestamp)`.
 
 | Column | Type | Notes |
 |--------|------|-------|

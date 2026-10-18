@@ -184,6 +184,14 @@ SQL
 
 log "Restoring"
 docker exec "$CONTAINER_ID" pg_restore -U candles -d candle_collector --exit-on-error "/drill/$SNAPSHOT_FILE"
+# A snapshot taken before migration 013 carries retention jobs. Clear them before post_restore
+# restarts the scheduler, as the disaster-recovery runbook does.
+psql_drill -d candle_collector < "$SCRIPT_DIR/../db/migrations/013-keep-all-history.sql" > /dev/null
+retention_jobs=$(psql_drill -d candle_collector -At <<'SQL'
+SELECT count(*) FROM timescaledb_information.jobs WHERE proc_name = 'policy_retention';
+SQL
+)
+[ "$retention_jobs" = "0" ] || fail "${retention_jobs} retention job(s) remain after migration 013"
 psql_drill -d candle_collector <<'SQL'
 SELECT timescaledb_post_restore();
 SQL

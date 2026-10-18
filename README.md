@@ -84,7 +84,7 @@ flowchart LR
 ```
 
 - **Collectors:** one container per exchange. Each polls on candle boundaries, stays inside the exchange's rate limit, and resumes from its last stored bar after a restart. Writes are idempotent.
-- **Storage:** TimescaleDB, compressed after 7 days. Candles are kept for 2 years, everything else for 1 year. 1m candles have their own table, so they can sit on a separate volume.
+- **Storage:** TimescaleDB, compressed after 7 days. Nothing is deleted: every table keeps all its history, so plan disk for growth (measured on the reference install, about 700 assets: roughly 4.5 GB a month compressed). 1m candles have their own table, so they can sit on a separate volume.
 - **API:** read-only FastAPI, plus a parquet export for bulk pulls.
 
 Module and table detail: [`ARCHITECTURE.md`](ARCHITECTURE.md).

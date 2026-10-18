@@ -11,6 +11,7 @@ if [ $# -lt 1 ]; then
     exit 1
 fi
 
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 BACKUP_FILE="$1"
 
 if [ ! -f "$BACKUP_FILE" ]; then
@@ -37,6 +38,18 @@ docker compose exec -T db pg_restore \
     --if-exists \
     --no-owner \
     -d candle_collector < "$BACKUP_FILE"
+
+# A dump taken before migration 013 carries retention jobs. Clear them before post_restore
+# restarts the job scheduler, or the next run drops old history.
+echo "==> Removing restored retention policies (migration 013)..."
+docker compose exec -T db psql -v ON_ERROR_STOP=1 -U candles candle_collector \
+    < "$SCRIPT_DIR/../db/migrations/013-keep-all-history.sql" > /dev/null
+retention_jobs=$(docker compose exec -T db psql -X -U candles candle_collector -Atc \
+    "SELECT count(*) FROM timescaledb_information.jobs WHERE proc_name = 'policy_retention'")
+if [ "$retention_jobs" != "0" ]; then
+    echo "==> FATAL: ${retention_jobs} retention job(s) remain; the scheduler stays stopped" >&2
+    exit 1
+fi
 
 echo "==> Finalizing TimescaleDB restore..."
 docker compose exec -T db psql -U candles candle_collector -c \
