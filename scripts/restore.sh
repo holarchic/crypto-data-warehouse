@@ -25,8 +25,9 @@ fi
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 BACKUP_FILE="$1"
 CONTAINER_DUMP="/tmp/candle_collector-restore-$$.dump"
-# mkdir is atomic on every platform the script runs on, unlike flock (absent on macOS).
-LOCK_DIR="${TMPDIR:-/tmp}/candle-collector-restore.lock"
+# mkdir is atomic on every platform the script runs on, unlike flock (absent on macOS). A fixed
+# path, not $TMPDIR, so every shell on the host contends for the same lock.
+LOCK_DIR="/tmp/candle-collector-restore.lock"
 
 if [ ! -f "$BACKUP_FILE" ]; then
     echo "Error: backup file not found: ${BACKUP_FILE}"
@@ -83,14 +84,19 @@ tablespaces=$(docker compose exec -T db sh -c \
     'set -o pipefail; pg_restore --file=- "$1" | sed -n "s/^SET default_tablespace = \(.*\);\$/\1/p" | sort -u' \
     _ "$CONTAINER_DUMP") \
     || fail "${BACKUP_FILE} is not a readable pg_dump archive; candle_collector is untouched"
-for tablespace in $tablespaces; do
-    [ "$tablespace" = "''" ] && continue
+# One identifier per line, as pg_dump prints it: '' is the default tablespace, and a name that
+# needs quoting comes double-quoted with any inner quote doubled.
+while IFS= read -r tablespace; do
+    [ -z "$tablespace" ] || [ "$tablespace" = "''" ] && continue
+    case "$tablespace" in
+        \"*\") tablespace="${tablespace#\"}"; tablespace="${tablespace%\"}"; tablespace="${tablespace//\"\"/\"}" ;;
+    esac
     found=$(db_sql -d postgres -At -v ts="$tablespace" <<'SQL'
 SELECT count(*) FROM pg_tablespace WHERE spcname = :'ts';
 SQL
 )
     [ "$found" = "1" ] || fail "the dump places tables on tablespace ${tablespace}, which this db lacks (on prod: migration 010); candle_collector is untouched"
-done
+done <<< "$tablespaces"
 
 echo "==> Recreating candle_collector (TimescaleDB ${TSDB_VERSION})..."
 db_sql -d postgres <<'SQL'
