@@ -34,8 +34,8 @@
 | Logs (monitor) | `docker compose logs -f monitor` |
 | DB shell | `docker compose exec db psql -U candles candle_collector` |
 | Apply migration | `docker compose exec db psql -U candles candle_collector < db/migrations/004-compression-retention.sql` |
-| Backup DB | `./scripts/backup.sh` |
-| Restore DB | `./scripts/restore.sh backups/<file>.dump` |
+| Backup DB (local dump) | `./scripts/backup.sh` |
+| Restore DB (local dump into the running database; not the offsite recovery path) | `./scripts/restore.sh backups/<file>.dump` |
 | Verify compression | `./scripts/verify-compression.sh` |
 
 ## API Queries
@@ -167,29 +167,51 @@ TimescaleDB auto-tunes `max_connections` low (~25 on 8GB). Override via `command
 Run the same SQL on prod just before and just after the backup being drilled, with the bounds the drill prints. Each restored count must fall between the two.
 
 ```bash
-RESTIC_ENV_FILE=~/.config/candle-collector/restic.env DRILL_DIR=<dir with ~25 GB free> scripts/restore-drill.sh
+RESTIC_ENV_FILE=~/.config/candle-collector/restic.env DRILL_DIR=<base dir with ~25 GB free> scripts/restore-drill.sh
 ```
 
 ### Disaster recovery
 
-The drill's fresh-target steps, against a new host's db container. `DC` is `(docker compose -f docker-compose.yml -f docker-compose.prod.yml)`. Steps 4–6 run as `candles` in `"${DC[@]}" exec -T db psql -X -v ON_ERROR_STOP=1 -U candles`.
+The drill's fresh-target steps on a new host. Do **not** use `deploy.sh` or `scripts/restore.sh` here. `deploy.sh` starts every writer and re-pulls `latest-pg16`. `restore.sh` restores a local dump into an existing database and is not this procedure.
 
-1. **Base host.** `setup.sh` and `deploy.sh` on the new host. Mount the volume at `/mnt/pgvol`, with an empty `/mnt/pgvol/pgdata_1m` owned by the db container's `postgres` user. Then stop everything except `db`, so nothing writes during the restore.
-2. **Credentials.** `./deploy/install-restic.sh`. Put `restic.env` and `restic-password` back in `/etc/candle-collector/` from the off-server copy.
-   - A new key from the bucket's account works too. Only the password must be the original.
-3. **Image.** Read the latest snapshot's tags (`restic snapshots --latest 1`). The db image's TimescaleDB must equal its `timescaledb-<ver>` tag, so pin `timescale/timescaledb:<ver>-pg<major>` if `latest-pg16` has moved.
-4. **Fresh database.** `deploy.sh` left a database built from `init.sql`, so replace it from the `postgres` database:
-   - `DROP DATABASE candle_collector;`
-   - `CREATE TABLESPACE ts_1m LOCATION '/mnt/pgvol/pgdata_1m';`
-   - `CREATE DATABASE candle_collector TEMPLATE template0;`
-5. **Extension.** In `candle_collector`, run `CREATE EXTENSION timescaledb VERSION '<ver>';` and then `SELECT timescaledb_pre_restore();`.
+```bash
+DC=(docker compose -f docker-compose.yml -f docker-compose.prod.yml)
+# Loads the credentials for one restic command only.
+restic_env() { (set -a; . /root/restore/restic.env; set +a; exec restic "$@"); }
+# SQL as the candles superuser; pass -d postgres or -d candle_collector.
+db_sql() { "${DC[@]}" exec -T db psql -X -v ON_ERROR_STOP=1 -U candles "$@"; }
+```
+
+**Credentials.** Keep them in `/root/restore/` until step 7. A `/etc/candle-collector/restic.env` would let the 05:30 job back up a half-restored database. Keep every writer stopped until step 7.
+
+1. **Storage first.**
+   - Run `setup.sh`.
+   - Mount the volume at `/mnt/pgvol` (fstab) before anything starts the db container. Docker's bind mount doesn't pick up a mount made after the container starts.
+   - Create empty `/mnt/pgvol/pgdata_1m` and `/mnt/pgvol/restore`, owned by uid 70 (the image's `postgres`).
+2. **Credentials and snapshot.**
+   - Run `./deploy/install-restic.sh`.
+   - Copy the off-server `restic.env` and `restic-password` into `/root/restore/`, with `RESTIC_PASSWORD_FILE` pointing there. A new bucket key from the account works too; only the password must be the original.
+   - Pick the snapshot with `restic_env snapshots --host candle-collector --latest 1`. Note its ID and its `timescaledb-<ver>` and `pg<major>` tags.
+3. **Image before first start.** On first start, the image installs TimescaleDB in every database at its own version, and the restore needs the snapshot's.
+   - `docker pull timescale/timescaledb:<ver>-pg<major>`
+   - `docker tag timescale/timescaledb:<ver>-pg<major> timescale/timescaledb:latest-pg16`
+   - Clone the repo into the project dir and write `.env` from `.env.example`. New secrets are fine.
+4. **Start only the db and stage the dump.**
+   - `"${DC[@]}" up -d db`
+   - `db_sql -d postgres -c "CREATE TABLESPACE ts_1m LOCATION '/mnt/pgvol/pgdata_1m'"` creates the tablespace, once; it outlives any database.
+   - `restic_env dump <snapshot id> /candle_collector.dump > /mnt/pgvol/restore/candle_collector.dump` puts the dump on the volume, which the db container sees at the same path.
+5. **Fresh database.** If anything below fails, start again here.
+   - `db_sql -d postgres -c 'DROP DATABASE IF EXISTS candle_collector' -c 'CREATE DATABASE candle_collector TEMPLATE template0'`
+   - `db_sql -d candle_collector -c "CREATE EXTENSION timescaledb VERSION '<ver>'" -c 'SELECT timescaledb_pre_restore()'`
 6. **Restore.**
-   - Fetch the dump onto the volume, which the db container sees at the same path:
-     `restic dump latest /candle_collector.dump > /mnt/pgvol/restore/candle_collector.dump`.
-   - Then `"${DC[@]}" exec -T db pg_restore -U candles -d candle_collector --exit-on-error /mnt/pgvol/restore/candle_collector.dump`.
-   - Then `SELECT timescaledb_post_restore();`.
-   - Any restore error: start again from step 4.
-7. **Bring it back.** Start the rest with `up -d --no-deps <services>`, and delete the dump.
+   - `"${DC[@]}" exec -T db pg_restore -U candles -d candle_collector --exit-on-error /mnt/pgvol/restore/candle_collector.dump`
+   - `db_sql -d candle_collector -c 'SELECT timescaledb_post_restore()'`
+7. **Bring it back.**
+   - Build and start the rest with `"${DC[@]}" build` and `up -d --no-deps <services>`.
+   - Add the cron lines from `deploy.sh`.
+   - Move the credentials to `/etc/candle-collector/` and fix `RESTIC_PASSWORD_FILE`.
+   - Run `./scripts/backup-offsite.sh` once, then delete the dump.
+   - Never run `compose pull db` or `deploy.sh` on this host unless you mean to move TimescaleDB versions.
 
 **Stuck repository lock.** Each run clears stale locks itself. Before a manual `restic unlock --remove-all`, check that no backup or drill is running: `pgrep restic` on the server, and any machine running a drill.
 

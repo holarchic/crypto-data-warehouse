@@ -13,11 +13,10 @@ export PATH="/usr/local/bin:/usr/bin:/bin:$PATH"
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
-RESTIC_ENV_FILE="${RESTIC_ENV_FILE:-/etc/candle-collector/restic.env}"
-BACKUP_OK_MARKER="${BACKUP_OK_MARKER:-/var/lib/candle-collector/backup-ok}"
+# shellcheck source=scripts/offsite-lib.sh
+. "$SCRIPT_DIR/offsite-lib.sh"
 LOCK_FILE="/run/lock/candle-collector-backup.lock"
-# Fixed rather than the hostname, so retention groups survive a host rebuild.
-SNAPSHOT_HOST="candle-collector"
+LOG_HINT="check /var/log/candle-collector-backup.log"
 DC=(docker compose -f docker-compose.yml -f docker-compose.prod.yml)
 
 log() { echo "==> $(date -u +%Y-%m-%dT%H:%M:%SZ) $*"; }
@@ -41,10 +40,10 @@ send_alert() {
     hostname=$(hostname)
     echo "==> ALERT: $message" >&2
     if [ -n "$WEBHOOK_URL" ]; then
-        curl -sf -X POST "$WEBHOOK_URL" \
+        curl -sf --connect-timeout 5 --max-time 15 -X POST "$WEBHOOK_URL" \
             -H "Content-Type: application/json" \
             -d "{\"text\":\"🚨 candle-collector offsite backup ($hostname): $message\"}" \
-            > /dev/null 2>&1 || true
+            > /dev/null 2>&1 || echo "==> Webhook post failed" >&2
     fi
 }
 
@@ -53,13 +52,9 @@ fail() {
     exit 1
 }
 
-trap 'send_alert "Offsite backup failed — check /var/log/candle-collector-backup.log"' ERR
-
-# The bucket credentials exist only in restic's process, never in this shell.
-restic_run() {
-    # shellcheck source=/dev/null
-    ( set -a; . "$RESTIC_ENV_FILE"; set +a; exec restic "$@" )
-}
+# Any other failing command. restic calls report their own failure through fail(): the ERR trap
+# does not reach inside the restic_run function.
+trap 'send_alert "Offsite backup failed; ${LOG_HINT}"' ERR
 
 # -- One run at a time ----------------------------------------------------------
 # A run still going when the next starts needs a look, not a second dump on top of it.
@@ -74,7 +69,7 @@ cd "$PROJECT_DIR"
 log "Offsite backup starting"
 
 # Only stale locks: one left by an interrupted run clears, a live drill elsewhere keeps its own.
-restic_run unlock
+restic_run unlock || fail "restic unlock failed (exit $?); ${LOG_HINT}"
 
 TSDB_VERSION=$("${DC[@]}" exec -T db psql -X -U candles -d candle_collector -Atc \
     "SELECT extversion FROM pg_extension WHERE extname = 'timescaledb'")
@@ -92,15 +87,17 @@ log "TimescaleDB ${TSDB_VERSION}, PostgreSQL ${PG_MAJOR}"
 log "Dumping candle_collector into the repository"
 restic_run backup --host "$SNAPSHOT_HOST" \
     --tag "timescaledb-${TSDB_VERSION}" --tag "pg${PG_MAJOR}" \
-    --stdin-filename candle_collector.dump --stdin-from-command -- \
+    --stdin-filename "$SNAPSHOT_FILE" --stdin-from-command -- \
     env -u AWS_ACCESS_KEY_ID -u AWS_SECRET_ACCESS_KEY -u AWS_SESSION_TOKEN \
-    "${DC[@]}" exec -T db pg_dump -U candles --format=custom --compress=0 candle_collector
+    "${DC[@]}" exec -T db pg_dump -U candles --format=custom --compress=0 candle_collector \
+    || fail "restic backup failed (exit $?), no snapshot made; ${LOG_HINT}"
 
 log "Applying retention"
-restic_run forget --host "$SNAPSHOT_HOST" --keep-daily 7 --keep-weekly 5 --keep-monthly 12 --prune
+restic_run forget --host "$SNAPSHOT_HOST" --keep-daily 7 --keep-weekly 5 --keep-monthly 12 --prune \
+    || fail "restic forget/prune failed (exit $?); ${LOG_HINT}"
 
 log "Checking the repository"
-restic_run check
+restic_run check || fail "restic check failed (exit $?); ${LOG_HINT}"
 
 mkdir -p "$(dirname "$BACKUP_OK_MARKER")"
 date -u +%Y-%m-%dT%H:%M:%SZ > "$BACKUP_OK_MARKER"

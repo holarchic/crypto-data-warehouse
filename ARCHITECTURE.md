@@ -94,10 +94,11 @@ A nightly host-cron job at 05:30 UTC, outside compose, that does nothing until `
   - Snapshots carry a fixed `--host candle-collector` and `timescaledb-<ver>`/`pg<major>` tags.
   - Retention is 7 daily, 5 weekly and 12 monthly snapshots, pruned nightly.
 - **After the dump.** `restic check`, then a success marker (`/var/lib/candle-collector/backup-ok`).
-- **Credentials.** The bucket credentials live only in restic's process. `env -u` strips them from the dump command, so compose keeps reading the HL pull's `AWS_*` from `.env`.
+- **Shared contract.** `scripts/offsite-lib.sh` is sourced by the backup, the drill and the monitor. It owns the env-file and marker paths, the snapshot host and file name, and `restic_run`.
+- **Credentials.** `restic_run` keeps the bucket credentials in restic's process only, and every caller handles its failure. `env -u` strips them from the dump command, so compose keeps reading the HL pull's `AWS_*` from `.env`.
 - **Locking.** A local `flock` stops runs from overlapping, and `restic unlock` clears stale locks only.
 - **Alerts.** A failure pages through the `ERR` trap. `deploy/host-monitor.sh` pages on a marker older than 26 h, using its own 6 h reminder file and a recovery ping.
-- **Drill.** `scripts/restore-drill.sh` restores the latest snapshot into a throwaway container of the tagged image. The target mirrors prod: the `candles` superuser, a `ts_1m` tablespace, a `template0` database and the exact extension version.
+- **Drill.** `scripts/restore-drill.sh` restores the newest snapshot, by parsed instant, into a throwaway container of the tagged image. It cleans up only the run directory and container it created, and the container's PGDATA volume with it. The target mirrors prod: the `candles` superuser, a `ts_1m` tablespace, a `template0` database and the exact extension version.
   - The restore runs `--exit-on-error`. The drill then checks owners, runs a restored compression job, and confirms a new `candles_1m` chunk lands in `ts_1m`.
   - Last, it prints `scripts/drill-counts.sql`: counts over a window that only grows, so prod's counts before and after the dump bracket them.
 - **Installer.** `deploy/install-restic.sh` installs a SHA-256-pinned restic release.
