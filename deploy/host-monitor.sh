@@ -20,7 +20,7 @@ COOLDOWN_SECONDS=3600
 # -- Webhook --------------------------------------------------------------------
 # A checkout without scripts/webhook-lib.sh still runs every check below; it just can't page.
 
-WEBHOOK_URL=""
+WEBHOOK_URL="${WEBHOOK_URL:-}"
 if [ -f "$PROJECT_DIR/scripts/webhook-lib.sh" ]; then
     # shellcheck source=scripts/webhook-lib.sh
     . "$PROJECT_DIR/scripts/webhook-lib.sh"

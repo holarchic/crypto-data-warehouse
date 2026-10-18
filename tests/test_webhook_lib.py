@@ -2,6 +2,7 @@
 
 import json
 import os
+import queue
 import shutil
 import socket
 import subprocess
@@ -58,6 +59,14 @@ def test_webhook_url_reads_env_like_compose(tmp_path, env_line):
     assert url_from_env_file(tmp_path, env_line) == "https://hooks.example/abc"
 
 
+@pytest.mark.parametrize("env_line", ['WEBHOOK_URL="https://hooks.example/abc', "WEBHOOK_URL='x"])
+def test_webhook_url_refuses_an_unclosed_quote(tmp_path, env_line):
+    (tmp_path / ".env").write_text(env_line + "\n")
+    result = run_lib('webhook_url "$1"', tmp_path)
+    assert (result.returncode, result.stdout) == (0, "")
+    assert "unclosed quote" in result.stderr
+
+
 def test_webhook_url_keeps_a_hash_inside_the_url(tmp_path):
     assert url_from_env_file(tmp_path, "WEBHOOK_URL=https://hooks.example/a#b") == (
         "https://hooks.example/a#b"
@@ -87,23 +96,30 @@ def test_webhook_url_warns_on_an_unreadable_env_file(tmp_path):
     assert "cannot read" in result.stderr
 
 
-@pytest.fixture
-def webhook_server():
-    """A local webhook; yields its URL and the list of JSON bodies it received."""
-    bodies = []
+def serve(status):
+    """A local webhook answering `status`; returns the server and a queue of request bodies."""
+    bodies = queue.Queue()
 
     class Capture(BaseHTTPRequestHandler):
         def do_POST(self):
-            bodies.append(self.rfile.read(int(self.headers["Content-Length"])))
-            self.send_response(204)
+            bodies.put(self.rfile.read(int(self.headers["Content-Length"])))
+            self.send_response(status)
+            if status in (301, 302):
+                self.send_header("Location", "http://127.0.0.1:9/elsewhere")
             self.end_headers()
 
         def log_message(self, *args):
             pass
 
     server = HTTPServer(("127.0.0.1", 0), Capture)
-    thread = threading.Thread(target=server.serve_forever, daemon=True)
-    thread.start()
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    return server, bodies
+
+
+@pytest.fixture
+def webhook_server():
+    """A local webhook answering 204; yields its URL and the queue of bodies it received."""
+    server, bodies = serve(204)
     yield f"http://127.0.0.1:{server.server_port}/hook", bodies
     server.shutdown()
 
@@ -119,7 +135,18 @@ def test_webhook_post_sends_slack_and_discord_keys(webhook_server, message):
     url, bodies = webhook_server
     result = run_lib('webhook_post "$1" "$2"', url, message)
     assert result.returncode == 0, result.stderr
-    assert [json.loads(body) for body in bodies] == [{"text": message, "content": message}]
+    assert json.loads(bodies.get(timeout=5)) == {"text": message, "content": message}
+    assert bodies.empty()
+
+
+@pytest.mark.parametrize("status", [302, 400, 500])
+def test_webhook_post_counts_only_a_2xx_answer_as_delivered(status):
+    server, _ = serve(status)
+    try:
+        result = run_lib('webhook_post "$1" x', f"http://127.0.0.1:{server.server_port}/hook")
+    finally:
+        server.shutdown()
+    assert result.returncode == 1
 
 
 def test_webhook_post_reports_an_unreachable_webhook():
