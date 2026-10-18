@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Verify TimescaleDB compression and retention policies are active.
+# Verify TimescaleDB compression policies are active.
 set -euo pipefail
 
 DB_CMD="docker compose exec -T db psql -U candles candle_collector --no-align --tuples-only"
@@ -40,7 +40,7 @@ docker compose exec -T db psql -U candles candle_collector -c "
 "
 
 echo ""
-echo "=== Retention policies ==="
+echo "=== Retention policies (expect none: all history is kept) ==="
 docker compose exec -T db psql -U candles candle_collector -c "
     SELECT hypertable_name,
            config->>'drop_after' AS drop_after

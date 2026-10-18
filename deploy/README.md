@@ -35,7 +35,7 @@
 | DB shell | `docker compose exec db psql -U candles candle_collector` |
 | Apply migration | `docker compose exec db psql -U candles candle_collector < db/migrations/004-compression-retention.sql` |
 | Backup DB (local dump) | `./scripts/backup.sh` |
-| Restore DB (local dump into the running database; not the offsite recovery path) | `./scripts/restore.sh backups/<file>.dump` |
+| Restore DB (local dump into the running database; not the offsite recovery path) | `./scripts/restore.sh backups/<file>.dump`. Restoring a TimescaleDB dump into the existing database fails on TimescaleDB's catalog tables; use the fresh-target steps in Disaster recovery |
 | Verify compression | `./scripts/verify-compression.sh` |
 
 ## API Queries
@@ -208,6 +208,7 @@ db_sql() { "${DC[@]}" exec -T db psql -X -v ON_ERROR_STOP=1 -U candles "$@"; }
    - `db_sql -d candle_collector -c "CREATE EXTENSION timescaledb VERSION '<ver>'" -c 'SELECT timescaledb_pre_restore()'`
 6. **Restore.**
    - `"${DC[@]}" exec -T db pg_restore -U candles -d candle_collector --exit-on-error /mnt/pgvol/restore/candle_collector.dump`
+   - `db_sql -d candle_collector < db/migrations/013-keep-all-history.sql`, then check that `SELECT count(*) FROM timescaledb_information.jobs WHERE proc_name = 'policy_retention'` returns 0. A snapshot taken before 013 brings its retention jobs back, and `post_restore` restarts the scheduler that runs them.
    - `db_sql -d candle_collector -c 'SELECT timescaledb_post_restore()'`
 7. **Bring it back.**
    - Build and start the rest with `"${DC[@]}" build` and `up -d --no-deps <services>`.

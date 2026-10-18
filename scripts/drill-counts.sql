@@ -2,7 +2,7 @@
 -- (scripts/restore-drill.sh prints them for the restore; run them on prod just before and
 -- just after the dump being drilled, with the same :since/:until).
 -- The [since, until) window sits behind every late writer (the HL liquidation pull rewrites
--- only the last 3 days) and inside every retention policy, and both totals only gain rows
+-- only the last 3 days), no table deletes rows (no retention), and both totals only gain rows
 -- (discovery upserts and deactivates by UPDATE), so each count only grows while a dump runs:
 -- prod before <= restored <= prod after.
 \set QUIET on
