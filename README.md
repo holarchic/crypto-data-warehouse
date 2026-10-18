@@ -55,7 +55,7 @@ Public endpoints only, so no exchange API keys. It runs unattended on a server y
 
 Timeframes are 1m, 5m, 15m, 30m, 1h, 2h, 4h and 12h, where the exchange offers them.
 
-Every exchange starts with BTC. A daily discovery job adds any asset trading over $1M a day on one of the perp exchanges, collects it everywhere it's listed, and drops it once it has stayed below $500k for a week, so a weekend lull doesn't cut its history (thresholds in `collector/exchanges.yaml`). The reference install is tracking about 650 assets on Binance, 620 on Bybit, 400 on OKX and 170 on HyperLiquid. Coinbase and dYdX are BTC only: discovery covers perps, and ccxt can't list dYdX's tickers.
+Every exchange starts with BTC. A daily discovery job adds any asset trading over $1M a day on one of the perp exchanges, collects it everywhere it's listed, and drops it once its highest nightly volume over the past seven days is below $500k, so a weekend lull doesn't cut its history (thresholds in `collector/exchanges.yaml`). The reference install is tracking about 650 assets on Binance, 620 on Bybit, 400 on OKX and 170 on HyperLiquid. Coinbase and dYdX are BTC only: discovery covers perps, and ccxt can't list dYdX's tickers.
 
 ## Data notes
 
