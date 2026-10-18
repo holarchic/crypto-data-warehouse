@@ -4,9 +4,11 @@
 #   - Disk usage — tiered 75% / 85% / 95% bands, per mount (/ and /mnt/pgvol)
 #   - Available memory <500MB
 #   - Expected Docker containers not running
+#   - Offsite backup older than 26h (once configured)
 #
 # Disk alerts self-dedup per mount+band: an escalation (75->85->95) pages at once,
 # an unchanged band re-pings at most hourly, a drop below 75% clears (recovery ping).
+# A stale backup re-pings every 6h on its own reminder file and pings again on recovery.
 # Memory + container alerts share the ALERT_FILE cooldown: skip if touched this hour.
 set -euo pipefail
 
@@ -18,8 +20,8 @@ COOLDOWN_SECONDS=3600
 # -- Load webhook URL ---------------------------------------------------------
 
 ENV_FILE="$PROJECT_DIR/.env"
-WEBHOOK_URL=""
-if [ -f "$ENV_FILE" ]; then
+WEBHOOK_URL="${WEBHOOK_URL:-}"
+if [ -z "$WEBHOOK_URL" ] && [ -f "$ENV_FILE" ]; then
     WEBHOOK_URL=$(grep -E '^WEBHOOK_URL=' "$ENV_FILE" | cut -d= -f2- | tr -d '"' || true)
 fi
 
@@ -107,6 +109,39 @@ for mount in "${DISK_MOUNTS[@]}"; do
         echo "$band $disk_now" > "$state_file"
     fi
 done
+
+# -- Offsite backup freshness -------------------------------------------------
+# Checked only once offsite backup is configured (the env file scripts/backup-offsite.sh
+# reads). A failed run pages from that script; this catches the runs that never start.
+# Its own reminder file, not the shared cooldown below, so a stale backup never mutes a
+# container-down page.
+RESTIC_ENV_FILE="${RESTIC_ENV_FILE:-/etc/candle-collector/restic.env}"
+BACKUP_OK_MARKER="${BACKUP_OK_MARKER:-/var/lib/candle-collector/backup-ok}"
+BACKUP_ALERT_FILE="${BACKUP_ALERT_FILE:-/tmp/candle-collector-backup-stale-alert}"
+BACKUP_STALE_SECONDS=$((26 * 3600))
+BACKUP_REMIND_SECONDS=$((6 * 3600))
+
+if [ -f "$RESTIC_ENV_FILE" ]; then
+    backup_now=$(date +%s)
+    last_ok=$(stat -c %Y "$BACKUP_OK_MARKER" 2>/dev/null || echo 0)
+    if [ $(( backup_now - last_ok )) -ge "$BACKUP_STALE_SECONDS" ]; then
+        last_alert=$(stat -c %Y "$BACKUP_ALERT_FILE" 2>/dev/null || echo 0)
+        if [ $(( backup_now - last_alert )) -ge "$BACKUP_REMIND_SECONDS" ]; then
+            if [ "$last_ok" -eq 0 ]; then
+                backup_age="never succeeded"
+            else
+                backup_age="last success $(( (backup_now - last_ok) / 3600 ))h ago"
+            fi
+            echo "[host-monitor] Offsite backup stale: ${backup_age}"
+            post_webhook "🟠 Offsite backup stale: ${backup_age}"
+            touch "$BACKUP_ALERT_FILE"
+        fi
+    elif [ -f "$BACKUP_ALERT_FILE" ]; then
+        echo "[host-monitor] Offsite backup recovered"
+        post_webhook "✅ Offsite backup recovered"
+        rm -f "$BACKUP_ALERT_FILE"
+    fi
+fi
 
 # -- Memory + container dedup gate (shared hourly cooldown) --------------------
 
