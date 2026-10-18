@@ -13,13 +13,13 @@ mkdir -p "$BACKUP_DIR"
 
 # shellcheck source=scripts/webhook-lib.sh
 . "$SCRIPT_DIR/webhook-lib.sh"
-load_webhook_url "$PROJECT_DIR"
+WEBHOOK_URL=$(webhook_url "$PROJECT_DIR")
 
 send_alert() {
     local message="$1"
     echo "==> ALERT: $message" >&2
-    webhook_post "🚨 candle-collector backup ($(hostname)): $message" \
-        || echo "==> Webhook post failed" >&2
+    webhook_post "$WEBHOOK_URL" "🚨 candle-collector backup ($(hostname)): $message" \
+        || echo "==> Page not delivered" >&2
 }
 
 # Alert on any failure

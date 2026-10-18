@@ -65,8 +65,8 @@ psql_drill() { docker exec -i "$CONTAINER_ID" psql -X -v ON_ERROR_STOP=1 -U cand
 
 [ -f "$RESTIC_ENV_FILE" ] || fail "${RESTIC_ENV_FILE} not found"
 BASE_DIR="${DRILL_DIR:-${TMPDIR:-/tmp}}"
-[ -d "$BASE_DIR" ] || fail "DRILL_DIR ${BASE_DIR} is not a directory"
-RUN_DIR=$(mktemp -d "$(cd "$BASE_DIR" && pwd)/restore-drill.XXXXXX")
+BASE_DIR=$(cd "$BASE_DIR" && pwd) || fail "DRILL_DIR ${BASE_DIR} is not a usable directory"
+RUN_DIR=$(mktemp -d "$BASE_DIR/restore-drill.XXXXXX")
 DUMP="$RUN_DIR/$SNAPSHOT_FILE"
 
 # -- Snapshot -----------------------------------------------------------------
@@ -77,7 +77,9 @@ import json, re, sys
 from datetime import datetime, timedelta, timezone
 from typing import NamedTuple
 
-TIME = re.compile(r"(\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d)(?:\.(\d+))?(Z|[+-]\d\d:\d\d)$")
+TIME = re.compile(
+    r"(?P<clock>\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d)(?:\.(?P<fraction>\d+))?(?P<offset>Z|[+-]\d\d:\d\d)$"
+)
 VERSION = re.compile(r"\d+(\.\d+)*$")
 
 class Taken(NamedTuple):
@@ -90,9 +92,10 @@ def taken(snap):
     m = TIME.match(snap["time"])
     if not m:
         sys.exit("snapshot " + snap["short_id"] + " has an unreadable time: " + snap["time"])
-    offset = "+00:00" if m[3] == "Z" else m[3]
-    instant = datetime.fromisoformat(m[1] + offset).astimezone(timezone.utc)
-    return Taken(instant=instant, nanoseconds=int((m[2] or "0").ljust(9, "0")[:9]))
+    offset = "+00:00" if m["offset"] == "Z" else m["offset"]
+    instant = datetime.fromisoformat(m["clock"] + offset).astimezone(timezone.utc)
+    nanoseconds = int((m["fraction"] or "0").ljust(9, "0")[:9])
+    return Taken(instant=instant, nanoseconds=nanoseconds)
 
 def tag(snap, prefix):
     values = [t[len(prefix):] for t in snap.get("tags") or [] if t.startswith(prefix)]
@@ -204,11 +207,16 @@ SELECT job_id AS compression_job FROM timescaledb_information.jobs
     WHERE hypertable_name = 'funding_rates' AND proc_name = 'policy_compression' \gset
 CALL run_job(:compression_job);
 
--- A new candles_1m chunk lands in ts_1m, through the restored attachment. Rolled back.
+-- A new candles_1m chunk lands in ts_1m, through the restored attachment. The row goes a
+-- day past every existing chunk, so its chunk is created here. Rolled back.
 BEGIN;
 CREATE TEMP TABLE drill_row ON COMMIT DROP AS
     SELECT * FROM candles_1m ORDER BY timestamp DESC LIMIT 1;
-UPDATE drill_row SET "timestamp" = "timestamp" + interval '60 days';
+UPDATE drill_row SET "timestamp" = (
+    SELECT max(range_end) FROM timescaledb_information.chunks WHERE hypertable_name = 'candles_1m'
+) + interval '1 day';
+CREATE TEMP TABLE drill_chunks_before ON COMMIT DROP AS
+    SELECT chunk_name FROM timescaledb_information.chunks WHERE hypertable_name = 'candles_1m';
 INSERT INTO candles_1m SELECT * FROM drill_row;
 DO $$
 DECLARE chunk_tablespace text;
@@ -216,9 +224,10 @@ BEGIN
     SELECT c.chunk_tablespace INTO chunk_tablespace
     FROM timescaledb_information.chunks c, drill_row r
     WHERE c.hypertable_name = 'candles_1m'
-      AND c.range_start <= r.timestamp AND c.range_end > r.timestamp;
+      AND c.range_start <= r.timestamp AND c.range_end > r.timestamp
+      AND c.chunk_name NOT IN (SELECT chunk_name FROM drill_chunks_before);
     IF NOT FOUND THEN
-        RAISE EXCEPTION 'no candles_1m chunk holds the inserted row';
+        RAISE EXCEPTION 'the inserted candles_1m row did not create a new chunk';
     END IF;
     IF chunk_tablespace IS DISTINCT FROM 'ts_1m' THEN
         RAISE EXCEPTION 'new candles_1m chunk is in %, expected ts_1m',

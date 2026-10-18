@@ -20,26 +20,28 @@ COOLDOWN_SECONDS=3600
 # -- Webhook --------------------------------------------------------------------
 # A checkout without scripts/webhook-lib.sh still runs every check below; it just can't page.
 
+WEBHOOK_URL=""
 if [ -f "$PROJECT_DIR/scripts/webhook-lib.sh" ]; then
     # shellcheck source=scripts/webhook-lib.sh
     . "$PROJECT_DIR/scripts/webhook-lib.sh"
-    load_webhook_url "$PROJECT_DIR"
+    WEBHOOK_URL=$(webhook_url "$PROJECT_DIR")
 else
     webhook_post() { return 1; }
 fi
 
 # -- Helpers ------------------------------------------------------------------
 
-# Non-zero when the page wasn't delivered, so reminder state can wait for one that was.
+# 0 only when the page was delivered (webhook_post's codes), so reminder state that must
+# not move on an unsent page can check it.
 post_webhook() {
-    webhook_post "🚨 candle-collector ($(hostname)): $1"
+    webhook_post "$WEBHOOK_URL" "🚨 candle-collector ($(hostname)): $1"
 }
 
 # Memory/container alerts: post + arm the shared ALERT_FILE hourly cooldown.
 send_alert() {
     local message="$1"
     echo "[host-monitor] ALERT: $message"
-    post_webhook "$message" || echo "[host-monitor] webhook post failed"
+    post_webhook "$message" || echo "[host-monitor] page not delivered"
     touch "$ALERT_FILE"
 }
 
@@ -47,7 +49,7 @@ send_alert() {
 disk_alert() {
     local message="$1"
     echo "[host-monitor] $message"
-    post_webhook "$message" || echo "[host-monitor] webhook post failed"
+    post_webhook "$message" || echo "[host-monitor] page not delivered"
 }
 
 # -- Disk usage (tiered, per mount) -------------------------------------------
@@ -141,7 +143,7 @@ if [ "$offsite_lib_loaded" -eq 1 ] && [ -f "$RESTIC_ENV_FILE" ]; then
                 touch "$BACKUP_ALERT_FILE" \
                     || echo "[host-monitor] cannot write ${BACKUP_ALERT_FILE}; the stale page repeats every run"
             else
-                echo "[host-monitor] webhook post failed; retrying next run"
+                echo "[host-monitor] page not delivered; retrying next run"
             fi
         fi
     elif [ -f "$BACKUP_ALERT_FILE" ]; then
@@ -149,7 +151,7 @@ if [ "$offsite_lib_loaded" -eq 1 ] && [ -f "$RESTIC_ENV_FILE" ]; then
         if post_webhook "✅ Offsite backup recovered"; then
             rm -f "$BACKUP_ALERT_FILE" || echo "[host-monitor] cannot remove ${BACKUP_ALERT_FILE}"
         else
-            echo "[host-monitor] webhook post failed; retrying next run"
+            echo "[host-monitor] page not delivered; retrying next run"
         fi
     fi
 fi

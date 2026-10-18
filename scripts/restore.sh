@@ -18,7 +18,7 @@ if [ ! -f "$BACKUP_FILE" ]; then
     exit 1
 fi
 
-echo "==> WARNING: This will DROP and recreate the candle_collector database."
+echo "==> WARNING: This drops every object the dump holds from candle_collector, then restores them from it."
 echo "    Backup file: ${BACKUP_FILE}"
 read -rp "    Continue? (yes/no): " CONFIRM
 if [ "$CONFIRM" != "yes" ]; then
