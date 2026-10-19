@@ -129,6 +129,21 @@ def test_collect_pair_poll_non_weight_bound_keeps_full_limit(monkeypatch):
     assert captured["limit"] == CANDLE_SEED_LIMIT
 
 
+def _window_end(since_ms, interval_s, bars):
+    """Last ms of the `bars`-th candle bucket counted from the one containing `since_ms`."""
+    bar_ms = interval_s * 1000
+    return (since_ms // bar_ms + bars) * bar_ms - 1
+
+
+def _hl_buckets(start_ms, end_ms, interval_s):
+    """What HL's candleSnapshot answers: every candle whose bucket contains a time in
+    [start, end], both ends included (the SDK's recorded response pads both ends)."""
+    bar_ms = interval_s * 1000
+    return [{"t": t, "T": t + bar_ms - 1, "s": "BTC", "i": "5m", "o": "1", "c": "1", "h": "1", "l": "1",
+             "v": "1", "n": 1}
+            for t in range(start_ms // bar_ms * bar_ms, end_ms // bar_ms * bar_ms + 1, bar_ms)]
+
+
 def test_collect_pair_poll_caps_the_window_at_poll_max_bars(monkeypatch):
     # HL charges by bars returned: a poll 3 h behind asks for 60 bars, not since→now.
     main_mod = _load_real_main()
@@ -137,7 +152,7 @@ def test_collect_pair_poll_caps_the_window_at_poll_max_bars(monkeypatch):
     captured, _ = _run_collect_pair(main_mod, monkeypatch, last_timestamp=stored, weight_budget=None,
                                     poll_max_bars=60, results=[[bar]])
     since = captured["calls"][0]["since_ms"]
-    assert captured["calls"] == [{"since_ms": since, "until_ms": since + 60 * 300 * 1000}]
+    assert captured["calls"] == [{"since_ms": since, "until_ms": _window_end(since, 300, 60)}]
 
 
 def test_collect_pair_capped_seed_walks_the_seed_depth_forward(monkeypatch):
@@ -147,7 +162,7 @@ def test_collect_pair_capped_seed_walks_the_seed_depth_forward(monkeypatch):
     captured, now = _run_collect_pair(main_mod, monkeypatch, last_timestamp=None, weight_budget=None,
                                       poll_max_bars=60)
     since = int(now * 1000) - CANDLE_SEED_LIMIT * 300 * 1000
-    assert captured["calls"] == [{"since_ms": since, "until_ms": since + 60 * 300 * 1000}]
+    assert captured["calls"] == [{"since_ms": since, "until_ms": _window_end(since, 300, 60)}]
 
 
 def test_collect_pair_uncapped_seed_is_a_tail_request(monkeypatch):
@@ -165,13 +180,13 @@ def test_collect_pair_empty_capped_window_moves_the_scan_past_it(monkeypatch):
     captured, _ = _run_collect_pair(main_mod, monkeypatch, last_timestamp=stored, weight_budget=None,
                                     poll_max_bars=60, scan_from=scan_from)
     since = captured["calls"][0]["since_ms"]
-    window = 60 * 300 * 1000
-    assert captured["calls"] == [{"since_ms": since, "until_ms": since + window}]
-    assert scan_from == {"BTC/USDT:USDT": since + window + 1}
-    bar = {"timestamp": (since + window + 600_000) / 1000}
+    first_end = _window_end(since, 300, 60)
+    assert captured["calls"] == [{"since_ms": since, "until_ms": first_end}]
+    assert scan_from == {"BTC/USDT:USDT": first_end + 1}
+    bar = {"timestamp": (first_end + 600_000) / 1000}
     captured, _ = _run_collect_pair(main_mod, monkeypatch, last_timestamp=stored, weight_budget=None,
                                     poll_max_bars=60, scan_from=scan_from, results=[[bar]])
-    assert captured["calls"] == [{"since_ms": since + window + 1, "until_ms": since + 2 * window + 1}]
+    assert captured["calls"] == [{"since_ms": first_end + 1, "until_ms": _window_end(first_end + 1, 300, 60)}]
     assert scan_from == {}  # bars found: the stored cursor leads again
 
 
@@ -186,33 +201,40 @@ def test_collect_pair_caught_up_empty_window_does_not_move_the_scan(monkeypatch)
     assert scan_from == {}
 
 
-def test_fetch_candles_until_bounds_the_real_hl_request():
-    # Through real ccxt: `until_ms` becomes candleSnapshot's endTime; without it ccxt asks since→now.
+def test_capped_hl_requests_return_at_most_poll_max_bars_raw_candles(monkeypatch):
+    # Through real ccxt and an HL that pads both ends: a catch-up poll and a seed each get at most
+    # poll_max_bars raw candles back, so each weighs 20 + ceil(60 / 60) = 21.
     import ccxt
 
     main_mod = _load_real_main()
     exchange = ccxt.hyperliquid({"options": {"fetchMarkets": {"types": ["swap"]}}})
-    requests = []
+    raw_counts = []
 
     def post_info(request, *a, **k):
-        requests.append(request)
+        if request["type"] == "candleSnapshot":
+            bars = _hl_buckets(request["req"]["startTime"], request["req"]["endTime"], 300)
+            raw_counts.append(len(bars))
+            return bars
         return {
             "metaAndAssetCtxs": [{"universe": [{"name": "BTC", "szDecimals": 5, "maxLeverage": 40}]},
                                  [{"markPx": "100", "dayNtlVlm": "1", "funding": "0", "openInterest": "1",
                                    "oraclePx": "100", "premium": "0", "prevDayPx": "100", "midPx": "100",
                                    "impactPxs": ["99", "101"], "dayBaseVlm": "1"}]],
             "spotMeta": {"tokens": [], "universe": []},
-            "candleSnapshot": [],
         }[request["type"]]
 
     exchange.publicPostInfo = post_info
     exchange.load_markets()
-    market_info = {"asset_id": "BTC", "native_symbol": "", "market_type": "perp"}
-    since = 1_000_000
-    main_mod.fetch_candles(exchange, "BTC/USDC:USDC", market_info, "hyperliquid", "5m", 300,
-                           main_mod.RateLimiter(0), since_ms=since, until_ms=since + 60 * 300 * 1000)
-    assert requests[-1]["req"]["startTime"] == since
-    assert requests[-1]["req"]["endTime"] == since + 60 * 300 * 1000
+    monkeypatch.setattr(main_mod, "insert_candles", lambda conn, candles, table: len(candles))
+    monkeypatch.setattr(main_mod, "upsert_status_success", lambda *a, **k: None)
+    config = SimpleNamespace(name="hyperliquid", market_type="perp", rate_limit_weight_budget=None, poll_max_bars=60)
+    tf = SimpleNamespace(name="5m", interval_s=300, table="candles")
+    behind = datetime.fromtimestamp(datetime.now(timezone.utc).timestamp() - 86400, tz=timezone.utc)  # catch-up
+    for last in (behind, None):  # then a seed
+        pair = {"asset_id": "BTC", "symbol": "BTC/USDC:USDC", "native_symbol": "", "market_type": "perp",
+                "last_timestamp": last}
+        main_mod._collect_pair(exchange, pair, config, tf, main_mod.RateLimiter(0), None, "hyperliquid/5m", {})
+    assert raw_counts == [60, 60]
 
 
 # --- candle-table routing (T-015) ---------------------------------------------
