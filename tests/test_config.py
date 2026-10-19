@@ -148,12 +148,47 @@ def test_bybit_1m_enabled_and_rate_retuned():
     assert cfg.rate_limit_ms == 30
 
 
+HL_INFO_WEIGHT = 20  # every HL info request; candleSnapshot adds ceil(bars / 60)
+
+
+def _hl_markets_load_requests(cfg):
+    """The info requests a real ccxt hyperliquid makes to load markets with `cfg.options` (the
+    constructor config `db.create_exchange` passes), answered with empty payloads."""
+    import ccxt
+
+    exchange = ccxt.hyperliquid(cfg.options)
+    seen = []
+
+    def post_info(request, *a, **k):
+        seen.append(request["type"])
+        return {
+            "metaAndAssetCtxs": [{"universe": []}, []],
+            "spotMeta": {"tokens": [], "universe": []},
+            "spotMetaAndAssetCtxs": [{"tokens": [], "universe": []}, []],
+            "perpDexs": [None, {"name": "xyz"}, {"name": "flx"}],
+        }[request["type"]]
+
+    exchange.publicPostInfo = post_info
+    exchange.load_markets()
+    return seen
+
+
+def test_hl_markets_load_is_perp_only():
+    # ccxt's default also loads spot and every HIP-3 dex: a burst of up to ~13 requests.
+    assert sorted(_hl_markets_load_requests(load_config("hyperliquid"))) == ["metaAndAssetCtxs", "spotMeta"]
+
+
 def test_hl_limiter_leaves_room_for_a_repair_call():
-    # HL's 1200 weight/min holds the busiest collector minute (polls at ~21 each, the off-limiter
-    # 20-weight OI snapshot, a ~40-weight markets reload) plus one 46-weight hl_candles_repair call.
+    # HL's 1200 weight/min holds the busiest collector minute: every limiter slot a caught-up poll
+    # (~21), the off-limiter OI snapshot, a markets reload and one 46-weight hl_candles_repair call,
+    # with room for two catch-up polls of up to 37 (1000 bars).
     cfg = load_config("hyperliquid")
     polls_per_minute = math.ceil(60_000 / cfg.rate_limit_ms)
-    assert polls_per_minute * 21 + 20 + 40 + 46 <= 1200
+    reload = HL_INFO_WEIGHT * len(_hl_markets_load_requests(cfg))
+    oi_snapshot = HL_INFO_WEIGHT
+    repair_call = 46
+    heavy_polls = 2 * (37 - 21)
+    assert polls_per_minute * 21 + oi_snapshot + reload + repair_call + heavy_polls <= 1200
 
 
 def test_load_candle_tables():
