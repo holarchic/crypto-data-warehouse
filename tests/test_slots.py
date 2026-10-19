@@ -67,10 +67,13 @@ def test_overrun_past_the_slot_starts_at_once(clock, caplog):
     assert "slot passed 50s ago, starting now" in caplog.text
 
 
-def test_no_previous_cycle_waits_for_the_slot_after_now(clock):
+def test_no_previous_cycle_waits_for_the_slot_after_now(clock, caplog):
     clock["now"] = 400.0
-    slots.sleep_until_next_slot(300, 30, None, "binance/premium")
+    with caplog.at_level(logging.INFO, logger="slots"):
+        slots.sleep_until_next_slot(300, 30, None, "binance/premium")
     assert clock["slept"] == [230.0]
+    # The line carries the time the target was taken from, so a check can recompute it.
+    assert "[binance/premium] no previous cycle, now 1970-01-01T00:06:40.000+00:00; next slot" in caplog.text
 
 
 def test_cycle_end_line_records_start_and_target(clock, caplog):

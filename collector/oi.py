@@ -108,7 +108,8 @@ def _to_float(x, field=None):
 
 
 def _get_active_pairs(conn, exchange_name):
-    """Get active pairs from collection_status (5m timeframe = finest granularity)."""
+    """Get active pairs from collection_status. Every venue polls 5m, so its 5m rows are the
+    venue's active universe."""
     return query_active_pairs(conn, exchange_name, "5m")
 
 
