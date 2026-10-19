@@ -29,6 +29,11 @@ log = logging.getLogger(__name__)
 
 def fetch_exchange_tickers(exchange, config):
     """Fetch all tickers for an exchange, filtered by market type. Returns list of (asset_id, symbol, market_type, native_symbol, volume)."""
+    # A venue whose ccxt has no fetchTickers (dYdX) is not a volume source: skip it before the call,
+    # which would raise NotSupported and log a traceback every night.
+    if not exchange.has.get("fetchTickers"):
+        log.info("[%s] ccxt has no fetchTickers; not a discovery volume source", config.name)
+        return []
     try:
         # OKX ignores ccxt unified "type" param — needs native instType
         if config.market_type == "perp" and config.ccxt_class == "okx":

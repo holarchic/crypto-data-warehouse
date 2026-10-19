@@ -220,3 +220,37 @@ def test_discover_history_failure_rolls_back_before_touching_the_universe(failin
     conn.commit.assert_not_called()
     calls.upsert.assert_not_called()
     calls.deactivate.assert_not_called()
+
+
+# --- fetch_exchange_tickers: venues without fetchTickers ---------------------------
+
+
+class _TickerExchange:
+    def __init__(self, has_fetch_tickers):
+        self.has = {"fetchTickers": has_fetch_tickers}
+        self.markets = {"BTC/USD:USD": {"base": "BTC", "swap": True, "id": "BTC-USD"}}
+        self.calls = 0
+
+    def fetch_tickers(self, params=None):
+        self.calls += 1
+        return {"BTC/USD:USD": {"quoteVolume": 5_000_000}}
+
+
+def _perp_config(name):
+    return SimpleNamespace(name=name, market_type="perp", ccxt_class=name)
+
+
+def test_venue_without_fetch_tickers_is_skipped_before_any_call(caplog):
+    exchange = _TickerExchange(has_fetch_tickers=False)
+    with caplog.at_level("INFO", logger="discovery"):
+        assert discovery.fetch_exchange_tickers(exchange, _perp_config("dydx")) == []
+    assert exchange.calls == 0
+    assert "[dydx] ccxt has no fetchTickers" in caplog.text
+    assert "Traceback" not in caplog.text and not any(r.exc_info for r in caplog.records)
+
+
+def test_venue_with_fetch_tickers_is_still_fetched():
+    exchange = _TickerExchange(has_fetch_tickers=True)
+    rows = discovery.fetch_exchange_tickers(exchange, _perp_config("binance"))
+    assert exchange.calls == 1
+    assert [r["asset_id"] for r in rows] == ["BTC"]
