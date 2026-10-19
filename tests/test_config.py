@@ -179,17 +179,17 @@ def test_hl_markets_load_is_perp_only():
 
 
 def test_hl_limiter_leaves_room_for_a_repair_call():
-    # HL's 1200 weight/min holds the busiest collector minute: every limiter slot a poll at its
-    # window cap, the off-limiter OI snapshot, a markets reload and one 46-weight hl_candles_repair
-    # call, with room for two 1000-bar seeds (37 each; only pairs discovery has just activated seed).
+    # HL's 1200 weight/min holds the busiest collector minute: every limiter slot (a closed 60 s
+    # window holds one more than 60 / spacing) a candle request at its window cap — seeds and
+    # catch-ups included, since every HL candle request is capped — plus the off-limiter OI
+    # snapshot, a markets reload and one 46-weight hl_candles_repair call.
     cfg = load_config("hyperliquid")
-    polls_per_minute = math.ceil(60_000 / cfg.rate_limit_ms)
-    poll = HL_INFO_WEIGHT + math.ceil(cfg.poll_max_bars / 60)
+    requests_per_minute = 60_000 // cfg.rate_limit_ms + 1
+    candle_request = HL_INFO_WEIGHT + math.ceil(cfg.poll_max_bars / 60)
     reload = HL_INFO_WEIGHT * len(_hl_markets_load_requests(cfg))
     oi_snapshot = HL_INFO_WEIGHT
     repair_call = 46
-    seeds = 2 * (HL_INFO_WEIGHT + math.ceil(1000 / 60) - poll)
-    assert polls_per_minute * poll + oi_snapshot + reload + repair_call + seeds <= 1200
+    assert requests_per_minute * candle_request + oi_snapshot + reload + repair_call <= 1200
 
 
 def test_load_candle_tables():

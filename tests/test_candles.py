@@ -140,10 +140,19 @@ def test_collect_pair_poll_caps_the_window_at_poll_max_bars(monkeypatch):
     assert captured["calls"] == [{"since_ms": since, "until_ms": since + 60 * 300 * 1000}]
 
 
-def test_collect_pair_seed_is_not_window_capped(monkeypatch):
+def test_collect_pair_capped_seed_walks_the_seed_depth_forward(monkeypatch):
+    # A cursorless pair on a capped venue starts CANDLE_SEED_LIMIT bars back, one 60-bar window a
+    # poll, not with a 1000-bar tail request.
     main_mod = _load_real_main()
-    captured, _ = _run_collect_pair(main_mod, monkeypatch, last_timestamp=None, weight_budget=None,
-                                    poll_max_bars=60)
+    captured, now = _run_collect_pair(main_mod, monkeypatch, last_timestamp=None, weight_budget=None,
+                                      poll_max_bars=60)
+    since = int(now * 1000) - CANDLE_SEED_LIMIT * 300 * 1000
+    assert captured["calls"] == [{"since_ms": since, "until_ms": since + 60 * 300 * 1000}]
+
+
+def test_collect_pair_uncapped_seed_is_a_tail_request(monkeypatch):
+    main_mod = _load_real_main()
+    captured, _ = _run_collect_pair(main_mod, monkeypatch, last_timestamp=None, weight_budget=None)
     assert captured["calls"] == [{"since_ms": None, "until_ms": None}]
 
 
@@ -251,7 +260,7 @@ def test_collect_pair_threads_tf_table(monkeypatch):
                         lambda conn, candles, table="candles": captured.setdefault("table", table) or 1)
     monkeypatch.setattr(main_mod, "upsert_status_success", lambda *a, **k: None)
     monkeypatch.setattr(main_mod.time, "time", lambda: 1_700_000_000.0)
-    config = SimpleNamespace(name="binance", market_type="perp", rate_limit_weight_budget=None)
+    config = SimpleNamespace(name="binance", market_type="perp", rate_limit_weight_budget=None, poll_max_bars=None)
     tf = SimpleNamespace(name="1m", interval_s=60, table="candles_1m")
     pair = {"asset_id": "BTC", "symbol": "B", "native_symbol": "B",
             "market_type": "perp", "last_timestamp": None}
@@ -313,6 +322,35 @@ def test_collect_loop_deferred_first_cycle_waits_for_the_slot_after_now(monkeypa
     tf = SimpleNamespace(name="1h", interval_s=3600, buffer_s=60, table="candles")
     calls = _drive_collect_loop(main_mod, monkeypatch, tf, cycles=2)
     assert calls == [(3600, 60, None, "binance/1h"), (3600, 60, 1000.0, "binance/1h")]
+
+
+def test_collect_loop_drops_scan_state_for_deactivated_pairs(monkeypatch):
+    main_mod = _load_real_main()
+    cycles = iter([["A", "B"], ["A"], ["A"]])
+    seen = []
+
+    def collect(exchange, pair, config, tf, rate_limiter, conn, thread_name, scan_from):
+        seen.append(sorted(scan_from))
+        scan_from[pair["symbol"]] = 1  # as an empty capped window would
+
+    tf = SimpleNamespace(name="5m", interval_s=300, buffer_s=30, table="candles")
+    _drive_collect_loop(main_mod, monkeypatch, tf, cycles=2)  # installs the fakes
+    monkeypatch.setattr(main_mod, "query_active_pairs", lambda c, n, t: [{"symbol": s} for s in next(cycles)])
+    monkeypatch.setattr(main_mod, "_collect_pair", collect)
+    calls = []
+
+    def pace(*a):
+        calls.append(a)
+        if len(calls) >= 2:
+            raise _StopLoop
+
+    monkeypatch.setattr(main_mod, "sleep_until_next_slot", pace)
+    try:
+        main_mod.collect_loop(object(), SimpleNamespace(name="binance", market_type="perp"), tf, "dsn", None)
+    except _StopLoop:
+        pass
+    # Cycle 1 sees A then B; cycle 2 (only A active) has dropped B's entry before polling A.
+    assert seen == [[], ["A"], ["A"]]
 
 
 def test_collect_loop_reconnect_failure_retries_from_the_failed_cycles_start(monkeypatch):
