@@ -1,10 +1,11 @@
 #!/usr/bin/env bash
-# Nightly offsite backup: streams pg_dump from the db container into a restic repository in an
-# S3-compatible bucket, applies retention, checks the repository, then records success.
+# Nightly offsite backup: streams pg_dump from the db container into a restic repository in a
+# bucket, applies retention, checks the repository (on Sundays reading back a quarter of its
+# data), then records success.
 #
 # Credentials live outside the checkout, in RESTIC_ENV_FILE (deploy/README.md § Offsite backups):
-#   RESTIC_REPOSITORY, RESTIC_PASSWORD_FILE, AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY
-# Without that file the script exits 0: offsite backup is opt-in.
+# RESTIC_REPOSITORY and RESTIC_PASSWORD_FILE, plus the bucket key as rclone's RCLONE_CONFIG_B2_*
+# for B2, or AWS_* for an S3 store. Without that file the script exits 0: offsite backup is opt-in.
 # Sends a webhook alert on failure; deploy/host-monitor.sh pages when BACKUP_OK_MARKER goes stale.
 set -euo pipefail
 
@@ -73,14 +74,18 @@ log "TimescaleDB ${TSDB_VERSION}, PostgreSQL ${PG_MAJOR}"
 # -- Backup -------------------------------------------------------------------
 # Uncompressed, so restic's chunking dedups the unchanged (already-compressed) chunks night to
 # night; restic compresses what it stores. The tags name the image scripts/restore-drill.sh
-# restores into. restic hands its environment to the dump command, so `env -u` drops the
-# bucket credentials before compose, which reads its own AWS_* from the project .env.
+# restores into. restic hands its environment to the dump command, so `env` drops every
+# variable the env file sets: the bucket key never reaches compose, which reads the HL pull's
+# AWS_* from the project .env.
+
+STRIP=$(restic_strip_env_args)
+read -r -a STRIP_ENV <<< "$STRIP"
 
 log "Dumping candle_collector into the repository"
 restic_run backup --host "$SNAPSHOT_HOST" \
     --tag "${SNAPSHOT_TAG_TIMESCALEDB}${TSDB_VERSION}" --tag "${SNAPSHOT_TAG_PG}${PG_MAJOR}" \
     --stdin-filename "$SNAPSHOT_FILE" --stdin-from-command -- \
-    env -u AWS_ACCESS_KEY_ID -u AWS_SECRET_ACCESS_KEY -u AWS_SESSION_TOKEN \
+    env "${STRIP_ENV[@]}" \
     "${DC[@]}" exec -T db pg_dump -U candles --format=custom --compress=0 candle_collector \
     || fail "restic backup failed (exit $?), no snapshot made; ${LOG_HINT}"
 
@@ -88,8 +93,19 @@ log "Applying retention"
 restic_run forget --host "$SNAPSHOT_HOST" --keep-daily 7 --keep-weekly 5 --keep-monthly 12 --prune \
     || fail "restic forget/prune failed (exit $?); ${LOG_HINT}"
 
-log "Checking the repository"
-restic_run check || fail "restic check failed (exit $?); ${LOG_HINT}"
+# Sundays also read back a quarter of the stored data, so a pack the bucket can no longer
+# serve pages within weeks rather than at a restore. A later night's success refreshes the
+# marker without rereading it: the page closes only when the named subset rereads clean.
+SUBSET=$(read_back_subset "$(date -u +%u)" "$(date -u +%V)")
+CHECK_ARGS=()
+if [ -n "$SUBSET" ]; then
+    CHECK_ARGS=(--read-data-subset "$SUBSET")
+    log "Checking the repository and reading back packs ${SUBSET}"
+else
+    log "Checking the repository"
+fi
+restic_run check "${CHECK_ARGS[@]}" \
+    || fail "restic check ${SUBSET:+--read-data-subset ${SUBSET} }failed (exit $?); ${LOG_HINT}"
 
 mkdir -p "$(dirname "$BACKUP_OK_MARKER")"
 date -u +%Y-%m-%dT%H:%M:%SZ > "$BACKUP_OK_MARKER"
