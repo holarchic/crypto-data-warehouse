@@ -1,5 +1,7 @@
 """Tests for collector/config.py — YAML config loading."""
 
+import math
+
 import pytest
 from config import (
     CANDLE_TABLES,
@@ -144,6 +146,14 @@ def test_bybit_1m_enabled_and_rate_retuned():
     by_name = {tf.name: tf.table for tf in cfg.timeframes}
     assert by_name["1m"] == "candles_1m"
     assert cfg.rate_limit_ms == 30
+
+
+def test_hl_limiter_leaves_room_for_a_repair_call():
+    # HL's 1200 weight/min holds the busiest collector minute (polls at ~21 each, the off-limiter
+    # 20-weight OI snapshot, a ~40-weight markets reload) plus one 46-weight hl_candles_repair call.
+    cfg = load_config("hyperliquid")
+    polls_per_minute = math.ceil(60_000 / cfg.rate_limit_ms)
+    assert polls_per_minute * 21 + 20 + 40 + 46 <= 1200
 
 
 def test_load_candle_tables():
