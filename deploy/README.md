@@ -231,5 +231,5 @@ db_sql() { "${DC[@]}" exec -T db psql -X -v ON_ERROR_STOP=1 -U candles "$@"; }
 **Compromised server.**
 1. Revoke the bucket key first.
 2. With the account's master key, restore each file's last version from before the compromise. Unhiding isn't enough if files were overwritten.
-3. Run `(. scripts/offsite-lib.sh; restic_run check --read-data)`, which flags any altered pack, since restic's file names are content hashes.
-4. Issue a new key.
+3. Issue a new key with the same restrictions, and put it in an env file on a trusted machine (not the compromised server).
+4. Run `(RESTIC_ENV_FILE=<that env file>; . scripts/offsite-lib.sh; restic_run check --read-data)`, which flags any altered pack, since restic's file names are content hashes.
