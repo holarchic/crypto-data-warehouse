@@ -3,9 +3,10 @@
 A loop polls on a slot grid, `k × interval + buffer`. Each cycle waits for the first slot after its
 own *start*, not after now: a cycle that overruns that slot is followed at once by a late cycle
 instead of skipping to the slot after now. Late cycles follow back to back, never concurrently,
-until one ends before its next slot, which puts the loop back on the grid. Polls are gap-aware, so
-a late cycle costs freshness, never data; a skipped slot cost a whole interval of freshness, and for
-dense OI a sample that cannot be fetched later.
+until one ends before its next slot, which puts the loop back on the grid. Cursor-based polls
+(candles, premium, the Binance OI baseline) are gap-aware, so a late cycle costs them freshness,
+never data. Snapshot feeds (dense and bulk OI) take the sample late instead, where a skipped slot
+lost it outright.
 """
 
 import logging
@@ -32,12 +33,13 @@ def sleep_until_next_slot(interval_s: int, buffer_s: int, started: float | None,
     """Sleep until the first slot after `started`, the start of the cycle that just ended, or not at
     all if that slot has passed. `started` None (no cycle has run yet) waits for the slot after now.
 
-    Logs one line per cycle end, the record the pacing check reads: the cycle's start, its target
-    slot and the wait (the line's own timestamp is the cycle end)."""
+    Logs one line per cycle end, the record the pacing check reads: the cycle's start (or, with no
+    previous cycle, the time the target was taken from), its target slot and the wait (the line's
+    own timestamp is the cycle end)."""
     now = time.time()
     if started is None:
         slot = next_slot(now, interval_s, buffer_s)
-        origin = "no previous cycle"
+        origin = f"no previous cycle, now {_iso(now)}"
     else:
         slot = next_slot(started, interval_s, buffer_s)
         origin = f"Cycle started {_iso(started)}"

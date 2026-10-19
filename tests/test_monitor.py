@@ -21,6 +21,7 @@ from monitor import (
     GAP_SQL_BY_TABLE,
     HEARTBEAT_CANDLES_SQL,
     LOOP_TIMEFRAMES,
+    alert_due,
     build_heartbeat_text,
     build_webhook_payload,
     compute_alarming,
@@ -31,7 +32,6 @@ from monitor import (
     format_gap_alert,
     format_stale_alert,
     gap_scan_due,
-    should_alert,
     should_send_heartbeat,
 )
 
@@ -293,23 +293,33 @@ def test_gap_scan_due_distinct_exchanges_do_not_suppress():
     assert gap_scan_due(last, ("bybit", "5m"), 300, now=1100) is True
 
 
-# --- should_alert (dedup) ---
+# --- alert_due / send_alert (dedup) ---
 
 
-def test_should_alert_first_call():
+def test_alert_due_first_call():
     cooldowns = {}
-    assert should_alert("test_key", cooldowns, 3600) is True
-    assert "test_key" in cooldowns
+    assert alert_due("test_key", cooldowns, 3600) is True
+    assert cooldowns == {}  # checking does not start the cooldown; delivery does
 
 
-def test_should_alert_within_cooldown():
+def test_alert_due_within_cooldown():
     cooldowns = {"test_key": time.time()}
-    assert should_alert("test_key", cooldowns, 3600) is False
+    assert alert_due("test_key", cooldowns, 3600) is False
 
 
-def test_should_alert_after_cooldown():
+def test_alert_due_after_cooldown():
     cooldowns = {"test_key": time.time() - 4000}
-    assert should_alert("test_key", cooldowns, 3600) is True
+    assert alert_due("test_key", cooldowns, 3600) is True
+
+
+def test_send_alert_starts_the_cooldown_only_on_delivery(monkeypatch):
+    cooldowns = {}
+    monkeypatch.setattr(monitor, "send_webhook", lambda url, text: False)
+    assert monitor.send_alert("https://hook.invalid", "k", "page", cooldowns) is False
+    assert cooldowns == {}  # a failed page stays due next cycle
+    monkeypatch.setattr(monitor, "send_webhook", lambda url, text: True)
+    assert monitor.send_alert("https://hook.invalid", "k", "page", cooldowns) is True
+    assert "k" in cooldowns
 
 
 # --- build_webhook_payload ---

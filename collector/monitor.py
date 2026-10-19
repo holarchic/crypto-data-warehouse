@@ -19,7 +19,7 @@ from status import LOOP_SENTINEL_SYMBOL
 log = logging.getLogger(__name__)
 
 # Per-loop heartbeat pseudo-timeframes (config.LOOP_INTERVALS keys: funding, oi, liq_ws, premium,
-# candle_ws). Their sentinel collection_status rows are checked for staleness like any
+# candle_ws, candle_repair). Their sentinel collection_status rows are checked for staleness like any
 # collector, but carry no candle series — so gap detection skips them.
 LOOP_TIMEFRAMES = frozenset(LOOP_INTERVALS)
 
@@ -162,13 +162,18 @@ def format_gap_alert(exchange, timeframe, gaps):
     return "\n".join(lines)
 
 
-def should_alert(key, cooldowns, cooldown_s):
-    """Dedup check. Returns True if alert should fire, updates cooldowns dict."""
-    now = time.time()
+def alert_due(key, cooldowns, cooldown_s):
+    """Dedup check: True unless `key` was delivered within `cooldown_s`."""
     last = cooldowns.get(key)
-    if last is not None and (now - last) < cooldown_s:
+    return last is None or (time.time() - last) >= cooldown_s
+
+
+def send_alert(webhook_url, key, text, cooldowns):
+    """POST an alert; only a delivered one starts `key`'s cooldown, so a failed page is retried
+    next cycle instead of being suppressed for the whole cooldown."""
+    if not send_webhook(webhook_url, text):
         return False
-    cooldowns[key] = now
+    cooldowns[key] = time.time()
     return True
 
 
@@ -421,8 +426,8 @@ def monitor_loop(dsn, timeframe_intervals, webhook_url, poll_s=300, cooldown_s=3
             # Kept separate from the candle count-delta below: a single dead loop is one row and
             # could never trip +delta_threshold, so folding it in would regress T-004.
             loop_stale = [s for s in stale if s["symbol"] == LOOP_SENTINEL_SYMBOL]
-            if loop_stale and should_alert("loop_staleness", cooldowns, cooldown_s):
-                if send_webhook(webhook_url, format_stale_alert(loop_stale)):
+            if loop_stale and alert_due("loop_staleness", cooldowns, cooldown_s):
+                if send_alert(webhook_url, "loop_staleness", format_stale_alert(loop_stale), cooldowns):
                     log.warning("Loop-liveness alert sent: %d stale loop(s)", len(loop_stale))
                 else:
                     log.warning("Loop-liveness alert delivery failed")
@@ -439,9 +444,9 @@ def monitor_loop(dsn, timeframe_intervals, webhook_url, poll_s=300, cooldown_s=3
                 "Collectors: %d stale (raw), %d alarming (baseline ~%.0f, +%d gate)",
                 len(stale), len(alarming), decision.baseline, delta_threshold,
             )
-            if decision.should_fire and should_alert("alarming", cooldowns, cooldown_s):
+            if decision.should_fire and alert_due("alarming", cooldowns, cooldown_s):
                 alert_text = format_alarming_alert(alarming, len(alarming), decision.baseline, delta_threshold)
-                if send_webhook(webhook_url, alert_text):
+                if send_alert(webhook_url, "alarming", alert_text, cooldowns):
                     log.warning("Alarming alert sent: %d collectors", len(alarming))
                 else:
                     log.warning("Alarming alert delivery failed")
@@ -475,8 +480,8 @@ def monitor_loop(dsn, timeframe_intervals, webhook_url, poll_s=300, cooldown_s=3
                 if gaps:
                     alert_text = format_gap_alert(exchange, timeframe, gaps)
                     alert_key = f"gaps:{exchange}:{timeframe}"
-                    if should_alert(alert_key, cooldowns, cooldown_s):
-                        if send_webhook(webhook_url, alert_text):
+                    if alert_due(alert_key, cooldowns, cooldown_s):
+                        if send_alert(webhook_url, alert_key, alert_text, cooldowns):
                             log.warning("Gap alert: %s/%s — %d gaps", exchange, timeframe, len(gaps))
                         else:
                             log.warning("Gap alert delivery failed: %s/%s", exchange, timeframe)
@@ -532,7 +537,7 @@ def run():
     sustain_cycles = int(os.environ.get("ALARMING_SUSTAIN_CYCLES", "3"))
     error_threshold = int(os.environ.get("ALARMING_ERROR_THRESHOLD", "3"))
 
-    # Candle TFs + per-loop heartbeat pseudo-TFs (funding/oi/liq_ws/premium/candle_ws) — so
+    # Candle TFs + per-loop heartbeat pseudo-TFs (funding/oi/liq_ws/premium/candle_ws/candle_repair) — so
     # compute_staleness flags a silently-dead loop (poll or WS) via the same staleness path.
     timeframe_intervals = {**load_timeframe_intervals(), **LOOP_INTERVALS}
 
