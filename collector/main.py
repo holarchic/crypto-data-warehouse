@@ -331,8 +331,8 @@ def run():
         threads.append(t)
         log.info("Started thread %s", t.name)
 
-    # HL 1m candle feed (T-015.1) — a WS-only candle stream (real-time, zero REST; a rare WS-drop gap is
-    # repaired out-of-band via T-019, never a live sweep — a live backfill was measured to starve HL's
+    # HL 1m candle feed (T-015.1) — a WS-only candle stream (real-time, zero REST; drop gaps and unclosed
+    # bars are repaired daily by hl_candles_repair, never a live sweep — a live backfill was measured to starve HL's
     # tight limiter). STREAMED, not polled: 1m is deliberately NOT in supported_timeframes, so no
     # per-symbol REST 1m collect_loop launches above (it would starve the unbackfillable dense OI).
     if config.has_candle_ws:

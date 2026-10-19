@@ -92,6 +92,7 @@ Pass: returns ≥1 candle with all OHLCV fields populated, correct exchange/symb
 | Run discovery (prod) | `docker compose -f docker-compose.yml -f docker-compose.prod.yml --profile discovery run --rm discovery` |
 | Offsite backup now | `./scripts/backup-offsite.sh` (see Offsite backups) |
 | List offsite snapshots | `(. scripts/offsite-lib.sh; restic_run snapshots)` |
+| HL 1m repair, manual window | `docker compose -f docker-compose.yml -f docker-compose.prod.yml --profile hl-candles-repair run --rm --no-deps hl-candles-repair python -m hl_candles_repair --hours N` (1–72; moves the cursor only when it covers the required range) |
 
 ### Code updates
 
@@ -117,7 +118,18 @@ TimescaleDB auto-tunes `max_connections` low (~25 on 8GB). Override via `command
 | `0 2 * * *` | Daily discovery |
 | `0 4 * * *` | Daily HL Grade-A liquidation pull (last 3 complete days) |
 | `30 5 * * *` | Nightly offsite backup (does nothing until configured, see below) |
+| `30 6 * * *` | Daily HL 1m repair from REST (a ~6 h trickle at 20 weight/min; see HL 1m repair) |
 | `*/5 * * * *` | Host monitor |
+
+## HL 1m repair
+
+`python -m hl_candles_repair` replaces recent HyperLiquid 1m bars with REST's closed values: the WebSocket feed can drop minutes or stop short of a minute's last trades, and REST only keeps ~3.5 days. It shares HL's per-IP request budget with the collector, so it trickles at 20 weight a minute.
+
+- **Logs:** `/var/log/candle-collector-hl-candles-repair.log`. The `DONE` line counts inserted (missing minutes filled) and updated (unclosed bars corrected) bars, incomplete coins and 429s.
+- **Paging:** the monitor pages when the `candle_repair` sentinel has no success for 36 h. A span that aged past REST's history before it could be repaired is posted to `WEBHOOK_URL`; the cursor moves past it only once that post is delivered.
+- **After a failure** nothing is needed: the next run reaches back to the last repaired minute (up to 72 h).
+- **Building:** it bakes `collector/`, so rebuild it with `--profile hl-candles-repair build hl-candles-repair` after a code update.
+- **Turning it off:** remove the cron line, stop a running one (`docker ps --filter name=hl-candles-repair -q | xargs -r docker stop`), and deactivate its sentinel so it stops paging: `UPDATE collection_status SET active = FALSE WHERE exchange = 'hyperliquid' AND symbol = '*' AND timeframe = 'candle_repair'`. To turn it back on, set `active = TRUE` again and restore the cron line.
 
 ## Offsite backups
 
