@@ -36,6 +36,7 @@ import os
 import time
 import urllib.error
 import urllib.request
+from collections.abc import Callable
 from dataclasses import dataclass, field
 
 import psycopg
@@ -124,7 +125,7 @@ class LockLost(Exception):
 
 
 # ---------------------------------------------------------------------------
-# Window, slices and pacing (pure)
+# Window, slices and pacing (the window and slice maths are pure; Pacer sleeps)
 # ---------------------------------------------------------------------------
 
 
@@ -167,8 +168,8 @@ def next_call_at(last_call_at: float, weight: int, per_min: float) -> float:
 class Pacer:
     """Weighted-debt pacing of every HL call the job makes, on an injected clock."""
 
-    clock: object
-    sleep: object
+    clock: Callable[[], float]
+    sleep: Callable[[float], None]
     per_min: float = WEIGHT_PER_MIN
     ready_at: float | None = None
     http429: int = 0
@@ -199,6 +200,8 @@ class Parsed:
 
 
 def _finite(x) -> float | None:
+    if isinstance(x, bool):  # float(True) is 1.0: a JSON true/false is not a price
+        return None
     try:
         v = float(x)
     except (TypeError, ValueError):
@@ -362,6 +365,13 @@ def write_bars(conn, pair: dict, bars: list[dict]) -> tuple[int, int]:
     return inserted, updated
 
 
+def active_pairs(conn) -> list[dict]:
+    """The WS feed's pair set, with the read transaction closed before hours of paced HTTP."""
+    pairs = query_active_pairs(conn, EXCHANGE, PAIRS_TIMEFRAME)
+    conn.commit()
+    return pairs
+
+
 def advance_cursor(conn, end_ms: int) -> None:
     upsert_status_success(conn, EXCHANGE, MARKET_TYPE, LOOP_SENTINEL_SYMBOL, CANDLE_REPAIR, end_ms / 1000)
 
@@ -371,7 +381,7 @@ class Session:
     """The run's connection and its advisory lock. A session lock ends with its connection, so a
     reconnect re-takes it before anything else touches HL or the table, or the run stops."""
 
-    connect: object
+    connect: Callable[[], object]
     conn: object = None
 
     def open(self) -> bool:
@@ -400,21 +410,23 @@ class Session:
 
 @dataclass
 class Deps:
-    connect: object
-    fetch_snapshot: object
-    fetch_meta: object
-    send_alert: object  # text -> True when delivered
-    sleep: object = time.sleep
-    clock: object = time.monotonic
-    wall_ms: object = lambda: int(time.time() * 1000)
+    connect: Callable[[], object]
+    fetch_snapshot: Callable[[str, int, int], object]
+    fetch_meta: Callable[[], dict[str, str]]
+    send_alert: Callable[[str], bool]  # True when delivered
+    sleep: Callable[[float], None] = time.sleep
+    clock: Callable[[], float] = time.monotonic
+    wall_ms: Callable[[], int] = lambda: int(time.time() * 1000)
 
 
 class SliceExpired(Exception):
     """The slice now starts past REST's reach: its answer could be truncated."""
 
 
-def _result(status: str, conflict: bool = False, inserted: int = 0, updated: int = 0) -> dict:
-    return {"status": status, "stored_conflict": conflict, "inserted": inserted, "updated": updated}
+def _result(status: str, conflict: bool = False, inserted: int = 0, updated: int = 0,
+            first_minute: int | None = None) -> dict:
+    return {"status": status, "stored_conflict": conflict, "inserted": inserted, "updated": updated,
+            "first_minute": first_minute}
 
 
 def repair_slice(session: Session, pacer: Pacer, deps: Deps, pair: dict, coin: str | None,
@@ -440,12 +452,16 @@ def repair_slice(session: Session, pacer: Pacer, deps: Deps, pair: dict, coin: s
     stored = session.call(stored_minutes, pair, start_ms, end_ms)
     conflict = bool(stored - {b["t"] for b in parsed.traded})
     inserted, updated = session.call(write_bars, pair, parsed.traded)
-    return _result(coverage(parsed.raw_minutes, start_ms, end_ms), conflict, inserted, updated)
+    first = parsed.raw_minutes[0] if parsed.raw_minutes else None
+    return _result(coverage(parsed.raw_minutes, start_ms, end_ms), conflict, inserted, updated, first)
+
+
+def _minute(ms: int) -> str:
+    return time.strftime("%Y-%m-%dT%H:%MZ", time.gmtime(ms / 1000))
 
 
 def _span(start_ms: int, end_ms: int) -> str:
-    fmt = "%Y-%m-%dT%H:%MZ"
-    return f"{time.strftime(fmt, time.gmtime(start_ms / 1000))}..{time.strftime(fmt, time.gmtime(end_ms / 1000))}"
+    return f"{_minute(start_ms)}..{_minute(end_ms)}"
 
 
 def repair(session: Session, pacer: Pacer, deps: Deps, pairs: list[dict], names: dict[str, str],
@@ -457,10 +473,11 @@ def repair(session: Session, pacer: Pacer, deps: Deps, pairs: list[dict], names:
             coin = names.get(pair["asset_id"])
             r = repair_slice(session, pacer, deps, pair, coin, s, e)
             results[pair["symbol"]].append(r)
-            if r["inserted"] or r["updated"] or r["status"] not in ("complete", "leading", "empty") \
+            if r["inserted"] or r["updated"] or r["status"] not in ("complete", "empty") \
                     or r["stored_conflict"]:
-                log.info("%s %s: %s inserted=%d updated=%d stored_conflict=%s", coin or pair["asset_id"],
-                         _span(s, e), r["status"], r["inserted"], r["updated"], r["stored_conflict"])
+                listed = f" listed_from={_minute(r['first_minute'])}" if r["status"] == "leading" else ""
+                log.info("%s %s: %s inserted=%d updated=%d stored_conflict=%s%s", coin or pair["asset_id"],
+                         _span(s, e), r["status"], r["inserted"], r["updated"], r["stored_conflict"], listed)
     return results
 
 
@@ -475,8 +492,9 @@ def report_loss(lost: tuple[int, int], deps: Deps) -> bool:
 
 
 def run(now_ms: int, hours: int | None, deps: Deps) -> int:
-    """One repair. Returns the exit code: 0 for a clean run (or another repair holding the lock),
-    1 for anything that withheld or qualified the cursor."""
+    """One repair. Returns the exit code: 1 for an incomplete coin, a 429, a lost span or an
+    undelivered alert; otherwise 0, including when another repair holds the lock and when a complete
+    manual window was too short to move the cursor."""
     session = Session(deps.connect)
     try:
         if not session.open():
@@ -488,7 +506,7 @@ def run(now_ms: int, hours: int | None, deps: Deps) -> int:
             session.call(bootstrap_cursor, win.req)
         start = win.end - hours * HOUR_MS if hours else win.req
         delivered = report_loss(win.lost, deps) if win.lost else True
-        pairs = session.call(query_active_pairs, EXCHANGE, PAIRS_TIMEFRAME)
+        pairs = session.call(active_pairs)
         if not pairs:
             log.error("no active %s %s pairs; nothing certified", EXCHANGE, PAIRS_TIMEFRAME)
             return 1
