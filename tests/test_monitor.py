@@ -421,6 +421,32 @@ def test_monitor_loop_heartbeat_reports_the_cycles_per_timeframe_stale_count(mon
     assert "2 stale" in heartbeats[0]
 
 
+def test_monitor_loop_retries_an_undelivered_heartbeat_next_cycle(monkeypatch):
+    # A failed delivery must not mark the week's heartbeat as sent.
+    deliveries = iter([False, True])
+    attempts = []
+    cycles = {"n": 0}
+    monkeypatch.setattr(sys.modules["psycopg"], "connect", lambda *a, **k: _FakeConn())
+    monkeypatch.setattr(monitor, "fetch_status_rows", lambda conn: [])
+    monkeypatch.setattr(monitor, "_get_exchange_timeframe_pairs", lambda conn: [])
+    monkeypatch.setattr(monitor, "fetch_heartbeat_stats", lambda conn: dict(HEARTBEAT_STATS))
+    monkeypatch.setattr(monitor, "should_send_heartbeat", lambda now, last_sent, *a: last_sent is None)
+    monkeypatch.setattr(monitor, "send_webhook", lambda url, text: attempts.append(text) or next(deliveries))
+    monkeypatch.setattr(monitor, "ping_healthcheck", lambda url: None)
+
+    def sleep(s):
+        cycles["n"] += 1
+        if cycles["n"] >= 3:
+            raise _StopMonitor
+
+    monkeypatch.setattr(monitor.time, "sleep", sleep)
+    try:
+        monitor.monitor_loop("dsn", {"1m": 60}, "https://hook.invalid")
+    except _StopMonitor:
+        pass
+    assert len(attempts) == 2  # failed, retried, delivered; no third attempt once sent
+
+
 # --- should_send_heartbeat ---
 
 

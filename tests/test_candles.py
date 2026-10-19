@@ -232,8 +232,8 @@ def test_collect_loop_deferred_first_cycle_waits_for_the_slot_after_now(monkeypa
 
 
 def test_collect_loop_reconnect_failure_retries_from_the_failed_cycles_start(monkeypatch):
-    # A failed reconnect sleeps 30 s and loops: the next wait still targets the slot after the
-    # failed iteration's start, the same wait as before the pacing change.
+    # A failed reconnect sleeps 30 s and loops: the next wait targets the slot after the failed
+    # iteration's start, so retries keep to the slot grid instead of hammering a down DB.
     main_mod = _load_real_main()
     conn = SimpleNamespace(closed=True)
     attempts = {"n": 0}

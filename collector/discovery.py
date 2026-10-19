@@ -28,7 +28,8 @@ log = logging.getLogger(__name__)
 
 
 def fetch_exchange_tickers(exchange, config):
-    """Fetch all tickers for an exchange, filtered by market type. Returns list of (asset_id, symbol, market_type, native_symbol, volume)."""
+    """Fetch all tickers for an exchange, filtered by market type. Returns one dict per asset (its
+    highest-volume symbol): asset_id, symbol, market_type, native_symbol, volume."""
     # A venue whose ccxt has no fetchTickers (dYdX) is not a volume source: skip it before the call,
     # which would raise NotSupported and log a traceback every night.
     if not exchange.has.get("fetchTickers"):
