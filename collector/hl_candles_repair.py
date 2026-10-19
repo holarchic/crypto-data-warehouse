@@ -6,11 +6,13 @@ before their minute closed (the WS row stops short of the minute's last trades: 
 minutes, 13% for BTC, measured 2026-10-19). This one-shot (`python -m hl_candles_repair`, run daily
 by cron) replaces each active coin's recent 1m bars with REST `candleSnapshot`'s closed values.
 
-**Budget.** HL counts REST and WS `post` requests against one per-IP weight budget (1200/min), and
-the collector's own polls (themselves `candleSnapshot`) already use ~1,155-1,175 of it. So the job
-trickles: every call it makes is charged `20 + ceil(minutes / 60)` and the next call waits
-`weight × 60 / budget` seconds (an average 20 weight/min, one 46-weight call per 26 h slice every
-138 s). A 429 backs off and halves the budget for the rest of the run.
+**Budget.** HL counts REST and WS `post` requests against one per-IP weight budget (1200/min). In
+its busiest minute the collector spends ~1,110 of it (50 limiter-paced polls of ~21 weight at its
+1.2 s spacing, the 20-weight OI snapshot, which bypasses that limiter, and a markets reload), so a
+minute holding one of this job's calls must leave room for the largest, 46. The job trickles: every
+call it makes is charged `20 + ceil(minutes / 60)` and the next call waits `weight × 60 / budget`
+seconds (an average 20 weight/min, one 46-weight call per 26 h slice every 138 s). A 429 backs off
+and halves the budget for the rest of the run.
 
 **Cursor.** `repaired_through` is the `last_timestamp` of the `candle_repair` loop sentinel: every
 minute before it has been repaired, or reported lost. A run covers the last 26 h, or back to the

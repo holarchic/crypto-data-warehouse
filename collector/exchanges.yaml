@@ -32,10 +32,11 @@ exchanges:
     ccxt_class: hyperliquid
     btc_symbol: "BTC/USDC:USDC"
     market_type: perp
-    # HL info endpoint has weight ~20; IP budget 1200 weight/min ⇒ ~1 req/sec.
-    # 1100ms leaves a small margin under the cap and eliminates the 429 flood
-    # that was causing hundreds of stale alerts on long TFs.
-    rate_limit_ms: 1100
+    # HL info endpoint has weight ~20; IP budget 1200 weight/min ⇒ ~1 req/sec. The budget's peak
+    # minute: 50 polls at 1200ms × ~21 + the 20-weight OI snapshot (urllib, outside this limiter)
+    # + a markets reload ≈ 1,110, leaving room for one 46-weight hl_candles_repair call. At 1100ms
+    # (55 polls ≈ 1,175) that call put a busy minute over 1200.
+    rate_limit_ms: 1200
     enabled: true
     has_funding: true
     has_oi: true
