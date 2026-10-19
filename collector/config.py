@@ -29,6 +29,11 @@ PREMIUM_LOOP = "premium"
 # per-pair candle status) is its liveness surface. Interval 300 → the monitor's 30-min floor flags a
 # dead thread ~35min after.
 CANDLE_WS = "candle_ws"
+# HL 1m daily REST repair (collector/hl_candles_repair.py): a one-shot that records success, and its
+# repaired-through cursor, on this sentinel. Not its cadence: 64800 makes the monitor page 36 h after
+# the last success. A daily run ends ~6 h after it starts, so successes land ~24 h apart; a first run
+# that never succeeds pages while its anchor (26 h back) is ~62 h old, under the job's 72 h cap.
+CANDLE_REPAIR = "candle_repair"
 # Premium-index poll cadence (T-010) — the SINGLE source: the ccxt timeframe, the poll interval,
 # AND the loop staleness floor (LOOP_INTERVALS below) all derive from here, so a cadence change is
 # one edit. collector/premium_index.py imports these (it must not redefine them). Fixed, not a
@@ -37,7 +42,7 @@ CANDLE_WS = "candle_ws"
 PREMIUM_TIMEFRAME = "5m"
 PREMIUM_INTERVAL_S = 300
 LOOP_INTERVALS = {FUNDING_LOOP: 3600, OI_LOOP: 300, LIQUIDATION_WS: 300, PREMIUM_LOOP: PREMIUM_INTERVAL_S,
-                  CANDLE_WS: 300}
+                  CANDLE_WS: 300, CANDLE_REPAIR: 64800}
 
 # Candle storage tables. A timeframe's `table:` in exchanges.yaml routes its candles to one of these
 # (default `candles`); `1m` routes to `candles_1m` (a separate hypertable on the ts_1m volume
