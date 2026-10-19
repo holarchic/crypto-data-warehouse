@@ -153,7 +153,10 @@ def _collect_pair(exchange, pair, config, tf, rate_limiter, conn, thread_name, s
     until_ms = None
     if since_ms is not None and config.poll_max_bars is not None:
         since_ms = max(since_ms, scan_from.get(pair["symbol"], 0))
-        until_ms = since_ms + config.poll_max_bars * tf.interval_s * 1000
+        # HL answers every candle whose bucket contains a time in [since, until], both ends
+        # included, so the window ends one ms before the bucket that would be the (cap + 1)th.
+        bar_ms = tf.interval_s * 1000
+        until_ms = (since_ms // bar_ms + config.poll_max_bars) * bar_ms - 1
     candles = fetch_candles(
         exchange, pair["symbol"], market_info, config.name, tf.name, tf.interval_s, rate_limiter,
         since_ms=since_ms, limit=limit, until_ms=until_ms,
