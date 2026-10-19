@@ -1,10 +1,12 @@
 """Tests for collector/monitor.py — pure function tests for staleness, gaps, dedup, webhooks."""
 
 import json
+import sys
 import time
 from collections import deque
 from datetime import date, datetime, timezone
 
+import monitor
 from config import (
     CANDLE_REPAIR,
     CANDLE_WS,
@@ -326,7 +328,6 @@ def test_build_webhook_payload():
 
 HEARTBEAT_STATS = {
     "fresh_1h": 8500,
-    "stale_3h": 40,
     "total_active": 8540,
     "total_errors": 312,
     "candles_24h": 124382,
@@ -334,7 +335,7 @@ HEARTBEAT_STATS = {
 
 
 def test_build_heartbeat_text_contains_all_fields():
-    text = build_heartbeat_text(HEARTBEAT_STATS)
+    text = build_heartbeat_text(HEARTBEAT_STATS, 40)
     assert "8500/8540" in text
     assert "40 stale" in text
     assert "124,382" in text  # thousands separator
@@ -342,10 +343,82 @@ def test_build_heartbeat_text_contains_all_fields():
 
 
 def test_build_heartbeat_text_zero_errors():
-    stats = {**HEARTBEAT_STATS, "total_errors": 0, "stale_3h": 0}
-    text = build_heartbeat_text(stats)
+    stats = {**HEARTBEAT_STATS, "total_errors": 0}
+    text = build_heartbeat_text(stats, 0)
     assert "0 errors" in text
     assert "0 stale" in text
+
+
+class _FakeCursor:
+    def __init__(self, results):
+        self._results = iter(results)
+        self.executed = []
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        return False
+
+    def execute(self, sql, params=None):
+        self.executed.append(sql)
+
+    def fetchone(self):
+        return next(self._results)
+
+
+class _FakeConn:
+    def __init__(self, results=()):
+        self.cur = _FakeCursor(results)
+
+    def cursor(self):
+        return self.cur
+
+    def close(self):
+        pass
+
+
+def test_fetch_heartbeat_stats_reads_the_three_status_columns():
+    conn = _FakeConn([(8500, 8540, 312), (124382,)])
+    stats = monitor.fetch_heartbeat_stats(conn)
+    assert stats == {"fresh_1h": 8500, "total_active": 8540, "total_errors": 312, "candles_24h": 124382}
+    assert "stale" not in monitor.HEARTBEAT_STATS_SQL
+
+
+class _StopMonitor(Exception):
+    pass
+
+
+def test_monitor_loop_heartbeat_reports_the_cycles_per_timeframe_stale_count(monkeypatch):
+    # A healthy 4h collector 3.5 h since success is not stale; a 1m collector an hour since success
+    # is, and so is a dead funding loop sentinel. The heartbeat text carries that cycle's count, 2.
+    def row(tf, since, symbol="BTC/USDT:USDT"):
+        return {"exchange": "binance", "symbol": symbol, "timeframe": tf, "last_success": None,
+                "error_count": 0, "last_error": None, "seconds_since_success": since}
+
+    rows = [row("4h", 3.5 * 3600), row("1m", 3600), row(FUNDING_LOOP, 10 * 86400, monitor.LOOP_SENTINEL_SYMBOL)]
+    sent = []
+    # monitor_loop imports psycopg inside the function; on the host that is conftest's stub module.
+    monkeypatch.setattr(sys.modules["psycopg"], "connect", lambda *a, **k: _FakeConn())
+    monkeypatch.setattr(monitor, "fetch_status_rows", lambda conn: rows)
+    monkeypatch.setattr(monitor, "_get_exchange_timeframe_pairs", lambda conn: [])
+    monkeypatch.setattr(monitor, "fetch_heartbeat_stats", lambda conn: dict(HEARTBEAT_STATS))
+    monkeypatch.setattr(monitor, "should_send_heartbeat", lambda *a: True)
+    monkeypatch.setattr(monitor, "send_webhook", lambda url, text: sent.append(text) or True)
+    monkeypatch.setattr(monitor, "ping_healthcheck", lambda url: None)
+
+    def stop(s):
+        raise _StopMonitor
+
+    monkeypatch.setattr(monitor.time, "sleep", stop)
+    intervals = {"1m": 60, "4h": 14400, FUNDING_LOOP: LOOP_INTERVALS[FUNDING_LOOP]}
+    try:
+        monitor.monitor_loop("dsn", intervals, "https://hook.invalid")
+    except _StopMonitor:
+        pass
+    heartbeats = [t for t in sent if t.startswith("candle-collector alive")]
+    assert len(heartbeats) == 1
+    assert "2 stale" in heartbeats[0]
 
 
 # --- should_send_heartbeat ---
