@@ -127,8 +127,8 @@ def restic_with_stdin_from_command():
     if restic is None or shutil.which("rclone", path=BASE_PATH) is None:
         return False
     version = subprocess.run([restic, "version"], capture_output=True, text=True).stdout
-    match = re.search(r"restic (\d+)\.(\d+)", version)
-    return match is not None and (int(match[1]), int(match[2])) >= (0, 17)
+    match = re.search(r"restic (?P<major>\d+)\.(?P<minor>\d+)", version)
+    return match is not None and (int(match["major"]), int(match["minor"])) >= (0, 17)
 
 
 @pytest.mark.skipif(not restic_with_stdin_from_command(), reason="needs restic >= 0.17 and rclone")
