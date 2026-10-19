@@ -88,6 +88,9 @@ class ExchangeConfig:
     # Weight-budget limiter (Binance): set to enable WeightRateLimiter instead
     # of the interval-based RateLimiter. Leave None to keep interval pacing.
     rate_limit_weight_budget: int | None = None
+    # Bars one poll may cover (HL): the venue charges by bars returned and ccxt sends the whole
+    # since→now window, so a catch-up poll's weight grows with the gap. None = uncapped.
+    poll_max_bars: int | None = None
     rate_limit_window_s: int = 60
     rate_limit_safety: int = 400
     # Weight reserved for priority callers (the Binance dense-OI lane, T-007.4). Positive-weight
@@ -143,6 +146,7 @@ def _parse_exchange(exchange_name: str, ex: dict, tf_defs: dict) -> ExchangeConf
         options=ex.get("options", {}),
         timeframes=timeframes,
         rate_limit_weight_budget=ex.get("rate_limit_weight_budget"),
+        poll_max_bars=ex.get("poll_max_bars"),
         rate_limit_window_s=ex.get("rate_limit_window_s", 60),
         rate_limit_safety=ex.get("rate_limit_safety", 400),
         rate_limit_priority_reserve=ex.get("rate_limit_priority_reserve", 0),

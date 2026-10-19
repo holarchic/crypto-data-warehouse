@@ -38,6 +38,10 @@ exchanges:
     # and two heavier catch-up polls. At 1100ms (55 polls ≈ 1,175) that call put a busy minute
     # over 1200.
     rate_limit_ms: 1200
+    # A poll covers at most 60 bars, so it costs ≤ 21 (20 + ceil(bars / 60)): ccxt asks HL for the
+    # whole since→now window, and after a long gap one poll would cost far more. A gap catches up
+    # 60 bars a cycle. Seeds (new pairs, 1000 bars, 37) follow the 02:00 discovery.
+    poll_max_bars: 60
     # ccxt constructor config. Perp markets only: ccxt's default load also fetches spot and every
     # HIP-3 dex (perpDexs plus one metaAndAssetCtxs per dex, up to ~13 requests ≈ 260 weight in
     # one burst). Swap-only is spotMeta + metaAndAssetCtxs, 40. No HIP-3 market is collected.
