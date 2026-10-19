@@ -6,6 +6,7 @@ from collections import deque
 from datetime import date, datetime, timezone
 
 from config import (
+    CANDLE_REPAIR,
     CANDLE_WS,
     FUNDING_LOOP,
     LIQUIDATION_WS,
@@ -142,7 +143,17 @@ def test_loop_timeframes_match_config():
     pins against name drift between the heartbeat writers and the monitor."""
     assert LOOP_TIMEFRAMES == set(LOOP_INTERVALS)
     assert {FUNDING_LOOP, OI_LOOP, LIQUIDATION_WS, PREMIUM_LOOP,
-            CANDLE_WS} == set(LOOP_INTERVALS)
+            CANDLE_WS, CANDLE_REPAIR} == set(LOOP_INTERVALS)
+
+
+def test_compute_staleness_pages_hl_repair_after_36h():
+    """The daily HL 1m repair sentinel: 64800 + max(64800, 1800) = 129600 s (36 h) since its last
+    success, the page the repair's 72 h cap is sized against."""
+    def row(since):
+        return {"exchange": "hyperliquid", "symbol": "*", "timeframe": CANDLE_REPAIR,
+                "seconds_since_success": since, "error_count": 0}
+    assert compute_staleness([row(129600)], LOOP_AWARE_INTERVALS) == []
+    assert len(compute_staleness([row(129601)], LOOP_AWARE_INTERVALS)) == 1
 
 
 def test_compute_staleness_flags_dead_ws_loop():
