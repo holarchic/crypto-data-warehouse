@@ -176,18 +176,6 @@ def test_collect_pair_advances_cursor_to_newest_closed_bar():
     assert cursors[PAIR["symbol"]] == t1 / 1000  # advanced to the newest closed bar
 
 
-# --- _sleep_until_next_boundary ----------------------------------------------
-
-
-def test_sleep_until_next_boundary_math(monkeypatch):
-    slept = {}
-    monkeypatch.setattr(pi.time, "time", lambda: 1000.0)
-    monkeypatch.setattr(pi.time, "sleep", lambda s: slept.setdefault("s", s))
-    # next 300s boundary after 1000 is 1200, + buffer 15 → 1215 → sleep 215s
-    pi._sleep_until_next_boundary(300, 15)
-    assert slept["s"] == 215.0
-
-
 # --- helpers -----------------------------------------------------------------
 
 
@@ -212,7 +200,7 @@ def test_run_wires_premium_thread_behind_flag():
 
 
 def _patch_loop(monkeypatch, conn, pairs, seed_fn, hb):
-    monkeypatch.setattr(pi, "_sleep_until_next_boundary", lambda *a: None)
+    monkeypatch.setattr(pi, "sleep_until_next_slot", lambda *a: None)
     monkeypatch.setattr(pi, "maybe_reload_markets", lambda *a: None)
     monkeypatch.setattr(pi, "connect_db", lambda *a, **k: conn)
     monkeypatch.setattr(pi, "query_active_pairs", lambda *a, **k: pairs)
@@ -243,6 +231,26 @@ def test_loop_seeds_empty_then_polls(monkeypatch):
     assert len(ex.calls) == 1              # polled the one pair
     assert ex.calls[0]["since"] is None    # forward-only on the empty table
     assert hb["n"] == 1
+
+
+def test_loop_paces_each_cycle_from_its_start(monkeypatch):
+    # The first wait has no previous cycle (slot after now); the second targets the slot after the
+    # first cycle's start, its first clock read (1000), not a later read inside the cycle.
+    conn, ex, hb = FakeConn(), FakeExchange([_closed_bar(1_600_000_000_000)]), {"n": 0}
+    pairs = [dict(PAIR, market_type="perp", last_timestamp=None)]
+    _patch_loop(monkeypatch, conn, pairs, lambda *a: {}, hb)
+    clock = {"t": 999.0}
+
+    def now():
+        clock["t"] += 1
+        return clock["t"]
+
+    calls = []
+    monkeypatch.setattr(pi.time, "time", now)
+    monkeypatch.setattr(pi, "sleep_until_next_slot", lambda *a: calls.append(a))
+    pi.premium_index_loop(ex, _cfg(), "dsn", RateLimiter(0), max_cycles=2)
+    assert calls[0] == (pi.PREMIUM_INTERVAL_S, pi.PREMIUM_POLL_BUFFER_S, None, "binance/premium")
+    assert calls[1] == (pi.PREMIUM_INTERVAL_S, pi.PREMIUM_POLL_BUFFER_S, 1000.0, "binance/premium")
 
 
 def test_loop_reactivated_symbol_resumes_from_db_cursor(monkeypatch):

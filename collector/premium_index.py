@@ -8,7 +8,7 @@ export) and resolves the pre-settlement premium ramp a 1h bar blurs.
 
 Binance-only: HL premium lives in `hl_asset_ctxs` (T-008); there is no bybit-premium seed.
 
-Shape mirrors the candle collect loop — boundary-aligned poll, gap-aware `since` cursor, the
+Shape mirrors the candle collect loop — slot-paced poll (`slots.py`), gap-aware `since` cursor, the
 T-007.4 weight diet (`poll_limit` keeps a caught-up poll at kline weight 1, not 5), and the
 T-014 error discipline (`safe_rollback` on every error path). It stays **non-priority** on the
 shared Binance `WeightRateLimiter` (it yields to candles + the dense-OI reserve — premium is
@@ -24,6 +24,7 @@ from backoff import RETRIABLE_EXCEPTIONS
 from candles import poll_limit
 from config import PREMIUM_INTERVAL_S, PREMIUM_LOOP, PREMIUM_TIMEFRAME, ExchangeConfig
 from rate_limiter import RateLimiter, binance_kline_weight, paced_call
+from slots import sleep_until_next_slot
 from status import query_active_pairs, upsert_loop_heartbeat
 
 from db import connect_db, maybe_reload_markets, safe_rollback
@@ -104,18 +105,6 @@ def _seed_cursors(conn, exchange_name: str) -> dict[str, float]:
         return {sym: float(ts) for sym, ts in cur.fetchall() if ts is not None}
 
 
-def _sleep_until_next_boundary(interval_s: int, buffer_s: int) -> None:
-    """Sleep to the next `interval_s` boundary + buffer, so each poll fires just after a bar
-    closes. Local copy of `main.sleep_until_next_boundary` (importing from `main` is circular —
-    `main` imports this loop); `oi.py` sets the per-module-helper precedent. The 3-copy
-    duplication with `main`/`oi` is a known future shared-util extraction, out of scope here."""
-    now = time.time()
-    next_boundary = (now // interval_s + 1) * interval_s + buffer_s
-    sleep_s = next_boundary - now
-    log.info("[premium] Sleeping %.0fs until next %ds boundary", sleep_s, interval_s)
-    time.sleep(sleep_s)
-
-
 def _heartbeat(conn, config: ExchangeConfig, thread_name: str) -> None:
     """Per-loop liveness heartbeat, guarded so a write hiccup can't kill the loop (it
     reconnects next cycle via the top-of-cycle `conn.closed` guard). Liveness only — a loop
@@ -155,7 +144,7 @@ def _collect_premium_pair(exchange, pair: dict, config: ExchangeConfig, rate_lim
 
 def premium_index_loop(exchange, config: ExchangeConfig, dsn: str, rate_limiter: RateLimiter,
                        *, max_cycles: int | None = None):
-    """Boundary-scheduled 5-min premium-index poll for Binance. Own DB connection; never exits
+    """Slot-paced 5-min premium-index poll for Binance. Own DB connection; never exits
     (daemon). `max_cycles` bounds the outer loop for tests (None = run forever), mirroring
     `ws_loop`'s `max_sessions`."""
     # Fail fast on a misconfig (matches oi_loop's raise + build_liq_spec): premiumIndexKlines is
@@ -170,10 +159,12 @@ def premium_index_loop(exchange, config: ExchangeConfig, dsn: str, rate_limiter:
     conn = connect_db(dsn)
     cursors: dict[str, float] = {}
     cycles = 0
+    started = None
 
     while max_cycles is None or cycles < max_cycles:
         cycles += 1
-        _sleep_until_next_boundary(PREMIUM_INTERVAL_S, PREMIUM_POLL_BUFFER_S)
+        sleep_until_next_slot(PREMIUM_INTERVAL_S, PREMIUM_POLL_BUFFER_S, started, thread_name)
+        started = time.time()
 
         try:
             maybe_reload_markets(exchange)

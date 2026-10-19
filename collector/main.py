@@ -17,6 +17,7 @@ from rate_limiter import (
     build_rate_limiter,
     paced_call,
 )
+from slots import sleep_until_next_slot
 from status import query_active_pairs, upsert_status_error, upsert_status_success
 from ws import ws_loop
 
@@ -87,14 +88,6 @@ def insert_candles(conn, candles, table="candles"):
             inserted += cur.rowcount
     conn.commit()
     return inserted
-
-
-def sleep_until_next_boundary(interval_s, buffer_s):
-    now = time.time()
-    next_boundary = (now // interval_s + 1) * interval_s + buffer_s
-    sleep_s = next_boundary - now
-    log.info("Sleeping %.0fs until next %ss boundary (+%ss buffer)", sleep_s, interval_s, buffer_s)
-    time.sleep(sleep_s)
 
 
 # ---------------------------------------------------------------------------
@@ -196,10 +189,12 @@ def collect_loop(exchange, config: ExchangeConfig, tf: TimeframeConfig, dsn: str
 
     # Poll loop — never exits
     first_cycle = not _defer_first_cycle(tf.interval_s)
+    started = None
     while True:
         if not first_cycle:
-            sleep_until_next_boundary(tf.interval_s, tf.buffer_s)
+            sleep_until_next_slot(tf.interval_s, tf.buffer_s, started, thread_name)
         first_cycle = False
+        started = time.time()
 
         try:
             maybe_reload_markets(exchange)
