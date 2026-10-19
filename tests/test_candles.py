@@ -173,3 +173,78 @@ def test_collect_pair_threads_tf_table(monkeypatch):
             "market_type": "perp", "last_timestamp": None}
     main_mod._collect_pair(object(), pair, config, tf, None, object(), "binance/1m")
     assert captured["table"] == "candles_1m"
+
+
+# --- collect_loop pacing: each cycle paces from its own start ---------------------
+
+
+class _StopLoop(Exception):
+    pass
+
+
+def _drive_collect_loop(main_mod, monkeypatch, tf, cycles, connect=None):
+    """Run collect_loop for `cycles` pacing calls against fakes and a ticking clock (1000, 1001, …);
+    return the recorded `sleep_until_next_slot` arguments."""
+    clock = {"t": 999.0}
+
+    def now():
+        clock["t"] += 1
+        return clock["t"]
+
+    calls = []
+
+    def pace(*a):
+        calls.append(a)
+        if len(calls) >= cycles:
+            raise _StopLoop
+
+    conn = SimpleNamespace(closed=False)
+    monkeypatch.setattr(main_mod.time, "time", now)
+    monkeypatch.setattr(main_mod.time, "sleep", lambda s: None)
+    monkeypatch.setattr(main_mod, "connect_db", connect or (lambda dsn: conn))
+    monkeypatch.setattr(main_mod, "maybe_reload_markets", lambda ex: None)
+    monkeypatch.setattr(main_mod, "query_active_pairs", lambda c, n, t: [{"symbol": "BTC/USDT:USDT"}])
+    # The fake poll reads the clock, as real polls do, so a start taken at cycle end reads later.
+    monkeypatch.setattr(main_mod, "_collect_pair", lambda *a: main_mod.time.time())
+    monkeypatch.setattr(main_mod, "sleep_until_next_slot", pace)
+    cfg = SimpleNamespace(name="binance", market_type="perp")
+    try:
+        main_mod.collect_loop(object(), cfg, tf, "dsn", None)
+    except _StopLoop:
+        pass
+    return calls
+
+
+def test_collect_loop_paces_each_cycle_from_its_start(monkeypatch):
+    main_mod = _load_real_main()
+    tf = SimpleNamespace(name="5m", interval_s=300, buffer_s=30, table="candles")
+    calls = _drive_collect_loop(main_mod, monkeypatch, tf, cycles=2)
+    # 5m runs its first cycle at once (no wait); each wait then targets the slot after the start
+    # of the cycle just ended: 1000, then 1002 (the poll in between reads 1001).
+    assert calls == [(300, 30, 1000.0, "binance/5m"), (300, 30, 1002.0, "binance/5m")]
+
+
+def test_collect_loop_deferred_first_cycle_waits_for_the_slot_after_now(monkeypatch):
+    main_mod = _load_real_main()
+    tf = SimpleNamespace(name="1h", interval_s=3600, buffer_s=60, table="candles")
+    calls = _drive_collect_loop(main_mod, monkeypatch, tf, cycles=2)
+    assert calls == [(3600, 60, None, "binance/1h"), (3600, 60, 1000.0, "binance/1h")]
+
+
+def test_collect_loop_reconnect_failure_retries_from_the_failed_cycles_start(monkeypatch):
+    # A failed reconnect sleeps 30 s and loops: the next wait still targets the slot after the
+    # failed iteration's start, the same wait as before the pacing change.
+    main_mod = _load_real_main()
+    conn = SimpleNamespace(closed=True)
+    attempts = {"n": 0}
+
+    def connect(dsn):
+        attempts["n"] += 1
+        if attempts["n"] == 2:  # the first call is the loop's initial connect
+            raise RuntimeError("db down")
+        return conn
+
+    tf = SimpleNamespace(name="5m", interval_s=300, buffer_s=30, table="candles")
+    calls = _drive_collect_loop(main_mod, monkeypatch, tf, cycles=1, connect=connect)
+    assert attempts["n"] == 2
+    assert calls == [(300, 30, 1000.0, "binance/5m")]

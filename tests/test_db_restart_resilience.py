@@ -124,7 +124,7 @@ def test_collect_loop_survives_status_write_failure_on_db_restart(monkeypatch):
     ])
     monkeypatch.setattr(main, "_collect_pair", boom_collect)
     monkeypatch.setattr(main, "upsert_status_error", boom_upsert)
-    monkeypatch.setattr(main, "sleep_until_next_boundary", stop)
+    monkeypatch.setattr(main, "sleep_until_next_slot", stop)
 
     tf = SimpleNamespace(name="5m", interval_s=300, buffer_s=30)
     cfg = SimpleNamespace(name="binance", market_type="perp", rate_limit_weight_budget=2400)
