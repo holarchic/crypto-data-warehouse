@@ -150,10 +150,10 @@ Identical column shape + PK to `candles`, holding ONLY `1m` (Binance + Bybit by 
 ### `collection_status`
 
 PK: `(exchange, market_type, symbol, timeframe)` — health tracking + discovery metadata per pair.
-Also holds per-loop **liveness heartbeats** for the funding/OI/premium/liquidation-WS/candle-WS threads: sentinel rows with
-`symbol = "*"` and `timeframe ∈ {funding, oi, liq_ws, premium, candle_ws}` (one per exchange/loop). Candle-facing readers
+Also holds per-loop **liveness heartbeats** for the funding/OI/premium/liquidation-WS/candle-WS threads and the daily HL 1m repair: sentinel rows with
+`symbol = "*"` and `timeframe ∈ {funding, oi, liq_ws, premium, candle_ws, candle_repair}` (one per exchange/loop). Candle-facing readers
 (`query_active_pairs`, the `/candles/*` and `/status` API endpoints) exclude these by pseudo-timeframe;
-the monitor's staleness check is the only consumer that acts on them.
+the monitor's staleness check acts on them, and the repair also reads and writes its own row's `last_timestamp` as its repaired-through cursor.
 
 | Column | Type | Notes |
 |--------|------|-------|

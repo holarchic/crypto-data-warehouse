@@ -116,6 +116,7 @@ def test_parse_keeps_traded_in_window_bars_and_counts_every_listed_minute():
 
 @pytest.mark.parametrize("bad", [
     {"o": "x"}, {"h": "NaN"}, {"v": "inf"}, {"n": "5"}, {"t": END - 4 * M + 1}, {"s": "ETH"}, {"t": None},
+    {"c": False}, {"o": True}, {"n": True}, {"t": True},
 ])
 def test_parse_flags_a_malformed_bar_and_keeps_nothing(bad):
     s = END - 4 * M
@@ -202,7 +203,7 @@ class World:
         monkeypatch.setattr(hl, "take_lock", lambda conn: self.lock_free)
         monkeypatch.setattr(hl, "read_cursor", lambda conn: self.cursor)
         monkeypatch.setattr(hl, "bootstrap_cursor", self._bootstrap)
-        monkeypatch.setattr(hl, "query_active_pairs", lambda conn, ex, tf: self.pairs)
+        monkeypatch.setattr(hl, "active_pairs", lambda conn: self.pairs)
         monkeypatch.setattr(hl, "stored_minutes", lambda conn, pair, s, e: {
             t for t in self.stored.get(pair["symbol"], set()) if s <= t < e})
         monkeypatch.setattr(hl, "write_bars", self._write)
@@ -275,6 +276,14 @@ def test_run_coin_failure_keeps_the_cursor(monkeypatch):
     w.fail = {"kPEPE"}
     assert w.run() == 1
     assert w.advanced == []
+
+
+def test_run_boolean_price_writes_nothing_and_keeps_the_cursor(monkeypatch):
+    w = World(monkeypatch, cursor=END - 20 * H)
+    real = w.fetch
+    w.fetch = lambda coin, s, e: [{**b, "c": False} if coin == "kPEPE" else b for b in real(coin, s, e)]
+    assert w.run() == 1
+    assert [s for s, _ in w.writes] == ["BTC/USDC:USDC"] and w.advanced == []
 
 
 def test_run_malformed_writes_nothing_for_that_slice(monkeypatch):
