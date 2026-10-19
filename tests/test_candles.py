@@ -71,22 +71,28 @@ def test_poll_limit_floors_on_clock_skew():
 # --- _collect_pair wiring (real main) -----------------------------------------
 
 
-def _run_collect_pair(main_mod, monkeypatch, last_timestamp, weight_budget):
-    """Drive the real _collect_pair with fetch_candles patched to capture its `limit`."""
-    captured = {}
+def _run_collect_pair(main_mod, monkeypatch, last_timestamp, weight_budget, poll_max_bars=None, results=None):
+    """Drive the real _collect_pair with fetch_candles patched to capture its `limit` (and every
+    call in `captured["calls"]`). `results` lists what successive fetches return (default: [])."""
+    captured = {"calls": []}
+    pending = list(results or [])
 
     def _fake_fetch(exchange, symbol, market_info, exchange_name, timeframe, interval_s,
-                    rate_limiter, since_ms=None, limit=1000):
+                    rate_limiter, since_ms=None, limit=1000, until_ms=None):
         captured["limit"] = limit
         captured["since_ms"] = since_ms
-        return []  # empty → insert_candles/status paths are no-ops
+        captured["calls"].append({"since_ms": since_ms, "until_ms": until_ms})
+        return pending.pop(0) if pending else []  # empty → insert_candles/status paths are no-ops
 
     monkeypatch.setattr(main_mod, "fetch_candles", _fake_fetch)
+    monkeypatch.setattr(main_mod, "insert_candles", lambda conn, candles, table: len(candles))
+    monkeypatch.setattr(main_mod, "upsert_status_success", lambda *a, **k: None)
     # Freeze wall clock so the poll_limit gap is deterministic.
     fixed_now = 1_700_000_000.0
     monkeypatch.setattr(main_mod.time, "time", lambda: fixed_now)
 
-    config = SimpleNamespace(name="binance", market_type="perp", rate_limit_weight_budget=weight_budget)
+    config = SimpleNamespace(name="binance", market_type="perp", rate_limit_weight_budget=weight_budget,
+                             poll_max_bars=poll_max_bars)
     tf = SimpleNamespace(name="5m", interval_s=300, table="candles")
     pair = {"asset_id": "BTC", "symbol": "BTC/USDT:USDT", "native_symbol": "BTCUSDT",
             "market_type": "perp", "last_timestamp": last_timestamp}
@@ -120,6 +126,73 @@ def test_collect_pair_poll_non_weight_bound_keeps_full_limit(monkeypatch):
     stored = datetime.fromtimestamp(1_700_000_000.0 - 3 * interval_s, tz=timezone.utc)
     captured, _ = _run_collect_pair(main_mod, monkeypatch, last_timestamp=stored, weight_budget=None)
     assert captured["limit"] == CANDLE_SEED_LIMIT
+
+
+def test_collect_pair_poll_caps_the_window_at_poll_max_bars(monkeypatch):
+    # HL charges by bars returned: a poll 3 h behind asks for 60 bars, not since→now.
+    main_mod = _load_real_main()
+    stored = datetime.fromtimestamp(1_700_000_000.0 - 36 * 300, tz=timezone.utc)
+    bar = {"timestamp": 1_699_990_000.0}
+    captured, _ = _run_collect_pair(main_mod, monkeypatch, last_timestamp=stored, weight_budget=None,
+                                    poll_max_bars=60, results=[[bar]])
+    since = captured["calls"][0]["since_ms"]
+    assert captured["calls"] == [{"since_ms": since, "until_ms": since + 60 * 300 * 1000}]
+
+
+def test_collect_pair_seed_is_not_window_capped(monkeypatch):
+    main_mod = _load_real_main()
+    captured, _ = _run_collect_pair(main_mod, monkeypatch, last_timestamp=None, weight_budget=None,
+                                    poll_max_bars=60)
+    assert captured["calls"] == [{"since_ms": None, "until_ms": None}]
+
+
+def test_collect_pair_capped_empty_window_steps_over_with_one_uncapped_poll(monkeypatch):
+    # A pair 10 days behind whose next 60 bars are empty would otherwise never advance its cursor.
+    main_mod = _load_real_main()
+    stored = datetime.fromtimestamp(1_700_000_000.0 - 10 * 86400, tz=timezone.utc)
+    captured, _ = _run_collect_pair(main_mod, monkeypatch, last_timestamp=stored, weight_budget=None,
+                                    poll_max_bars=60)
+    since = captured["calls"][0]["since_ms"]
+    assert captured["calls"] == [{"since_ms": since, "until_ms": since + 60 * 300 * 1000},
+                                 {"since_ms": since, "until_ms": None}]
+
+
+def test_collect_pair_caught_up_empty_window_does_not_refetch(monkeypatch):
+    # Caught up (the 60-bar window reaches past now): an empty answer is just no new bar yet.
+    main_mod = _load_real_main()
+    stored = datetime.fromtimestamp(1_700_000_000.0 - 300, tz=timezone.utc)
+    captured, _ = _run_collect_pair(main_mod, monkeypatch, last_timestamp=stored, weight_budget=None,
+                                    poll_max_bars=60)
+    assert len(captured["calls"]) == 1
+
+
+def test_fetch_candles_until_bounds_the_real_hl_request():
+    # Through real ccxt: `until_ms` becomes candleSnapshot's endTime; without it ccxt asks since→now.
+    import ccxt
+
+    main_mod = _load_real_main()
+    exchange = ccxt.hyperliquid({"options": {"fetchMarkets": {"types": ["swap"]}}})
+    requests = []
+
+    def post_info(request, *a, **k):
+        requests.append(request)
+        return {
+            "metaAndAssetCtxs": [{"universe": [{"name": "BTC", "szDecimals": 5, "maxLeverage": 40}]},
+                                 [{"markPx": "100", "dayNtlVlm": "1", "funding": "0", "openInterest": "1",
+                                   "oraclePx": "100", "premium": "0", "prevDayPx": "100", "midPx": "100",
+                                   "impactPxs": ["99", "101"], "dayBaseVlm": "1"}]],
+            "spotMeta": {"tokens": [], "universe": []},
+            "candleSnapshot": [],
+        }[request["type"]]
+
+    exchange.publicPostInfo = post_info
+    exchange.load_markets()
+    market_info = {"asset_id": "BTC", "native_symbol": "", "market_type": "perp"}
+    since = 1_000_000
+    main_mod.fetch_candles(exchange, "BTC/USDC:USDC", market_info, "hyperliquid", "5m", 300,
+                           main_mod.RateLimiter(0), since_ms=since, until_ms=since + 60 * 300 * 1000)
+    assert requests[-1]["req"]["startTime"] == since
+    assert requests[-1]["req"]["endTime"] == since + 60 * 300 * 1000
 
 
 # --- candle-table routing (T-015) ---------------------------------------------

@@ -31,10 +31,12 @@ log = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 
-def fetch_candles(exchange, symbol, market_info, exchange_name, timeframe, interval_s, rate_limiter, since_ms=None, limit=1000):
+def fetch_candles(exchange, symbol, market_info, exchange_name, timeframe, interval_s, rate_limiter, since_ms=None, limit=1000,
+                  until_ms=None):
+    params = {"until": until_ms} if until_ms is not None else {}
     raw = paced_call(
         rate_limiter, exchange, binance_kline_weight(limit),
-        exchange.fetch_ohlcv, symbol, timeframe, since=since_ms, limit=limit,
+        exchange.fetch_ohlcv, symbol, timeframe, since=since_ms, limit=limit, params=params,
     )
     now_ms = int(time.time() * 1000)
     candles = []
@@ -140,10 +142,20 @@ def _collect_pair(exchange, pair, config, tf, rate_limiter, conn, thread_name):
         else:
             limit = CANDLE_SEED_LIMIT
         label = "Poll"
+    until_ms = None
+    if since_ms is not None and config.poll_max_bars is not None:
+        until_ms = since_ms + config.poll_max_bars * tf.interval_s * 1000
     candles = fetch_candles(
         exchange, pair["symbol"], market_info, config.name, tf.name, tf.interval_s, rate_limiter,
-        since_ms=since_ms, limit=limit,
+        since_ms=since_ms, limit=limit, until_ms=until_ms,
     )
+    if not candles and until_ms is not None and until_ms < time.time() * 1000:
+        # A capped window with no bars would hold the cursor still forever; one uncapped poll
+        # steps over the bar-less stretch (rare: a coin that stopped producing bars for a while).
+        candles = fetch_candles(
+            exchange, pair["symbol"], market_info, config.name, tf.name, tf.interval_s, rate_limiter,
+            since_ms=since_ms, limit=limit,
+        )
     inserted = insert_candles(conn, candles, tf.table)
     last_ts = max((c["timestamp"] for c in candles), default=None) if candles else None
     upsert_status_success(conn, config.name, market_info["market_type"], pair["symbol"], tf.name, last_ts, asset_id=market_info["asset_id"])
