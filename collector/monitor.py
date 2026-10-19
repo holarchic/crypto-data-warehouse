@@ -185,15 +185,16 @@ def build_webhook_payload(text):
     return json.dumps({"text": text, "content": text}).encode("utf-8")
 
 
-def build_heartbeat_text(stats):
-    """One-line summary for the daily heartbeat.
+def build_heartbeat_text(stats, stale_count):
+    """One-line summary for the weekly heartbeat.
 
-    stats keys: fresh_1h, stale_3h, total_active, candles_24h, total_errors.
+    stats keys: fresh_1h, total_active, candles_24h, total_errors. `stale_count` is the cycle's
+    `compute_staleness` count, so a healthy 4h or 12h collector is not stale between its polls.
     """
     return (
         "candle-collector alive: "
         f"{stats['fresh_1h']}/{stats['total_active']} collectors fresh (<1h), "
-        f"{stats['stale_3h']} stale (>3h), "
+        f"{stale_count} stale, "
         f"{stats['candles_24h']:,} candles/24h, "
         f"{stats['total_errors']} errors"
     )
@@ -275,7 +276,6 @@ def send_webhook(url, text):
 HEARTBEAT_STATS_SQL = """
     SELECT
         count(*) FILTER (WHERE last_success > NOW() - INTERVAL '1 hour') AS fresh_1h,
-        count(*) FILTER (WHERE last_success IS NULL OR last_success < NOW() - INTERVAL '3 hours') AS stale_3h,
         count(*) AS total_active,
         COALESCE(sum(error_count), 0) AS total_errors
     FROM collection_status
@@ -295,12 +295,11 @@ def fetch_heartbeat_stats(conn):
     """Query DB for daily heartbeat summary stats."""
     with conn.cursor() as cur:
         cur.execute(HEARTBEAT_STATS_SQL)
-        fresh_1h, stale_3h, total_active, total_errors = cur.fetchone()
+        fresh_1h, total_active, total_errors = cur.fetchone()
         cur.execute(HEARTBEAT_CANDLES_SQL)
         (candles_24h,) = cur.fetchone()
     return {
         "fresh_1h": fresh_1h,
-        "stale_3h": stale_3h,
         "total_active": total_active,
         "total_errors": int(total_errors),
         "candles_24h": candles_24h,
@@ -488,7 +487,7 @@ def monitor_loop(dsn, timeframe_intervals, webhook_url, poll_s=300, cooldown_s=3
             if should_send_heartbeat(now_utc, last_heartbeat_date, heartbeat_hour_utc, heartbeat_weekday):
                 try:
                     stats = fetch_heartbeat_stats(conn)
-                    text = build_heartbeat_text(stats)
+                    text = build_heartbeat_text(stats, len(stale))
                     send_webhook(webhook_url, text)
                     last_heartbeat_date = now_utc.date()
                     log.info("Heartbeat sent: %s", text)
