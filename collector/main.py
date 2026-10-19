@@ -152,11 +152,11 @@ def _collect_pair(exchange, pair, config, tf, rate_limiter, conn, thread_name):
     return True
 
 
-# Defer first cycle to the next boundary only for mid-interval TFs (30m-12h). These
+# Defer first cycle to the next slot only for mid-interval TFs (30m-12h). These
 # have many pairs and cluster-start on shared boundaries, so running them all at once
 # on restart saturates the exchange's rate-limit budget the hardest. Short TFs (< 30m)
 # run immediately so candle data starts flowing. Very long TFs (>= 1d) also run
-# immediately because their "next boundary" computed from the UNIX epoch can be days
+# immediately because their next slot, computed from the UNIX epoch, can be days
 # away (1w boundaries are Thursdays — a post-restart defer could leave 1w pairs stale
 # for a week).
 _DEFER_FIRST_CYCLE_MIN_S = 1800   # 30m

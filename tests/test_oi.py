@@ -371,6 +371,29 @@ def test_oi_loops_pace_from_their_cycle_start_on_the_no_pairs_path(monkeypatch, 
     assert slept == [(30, oi.OI_POLL_BUFFER_S, 1000.0, f"{loop}/oi")]
 
 
+def test_bulk_loop_paces_from_its_cycle_start_on_a_full_cycle(monkeypatch):
+    # The cycle reads the clock for its snapshot time (1001) after taking its start (1000).
+    from types import SimpleNamespace
+    slept = []
+
+    def stop(*a):
+        slept.append(a)
+        raise _StopLoop
+
+    monkeypatch.setattr(oi, "connect_db", lambda dsn: FakeConn())
+    monkeypatch.setattr(oi, "_get_active_pairs", lambda c, name: [{"asset_id": "BTC", "symbol": "BTC/USDT:USDT"}])
+    monkeypatch.setattr(oi, "paced_call", lambda rl, ex, w, fn, *a, priority=False, **k: fn(*a, **k))
+    monkeypatch.setattr(oi, "_insert_oi", lambda conn, rows: len(rows))
+    monkeypatch.setattr(oi, "_heartbeat", lambda *a: None)
+    monkeypatch.setattr(oi, "sleep_until_next_slot", stop)
+    monkeypatch.setattr(oi.time, "time", _ticking_clock())
+    ex = SimpleNamespace(fetch_tickers=lambda: {"BTC/USDT:USDT": {"info": {"openInterest": "1", "openInterestValue": "2"}}})
+    cfg = SimpleNamespace(name="bybit", market_type="perp", ccxt_class="bybit", oi_poll_interval_s=30)
+    with pytest.raises(_StopLoop):
+        oi._oi_loop_bulk(ex, cfg, "dsn", None)
+    assert slept == [(30, oi.OI_POLL_BUFFER_S, 1000.0, "bybit/oi")]
+
+
 def test_dual_write_happy_path(monkeypatch):
     universe, ctxs = _fixture_universe_ctxs()
     conn = FakeConn()
@@ -827,8 +850,11 @@ def test_binance_loop_skips_baseline_when_seed_fails(monkeypatch):
     monkeypatch.setattr(oi, "_binance_baseline_sweep", lambda *a: swept.__setitem__("n", swept["n"] + 1) or 0)
     hb = {"n": 0}
     monkeypatch.setattr(oi, "_heartbeat", lambda *a: hb.__setitem__("n", hb["n"] + 1))
+    monkeypatch.setattr(oi.time, "time", _ticking_clock())
+    slept = []
 
     def stop(*a):
+        slept.append(a)
         raise _StopLoop
 
     monkeypatch.setattr(oi, "sleep_until_next_slot", stop)
@@ -847,6 +873,8 @@ def test_binance_loop_skips_baseline_when_seed_fails(monkeypatch):
         pass
     assert swept["n"] == 0   # baseline sweep skipped (seed failed)
     assert hb["n"] == 1      # liveness heartbeat still fired
+    # A full cycle (it reads the clock after its start) paces from its start, the first read.
+    assert slept == [(60, oi.OI_POLL_BUFFER_S, 1000.0, "binance/oi")]
     # The premiumIndex trigger rides the priority weight lane (T-007.4).
     assert ("fetch_funding_rates", True) in paced_calls
 

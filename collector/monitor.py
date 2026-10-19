@@ -292,7 +292,7 @@ HEARTBEAT_CANDLES_SQL = "SELECT " + " + ".join(
 
 
 def fetch_heartbeat_stats(conn):
-    """Query DB for daily heartbeat summary stats."""
+    """Query DB for the weekly heartbeat summary stats."""
     with conn.cursor() as cur:
         cur.execute(HEARTBEAT_STATS_SQL)
         fresh_1h, total_active, total_errors = cur.fetchone()
@@ -488,9 +488,11 @@ def monitor_loop(dsn, timeframe_intervals, webhook_url, poll_s=300, cooldown_s=3
                 try:
                     stats = fetch_heartbeat_stats(conn)
                     text = build_heartbeat_text(stats, len(stale))
-                    send_webhook(webhook_url, text)
-                    last_heartbeat_date = now_utc.date()
-                    log.info("Heartbeat sent: %s", text)
+                    if send_webhook(webhook_url, text):
+                        last_heartbeat_date = now_utc.date()
+                        log.info("Heartbeat sent: %s", text)
+                    else:
+                        log.warning("Heartbeat delivery failed; retrying next cycle")
                 except Exception:
                     log.exception("Heartbeat send failed")
 
