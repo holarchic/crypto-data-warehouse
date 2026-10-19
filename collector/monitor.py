@@ -484,7 +484,9 @@ def monitor_loop(dsn, timeframe_intervals, webhook_url, poll_s=300, cooldown_s=3
                         if send_alert(webhook_url, alert_key, alert_text, cooldowns):
                             log.warning("Gap alert: %s/%s — %d gaps", exchange, timeframe, len(gaps))
                         else:
+                            # Leave the scan due so the next cycle retries, not the next tier.
                             log.warning("Gap alert delivery failed: %s/%s", exchange, timeframe)
+                            continue
                 last_gap_scan[(exchange, timeframe)] = now
 
             # --- Weekly status heartbeat (Discord summary) ---

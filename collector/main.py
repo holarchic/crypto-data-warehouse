@@ -109,12 +109,17 @@ def _btc_fallback_pairs(config: ExchangeConfig, exchange) -> list[dict]:
     }]
 
 
-def _collect_pair(exchange, pair, config, tf, rate_limiter, conn, thread_name):
+def _collect_pair(exchange, pair, config, tf, rate_limiter, conn, thread_name, scan_from):
     """Fetch and insert candles for a single pair. Returns True on success.
 
     Gap-aware: fetches from last_timestamp forward (`since`), so a pair that
     missed N cycles backfills N candles on its next successful run. The fixed
     limit=10 approach lost data permanently after 10 consecutive failures.
+
+    `scan_from` ({symbol: ms}, owned by the calling loop) carries a window-capped venue past empty
+    windows: when a capped window behind now returns no bars (a cursor older than the venue's
+    history, or a bar-less stretch), the next poll starts after it instead of asking again, so the
+    cursor reaches the next bar without one uncapped, heavy request.
     """
     market_info = {
         "asset_id": pair["asset_id"] or "BTC",
@@ -144,18 +149,17 @@ def _collect_pair(exchange, pair, config, tf, rate_limiter, conn, thread_name):
         label = "Poll"
     until_ms = None
     if since_ms is not None and config.poll_max_bars is not None:
+        since_ms = max(since_ms, scan_from.get(pair["symbol"], 0))
         until_ms = since_ms + config.poll_max_bars * tf.interval_s * 1000
     candles = fetch_candles(
         exchange, pair["symbol"], market_info, config.name, tf.name, tf.interval_s, rate_limiter,
         since_ms=since_ms, limit=limit, until_ms=until_ms,
     )
-    if not candles and until_ms is not None and until_ms < time.time() * 1000:
-        # A capped window with no bars would hold the cursor still forever; one uncapped poll
-        # steps over the bar-less stretch (rare: a coin that stopped producing bars for a while).
-        candles = fetch_candles(
-            exchange, pair["symbol"], market_info, config.name, tf.name, tf.interval_s, rate_limiter,
-            since_ms=since_ms, limit=limit,
-        )
+    if until_ms is not None:
+        if not candles and until_ms < time.time() * 1000:
+            scan_from[pair["symbol"]] = until_ms + 1
+        else:
+            scan_from.pop(pair["symbol"], None)
     inserted = insert_candles(conn, candles, tf.table)
     last_ts = max((c["timestamp"] for c in candles), default=None) if candles else None
     upsert_status_success(conn, config.name, market_info["market_type"], pair["symbol"], tf.name, last_ts, asset_id=market_info["asset_id"])
@@ -202,6 +206,7 @@ def collect_loop(exchange, config: ExchangeConfig, tf: TimeframeConfig, dsn: str
     # Poll loop — never exits
     first_cycle = not _defer_first_cycle(tf.interval_s)
     started = None
+    scan_from: dict[str, int] = {}  # per-pair position past empty capped windows (see _collect_pair)
     while True:
         if not first_cycle:
             sleep_until_next_slot(tf.interval_s, tf.buffer_s, started, thread_name)
@@ -237,7 +242,7 @@ def collect_loop(exchange, config: ExchangeConfig, tf: TimeframeConfig, dsn: str
         # Iterate over each pair — errors are isolated per-pair
         for pair in pairs:
             try:
-                _collect_pair(exchange, pair, config, tf, rate_limiter, conn, thread_name)
+                _collect_pair(exchange, pair, config, tf, rate_limiter, conn, thread_name, scan_from)
             except RETRIABLE_EXCEPTIONS as exc:
                 log.warning("[%s] Retriable error on %s: %s", thread_name, pair["symbol"], exc)
                 if conn.closed:
