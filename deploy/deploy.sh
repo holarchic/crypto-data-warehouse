@@ -50,9 +50,9 @@ info "Pulling base images"
 $COMPOSE pull db
 
 info "Building application images"
-# Include profile-gated services (discovery, liquidations-hl) so they don't run stale code after
-# a git pull — `compose build` alone skips anything behind a profile flag.
-$COMPOSE --profile discovery --profile liquidations-hl build
+# Include profile-gated services (discovery, liquidations-hl, hl-candles-repair) so they don't run
+# stale code after a git pull — `compose build` alone skips anything behind a profile flag.
+$COMPOSE --profile discovery --profile liquidations-hl --profile hl-candles-repair build
 
 info "Starting services"
 $COMPOSE up -d
@@ -83,6 +83,8 @@ NEW_CRON="$EXISTING_CRON
 0 2 * * * cd $PROJECT_DIR && $COMPOSE --profile discovery run --rm discovery >> /var/log/candle-collector-discovery.log 2>&1
 # candle-collector: daily HL Grade-A liquidation pull (04:00 UTC — T-009.3)
 0 4 * * * cd $PROJECT_DIR && $COMPOSE --profile liquidations-hl run --rm liquidations-hl >> /var/log/candle-collector-liquidations-hl.log 2>&1
+# candle-collector: daily HL 1m repair from REST (06:30 UTC, ~6 h background trickle — T-019)
+30 6 * * * cd $PROJECT_DIR && $COMPOSE --profile hl-candles-repair run --rm --no-deps hl-candles-repair >> /var/log/candle-collector-hl-candles-repair.log 2>&1
 # candle-collector: nightly offsite backup (05:30 UTC; a no-op until the restic env file exists)
 30 5 * * * $PROJECT_DIR/scripts/backup-offsite.sh >> /var/log/candle-collector-backup.log 2>&1
 # candle-collector: host monitor (every 5 min)

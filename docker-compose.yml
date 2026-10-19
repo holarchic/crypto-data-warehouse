@@ -101,6 +101,17 @@ services:
       AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY:-}
     restart: "no"
 
+  # HL 1m daily repair (T-019) — one-shot that replaces recent HL 1m bars with REST's closed values,
+  # run by cron. WEBHOOK_URL carries its alert for a span that aged past REST's history.
+  hl-candles-repair:
+    <<: *collector-common
+    profiles: ["hl-candles-repair"]
+    command: ["python", "-m", "hl_candles_repair"]
+    environment:
+      <<: *collector-env
+      WEBHOOK_URL: ${WEBHOOK_URL:-}
+    restart: "no"
+
   api:
     build: ./api
     depends_on:
