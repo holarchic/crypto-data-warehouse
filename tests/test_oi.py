@@ -2,11 +2,13 @@
 
 The repo has NO real-DB test harness (conftest stubs psycopg/db/status/backoff with
 MagicMock). So DB-engine behaviour (real ON-CONFLICT dedup, real rollback) is verified
-in prod; here we test cc's own logic: parsing, the sleep boundary, and the loop's
+in prod; here we test cc's own logic: parsing, the pacing call, and the loop's
 insert/commit/rollback discipline via a fake conn/cursor that records calls.
 """
 
 import sys
+
+import pytest
 
 # conftest stubs `oi` to a MagicMock; remove the stub so we test the real module.
 sys.modules.pop("oi", None)
@@ -104,45 +106,6 @@ def test_parse_hl_ctx_impact_pxs_variants():
     assert short["impact_ask_px"] is None
     # absent key → both None
     assert oi._parse_hl_ctx({})["impact_bid_px"] is None
-
-
-def test_sleep_until_next_computes_boundary(monkeypatch):
-    slept = {}
-    monkeypatch.setattr(oi.time, "time", lambda: 1000.0)
-    monkeypatch.setattr(oi.time, "sleep", lambda s: slept.setdefault("s", s))
-    oi._sleep_until_next(60, 5)
-    # next 60s boundary after 1000 is 1020, +5 buffer = 1025 → sleep 25s
-    assert slept["s"] == 25.0
-
-
-def test_sleep_until_next_clamps_buffer_to_half_interval(monkeypatch):
-    # A 30s buffer on a 30s interval would fold the slot onto the boundary (1020, sleep 20);
-    # the clamp caps the buffer at interval//2=15 so the slot sits mid-period.
-    slept = {}
-    monkeypatch.setattr(oi.time, "time", lambda: 1000.0)
-    monkeypatch.setattr(oi.time, "sleep", lambda s: slept.setdefault("s", s))
-    oi._sleep_until_next(30, 30)
-    # slots are k*30 + min(30,15) = …975, 1005, 1035; the next after 1000 is 1005 → sleep 5s
-    assert slept["s"] == 5.0
-
-
-def test_sleep_until_next_keeps_slot_after_overrunning_boundary(monkeypatch):
-    # A dense cycle started at slot 990 (=960+30) runs 37s, ending at 1027 — past the 1020
-    # boundary but before its 1050 slot. It must wait for 1050 (23s, 60s cadence), not skip
-    # to 1110 (83s, 120s cadence).
-    slept = {}
-    monkeypatch.setattr(oi.time, "time", lambda: 1027.0)
-    monkeypatch.setattr(oi.time, "sleep", lambda s: slept.setdefault("s", s))
-    oi._sleep_until_next(60, 30)
-    assert slept["s"] == 23.0
-
-
-def test_sleep_until_next_on_slot_waits_full_interval(monkeypatch):
-    slept = {}
-    monkeypatch.setattr(oi.time, "time", lambda: 1050.0)
-    monkeypatch.setattr(oi.time, "sleep", lambda s: slept.setdefault("s", s))
-    oi._sleep_until_next(60, 30)
-    assert slept["s"] == 60.0
 
 
 # --- Slice B: insert/commit/rollback discipline via a fake conn ---------------
@@ -329,8 +292,9 @@ class _StopLoop(Exception):
     pass
 
 
-def _drive_one_cycle(monkeypatch, conn, universe, ctxs, pairs):
-    """Run exactly one iteration of _oi_loop_hyperliquid against a fake conn."""
+def _drive_one_cycle(monkeypatch, conn, universe, ctxs, pairs, clock=lambda: 1_700_000_000.0, slept=None):
+    """Run exactly one iteration of _oi_loop_hyperliquid against a fake conn. `slept`, if given,
+    collects the end-of-cycle pacing call's arguments."""
     from types import SimpleNamespace
     monkeypatch.setattr(oi, "connect_db", lambda dsn: conn)
     monkeypatch.setattr(oi, "_get_active_pairs", lambda c, name: pairs)
@@ -343,10 +307,12 @@ def _drive_one_cycle(monkeypatch, conn, universe, ctxs, pairs):
     monkeypatch.setattr(oi, "_heartbeat", lambda *a: hb.__setitem__("n", hb["n"] + 1))
 
     def stop(*a):
+        if slept is not None:
+            slept.append(a)
         raise _StopLoop
 
-    monkeypatch.setattr(oi, "_sleep_until_next", stop)
-    monkeypatch.setattr(oi.time, "time", lambda: 1_700_000_000.0)
+    monkeypatch.setattr(oi, "sleep_until_next_slot", stop)
+    monkeypatch.setattr(oi.time, "time", clock)
     cfg = SimpleNamespace(name="hyperliquid", market_type="perp", ccxt_class="hyperliquid",
                           oi_poll_interval_s=60)
     try:
@@ -358,6 +324,51 @@ def _drive_one_cycle(monkeypatch, conn, universe, ctxs, pairs):
 
 def _rows_for(conn, sql_marker):
     return [params for sql, params in conn.executed if sql_marker in sql]
+
+
+def _ticking_clock():
+    """time.time() stand-in returning 1000, 1001, 1002, … so a test can tell which call it got."""
+    state = {"t": 999.0}
+
+    def now():
+        state["t"] += 1
+        return state["t"]
+
+    return now
+
+
+def test_hl_loop_paces_from_its_cycle_start(monkeypatch):
+    universe, ctxs = _fixture_universe_ctxs()
+    slept = []
+    _drive_one_cycle(monkeypatch, FakeConn(), universe, ctxs, _pairs(), clock=_ticking_clock(), slept=slept)
+    # The cycle's start is the first clock read (1000), taken before any work, not a later one.
+    assert slept == [(60, oi.OI_POLL_BUFFER_S, 1000.0, "hyperliquid/oi")]
+
+
+@pytest.mark.parametrize("loop", ["hyperliquid", "bulk", "binance"])
+def test_oi_loops_pace_from_their_cycle_start_on_the_no_pairs_path(monkeypatch, loop):
+    from types import SimpleNamespace
+    slept = []
+
+    def stop(*a):
+        slept.append(a)
+        raise _StopLoop
+
+    monkeypatch.setattr(oi, "connect_db", lambda dsn: FakeConn())
+    monkeypatch.setattr(oi, "_get_active_pairs", lambda c, name: [])
+    monkeypatch.setattr(oi, "_heartbeat", lambda *a: None)
+    monkeypatch.setattr(oi, "sleep_until_next_slot", stop)
+    monkeypatch.setattr(oi.time, "time", _ticking_clock())
+    cfg = SimpleNamespace(name=loop, market_type="perp", ccxt_class=loop, oi_poll_interval_s=30,
+                          oi_dense_concurrency=1, rate_limit_priority_reserve=0)
+    run = {
+        "hyperliquid": lambda: oi._oi_loop_hyperliquid(cfg, "dsn"),
+        "bulk": lambda: oi._oi_loop_bulk(None, cfg, "dsn", None),
+        "binance": lambda: oi._oi_loop_binance(None, cfg, "dsn", None),
+    }[loop]
+    with pytest.raises(_StopLoop):
+        run()
+    assert slept == [(30, oi.OI_POLL_BUFFER_S, 1000.0, f"{loop}/oi")]
 
 
 def test_dual_write_happy_path(monkeypatch):
@@ -820,7 +831,7 @@ def test_binance_loop_skips_baseline_when_seed_fails(monkeypatch):
     def stop(*a):
         raise _StopLoop
 
-    monkeypatch.setattr(oi, "_sleep_until_next", stop)
+    monkeypatch.setattr(oi, "sleep_until_next_slot", stop)
 
     def fetch_funding_rates():  # named (not a lambda) so the spy records the real fn name
         return {}
@@ -858,7 +869,7 @@ def _drive_binance_reserve_cycle(monkeypatch, caplog, dense_pairs, reserve):
     def stop(*a):
         raise _StopLoop
 
-    monkeypatch.setattr(oi, "_sleep_until_next", stop)
+    monkeypatch.setattr(oi, "sleep_until_next_slot", stop)
 
     def fetch_funding_rates():
         return {}
@@ -912,7 +923,7 @@ def test_binance_loop_reserve_warning_is_edge_triggered_across_cycles(monkeypatc
             raise _StopLoop
 
     _remaining = iter(range(len(dense_by_cycle) - 1))  # allow N cycles, stop before the (N+1)th set
-    monkeypatch.setattr(oi, "_sleep_until_next", stop_when_drained)
+    monkeypatch.setattr(oi, "sleep_until_next_slot", stop_when_drained)
 
     def fetch_funding_rates():
         return {}

@@ -30,6 +30,7 @@ from rate_limiter import (
     RateLimiter,
     paced_call,
 )
+from slots import sleep_until_next_slot
 from status import query_active_pairs, upsert_loop_heartbeat
 
 from db import connect_db, create_exchange, maybe_reload_markets, safe_rollback
@@ -140,22 +141,6 @@ def _insert_hl_snapshot(conn, oi_rows, ctx_rows):
         ctx_n = _exec_rows(cur, INSERT_HL_CTX_SQL, ctx_rows)
     conn.commit()
     return oi_n, ctx_n
-
-
-def _sleep_until_next(interval_s, buffer_s):
-    """Sleep until the next slot (`k × interval_s + buffer`) strictly after now. Targeting the
-    next *boundary* plus the buffer instead would skip a slot whenever a cycle ends after a
-    boundary but before its buffer point — a 37s Binance dense cycle started at :30 ends at :07
-    and would wait until the following :30, halving the unbackfillable dense cadence to 120s.
-    The buffer is clamped to half the interval so the slot stays mid-period: at a sub-minute
-    cadence (Bybit/OKX 30s) the shared 30s buffer equals the interval and would fold the slot
-    back onto the boundary itself, polling at the instant the venue rolls its data."""
-    buffer_s = min(buffer_s, interval_s // 2)
-    now = time.time()
-    next_boundary = ((now - buffer_s) // interval_s + 1) * interval_s + buffer_s
-    sleep_s = next_boundary - now
-    log.info("[oi] Sleeping %.0fs until next %ds boundary", sleep_s, interval_s)
-    time.sleep(sleep_s)
 
 
 def _heartbeat(conn, config: ExchangeConfig, thread_name: str):
@@ -314,6 +299,7 @@ def _oi_loop_hyperliquid(config: ExchangeConfig, dsn: str):
     conn = connect_db(dsn)
 
     while True:
+        started = time.time()
         # Reconnect if needed
         if conn.closed:
             try:
@@ -329,13 +315,13 @@ def _oi_loop_hyperliquid(config: ExchangeConfig, dsn: str):
         except Exception:
             log.exception("[%s] Failed to query active pairs", thread_name)
             safe_rollback(conn)
-            _sleep_until_next(config.oi_poll_interval_s, OI_POLL_BUFFER_S)
+            sleep_until_next_slot(config.oi_poll_interval_s, OI_POLL_BUFFER_S, started, thread_name)
             continue
 
         if not pairs:
             log.info("[%s] No active pairs, sleeping", thread_name)
             _heartbeat(conn, config, thread_name)
-            _sleep_until_next(config.oi_poll_interval_s, OI_POLL_BUFFER_S)
+            sleep_until_next_slot(config.oi_poll_interval_s, OI_POLL_BUFFER_S, started, thread_name)
             continue
 
         # Build asset_id → pair lookup
@@ -360,7 +346,7 @@ def _oi_loop_hyperliquid(config: ExchangeConfig, dsn: str):
                 safe_rollback(conn)
 
         _heartbeat(conn, config, thread_name)
-        _sleep_until_next(config.oi_poll_interval_s, OI_POLL_BUFFER_S)
+        sleep_until_next_slot(config.oi_poll_interval_s, OI_POLL_BUFFER_S, started, thread_name)
 
 
 # ---------------------------------------------------------------------------
@@ -420,6 +406,7 @@ def _oi_loop_bulk(exchange, config: ExchangeConfig, dsn: str, rate_limiter: Rate
     conn = connect_db(dsn)
 
     while True:
+        started = time.time()
         if conn.closed:
             try:
                 conn = connect_db(dsn)
@@ -433,13 +420,13 @@ def _oi_loop_bulk(exchange, config: ExchangeConfig, dsn: str, rate_limiter: Rate
         except Exception:
             log.exception("[%s] Failed to query active pairs", thread_name)
             safe_rollback(conn)
-            _sleep_until_next(config.oi_poll_interval_s, OI_POLL_BUFFER_S)
+            sleep_until_next_slot(config.oi_poll_interval_s, OI_POLL_BUFFER_S, started, thread_name)
             continue
 
         if not pairs:
             log.info("[%s] No active pairs, sleeping", thread_name)
             _heartbeat(conn, config, thread_name)
-            _sleep_until_next(config.oi_poll_interval_s, OI_POLL_BUFFER_S)
+            sleep_until_next_slot(config.oi_poll_interval_s, OI_POLL_BUFFER_S, started, thread_name)
             continue
 
         active = {p["symbol"]: p for p in pairs}
@@ -468,7 +455,7 @@ def _oi_loop_bulk(exchange, config: ExchangeConfig, dsn: str, rate_limiter: Rate
                 safe_rollback(conn)
 
         _heartbeat(conn, config, thread_name)
-        _sleep_until_next(config.oi_poll_interval_s, OI_POLL_BUFFER_S)
+        sleep_until_next_slot(config.oi_poll_interval_s, OI_POLL_BUFFER_S, started, thread_name)
 
 
 # ---------------------------------------------------------------------------
@@ -733,6 +720,7 @@ def _oi_loop_binance(exchange, config: ExchangeConfig, dsn: str, rate_limiter: R
     dense_pool = None  # built lazily below when oi_dense_concurrency > 1; retried on failure
 
     while True:
+        started = time.time()
         # Lazy-build the isolated-session dense pool; retry each cycle on failure so a transient
         # init miss self-heals instead of disabling parallelism until restart (degraded =
         # sequential dense on the main exchange, which still collects, just slower).
@@ -757,13 +745,13 @@ def _oi_loop_binance(exchange, config: ExchangeConfig, dsn: str, rate_limiter: R
         except Exception:
             log.exception("[%s] Failed to query active pairs", thread_name)
             safe_rollback(conn)
-            _sleep_until_next(config.oi_poll_interval_s, OI_POLL_BUFFER_S)
+            sleep_until_next_slot(config.oi_poll_interval_s, OI_POLL_BUFFER_S, started, thread_name)
             continue
 
         if not pairs:
             log.info("[%s] No active pairs, sleeping", thread_name)
             _heartbeat(conn, config, thread_name)
-            _sleep_until_next(config.oi_poll_interval_s, OI_POLL_BUFFER_S)
+            sleep_until_next_slot(config.oi_poll_interval_s, OI_POLL_BUFFER_S, started, thread_name)
             continue
 
         if not seeded:
@@ -797,7 +785,7 @@ def _oi_loop_binance(exchange, config: ExchangeConfig, dsn: str, rate_limiter: R
             if not conn.closed:
                 safe_rollback(conn)
             _heartbeat(conn, config, thread_name)
-            _sleep_until_next(config.oi_poll_interval_s, OI_POLL_BUFFER_S)
+            sleep_until_next_slot(config.oi_poll_interval_s, OI_POLL_BUFFER_S, started, thread_name)
             continue
 
         dense = _binance_dense_set(
@@ -856,7 +844,7 @@ def _oi_loop_binance(exchange, config: ExchangeConfig, dsn: str, rate_limiter: R
             thread_name, dense_inserted, len(dense), base_inserted, len(due), cycle_s, weight,
         )
         _heartbeat(conn, config, thread_name)
-        _sleep_until_next(config.oi_poll_interval_s, OI_POLL_BUFFER_S)
+        sleep_until_next_slot(config.oi_poll_interval_s, OI_POLL_BUFFER_S, started, thread_name)
 
 
 # ---------------------------------------------------------------------------
