@@ -71,7 +71,8 @@ def test_poll_limit_floors_on_clock_skew():
 # --- _collect_pair wiring (real main) -----------------------------------------
 
 
-def _run_collect_pair(main_mod, monkeypatch, last_timestamp, weight_budget, poll_max_bars=None, results=None):
+def _run_collect_pair(main_mod, monkeypatch, last_timestamp, weight_budget, poll_max_bars=None, results=None,
+                      scan_from=None):
     """Drive the real _collect_pair with fetch_candles patched to capture its `limit` (and every
     call in `captured["calls"]`). `results` lists what successive fetches return (default: [])."""
     captured = {"calls": []}
@@ -96,7 +97,7 @@ def _run_collect_pair(main_mod, monkeypatch, last_timestamp, weight_budget, poll
     tf = SimpleNamespace(name="5m", interval_s=300, table="candles")
     pair = {"asset_id": "BTC", "symbol": "BTC/USDT:USDT", "native_symbol": "BTCUSDT",
             "market_type": "perp", "last_timestamp": last_timestamp}
-    main_mod._collect_pair(object(), pair, config, tf, None, None, "binance/5m")
+    main_mod._collect_pair(object(), pair, config, tf, None, None, "binance/5m", {} if scan_from is None else scan_from)
     return captured, fixed_now
 
 
@@ -146,24 +147,34 @@ def test_collect_pair_seed_is_not_window_capped(monkeypatch):
     assert captured["calls"] == [{"since_ms": None, "until_ms": None}]
 
 
-def test_collect_pair_capped_empty_window_steps_over_with_one_uncapped_poll(monkeypatch):
-    # A pair 10 days behind whose next 60 bars are empty would otherwise never advance its cursor.
+def test_collect_pair_empty_capped_window_moves_the_scan_past_it(monkeypatch):
+    # A cursor 10 days behind (older than the venue keeps, say): the first 60-bar window is empty.
+    # The next poll asks for the following 60 bars, never for since→now in one heavy request.
     main_mod = _load_real_main()
     stored = datetime.fromtimestamp(1_700_000_000.0 - 10 * 86400, tz=timezone.utc)
+    scan_from = {}
     captured, _ = _run_collect_pair(main_mod, monkeypatch, last_timestamp=stored, weight_budget=None,
-                                    poll_max_bars=60)
+                                    poll_max_bars=60, scan_from=scan_from)
     since = captured["calls"][0]["since_ms"]
-    assert captured["calls"] == [{"since_ms": since, "until_ms": since + 60 * 300 * 1000},
-                                 {"since_ms": since, "until_ms": None}]
+    window = 60 * 300 * 1000
+    assert captured["calls"] == [{"since_ms": since, "until_ms": since + window}]
+    assert scan_from == {"BTC/USDT:USDT": since + window + 1}
+    bar = {"timestamp": (since + window + 600_000) / 1000}
+    captured, _ = _run_collect_pair(main_mod, monkeypatch, last_timestamp=stored, weight_budget=None,
+                                    poll_max_bars=60, scan_from=scan_from, results=[[bar]])
+    assert captured["calls"] == [{"since_ms": since + window + 1, "until_ms": since + 2 * window + 1}]
+    assert scan_from == {}  # bars found: the stored cursor leads again
 
 
-def test_collect_pair_caught_up_empty_window_does_not_refetch(monkeypatch):
+def test_collect_pair_caught_up_empty_window_does_not_move_the_scan(monkeypatch):
     # Caught up (the 60-bar window reaches past now): an empty answer is just no new bar yet.
     main_mod = _load_real_main()
     stored = datetime.fromtimestamp(1_700_000_000.0 - 300, tz=timezone.utc)
+    scan_from = {}
     captured, _ = _run_collect_pair(main_mod, monkeypatch, last_timestamp=stored, weight_budget=None,
-                                    poll_max_bars=60)
+                                    poll_max_bars=60, scan_from=scan_from)
     assert len(captured["calls"]) == 1
+    assert scan_from == {}
 
 
 def test_fetch_candles_until_bounds_the_real_hl_request():
@@ -244,7 +255,7 @@ def test_collect_pair_threads_tf_table(monkeypatch):
     tf = SimpleNamespace(name="1m", interval_s=60, table="candles_1m")
     pair = {"asset_id": "BTC", "symbol": "B", "native_symbol": "B",
             "market_type": "perp", "last_timestamp": None}
-    main_mod._collect_pair(object(), pair, config, tf, None, object(), "binance/1m")
+    main_mod._collect_pair(object(), pair, config, tf, None, object(), "binance/1m", {})
     assert captured["table"] == "candles_1m"
 
 

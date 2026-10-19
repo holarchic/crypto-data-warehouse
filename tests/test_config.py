@@ -208,6 +208,18 @@ def test_unknown_table_raises_at_load():
         _parse_exchange("x", ex, tf_defs)
 
 
+@pytest.mark.parametrize("bad", [0, -60, True, 60.5, "60"])
+def test_poll_max_bars_rejects_anything_but_a_positive_int(bad):
+    ex = {"ccxt_class": "x", "btc_symbol": "B", "market_type": "perp", "poll_max_bars": bad}
+    with pytest.raises(ValueError, match="poll_max_bars must be a positive integer"):
+        _parse_exchange("x", ex, {})
+
+
+def test_poll_max_bars_defaults_to_uncapped():
+    ex = {"ccxt_class": "x", "btc_symbol": "B", "market_type": "perp"}
+    assert _parse_exchange("x", ex, {}).poll_max_bars is None
+
+
 def test_load_candle_tables_validates_bad_table(monkeypatch):
     # The MONITOR path (load_candle_tables) never runs _parse_exchange, so it must validate too —
     # else a bad table: reaches GAP_SQL_BY_TABLE[table] as a per-cycle KeyError (codex correctness).

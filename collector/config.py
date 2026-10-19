@@ -122,6 +122,14 @@ def _load_yaml():
         return yaml.safe_load(f)
 
 
+def _positive_int_or_none(exchange_name: str, key: str, value):
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+        raise ValueError(f"{exchange_name}.{key} must be a positive integer, got {value!r}")
+    return value
+
+
 def _parse_exchange(exchange_name: str, ex: dict, tf_defs: dict) -> ExchangeConfig:
     timeframes = []
     for tf_name in ex.get("supported_timeframes", []):
@@ -146,7 +154,7 @@ def _parse_exchange(exchange_name: str, ex: dict, tf_defs: dict) -> ExchangeConf
         options=ex.get("options", {}),
         timeframes=timeframes,
         rate_limit_weight_budget=ex.get("rate_limit_weight_budget"),
-        poll_max_bars=ex.get("poll_max_bars"),
+        poll_max_bars=_positive_int_or_none(exchange_name, "poll_max_bars", ex.get("poll_max_bars")),
         rate_limit_window_s=ex.get("rate_limit_window_s", 60),
         rate_limit_safety=ex.get("rate_limit_safety", 400),
         rate_limit_priority_reserve=ex.get("rate_limit_priority_reserve", 0),

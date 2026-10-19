@@ -431,6 +431,33 @@ def test_monitor_loop_heartbeat_reports_the_cycles_per_timeframe_stale_count(mon
     assert "2 stale" in heartbeats[0]
 
 
+def test_monitor_loop_retries_an_undelivered_gap_alert_next_cycle(monkeypatch):
+    # A 12h gap scan runs every few hours; a failed delivery must leave it due for the next cycle.
+    deliveries = iter([False, True])
+    attempts = []
+    cycles = {"n": 0}
+    monkeypatch.setattr(sys.modules["psycopg"], "connect", lambda *a, **k: _FakeConn())
+    monkeypatch.setattr(monitor, "fetch_status_rows", lambda conn: [])
+    monkeypatch.setattr(monitor, "_get_exchange_timeframe_pairs", lambda conn: [("binance", "12h")])
+    monkeypatch.setattr(monitor, "detect_gaps", lambda *a: [{"symbol": "BTC/USDT:USDT", "missing_count": 1,
+                                                             "gap_after": "t0", "gap_before": "t1"}])
+    monkeypatch.setattr(monitor, "should_send_heartbeat", lambda *a: False)
+    monkeypatch.setattr(monitor, "send_webhook", lambda url, text: attempts.append(text) or next(deliveries))
+    monkeypatch.setattr(monitor, "ping_healthcheck", lambda url: None)
+
+    def sleep(s):
+        cycles["n"] += 1
+        if cycles["n"] >= 3:
+            raise _StopMonitor
+
+    monkeypatch.setattr(monitor.time, "sleep", sleep)
+    try:
+        monitor.monitor_loop("dsn", {"12h": 43200}, "https://hook.invalid")
+    except _StopMonitor:
+        pass
+    assert len(attempts) == 2  # failed, retried next cycle, delivered; then in cooldown
+
+
 def test_monitor_loop_retries_an_undelivered_heartbeat_next_cycle(monkeypatch):
     # A failed delivery must not mark the week's heartbeat as sent.
     deliveries = iter([False, True])
