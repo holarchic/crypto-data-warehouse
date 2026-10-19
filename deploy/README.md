@@ -91,7 +91,7 @@ Pass: returns ≥1 candle with all OHLCV fields populated, correct exchange/symb
 | Server setup | `./deploy/setup.sh [CLIENT_IP...]` |
 | Run discovery (prod) | `docker compose -f docker-compose.yml -f docker-compose.prod.yml --profile discovery run --rm discovery` |
 | Offsite backup now | `./scripts/backup-offsite.sh` (see Offsite backups) |
-| List offsite snapshots | `(set -a; . /etc/candle-collector/restic.env; set +a; restic snapshots)` |
+| List offsite snapshots | `(. scripts/offsite-lib.sh; restic_run snapshots)` |
 
 ### Code updates
 
@@ -121,12 +121,13 @@ TimescaleDB auto-tunes `max_connections` low (~25 on 8GB). Override via `command
 
 ## Offsite backups
 
-`scripts/backup-offsite.sh` streams `pg_dump` from the db container into a [restic](https://restic.net) repository in an S3-compatible bucket every night at 05:30 UTC. That slot is clear of discovery, the HL pull and the compression jobs.
+`scripts/backup-offsite.sh` streams `pg_dump` from the db container into a [restic](https://restic.net) repository in a bucket every night at 05:30 UTC. That slot is clear of discovery, the HL pull and the compression jobs. On Backblaze B2, restic reaches the bucket through [rclone](https://rclone.org)'s native B2 backend; B2's S3 endpoint can cut off reads of intact files.
 
 - **No local copy:** the dump never touches local disk.
 - **Encrypted:** restic encrypts the repository with its password.
 - **Dedup:** the dump is uncompressed, so restic dedups the unchanged history night to night.
 - **Retention:** 7 daily, 5 weekly and 12 monthly snapshots, then `restic check`.
+- **Read-back:** Sunday runs also read back a quarter of the stored data, a different quarter each week, so every file in the bucket is read within about 4 weeks.
 - **Paging:** a failed run pages through `WEBHOOK_URL`. `host-monitor.sh` pages when the last success is more than 26 h old.
 - **RPO:** about 24 h.
 
@@ -134,31 +135,35 @@ TimescaleDB auto-tunes `max_connections` low (~25 on 8GB). Override via `command
 
 1. **Bucket.** Create a private bucket for the backups alone. Add a lifecycle rule that deletes hidden (noncurrent) versions after 30 days.
 2. **Key.** Create a key restricted to that bucket that can list, read and write but **not delete file versions**. On Backblaze B2 that's `listBuckets,listFiles,readFiles,writeFiles`.
-   - restic's S3 backend removes files by hiding them, so prune and lock cleanup work.
+   - restic removes files by hiding them, so prune and lock cleanup work. Over rclone that holds because `restic_run` (`scripts/offsite-lib.sh`) starts rclone without restic's default `--b2-hard-delete`. Run every manual restic command through `restic_run`, as below: plain `restic` over rclone can't remove its own lock with this key.
    - A stolen key can hide files but can't destroy versions, which leaves 30 days to recover.
 3. **Credentials.** Write them to `/etc/candle-collector/` (directory `700`, files `600`), outside the checkout:
 
    ```bash
-   # /etc/candle-collector/restic.env
-   RESTIC_REPOSITORY=s3:https://<s3-endpoint>/<bucket>/candle-collector
+   # /etc/candle-collector/restic.env: one NAME=value per line, LF line endings
+   RESTIC_REPOSITORY=rclone:b2:<bucket>/candle-collector
    RESTIC_PASSWORD_FILE=/etc/candle-collector/restic-password
-   AWS_ACCESS_KEY_ID=<key id>
-   AWS_SECRET_ACCESS_KEY=<key>
+   RCLONE_CONFIG_B2_TYPE=b2
+   RCLONE_CONFIG_B2_ACCOUNT=<key id>
+   RCLONE_CONFIG_B2_KEY=<key>
    ```
 
+   The `RCLONE_CONFIG_B2_*` lines define rclone's `b2` remote, so no rclone config file is needed. For another S3-compatible store, use `RESTIC_REPOSITORY=s3:https://<s3-endpoint>/<bucket>/candle-collector` with `AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY` instead. The dump command never sees any variable this file sets.
+
    `restic-password` holds a long random password (`openssl rand -base64 48`). **Keep a copy of the password and repository off the server**, in a password manager. A lost server takes its copy with it, and without the password the backups can't be read.
-4. **Install restic and initialise the repository:**
+4. **Install restic and rclone, and initialise the repository:**
 
    ```bash
    ./deploy/install-restic.sh
-   (set -a; . /etc/candle-collector/restic.env; set +a; restic init)
+   ./deploy/install-rclone.sh   # pinned: Ubuntu's rclone can't authorize a bucket-restricted B2 key
+   (. scripts/offsite-lib.sh; restic_run init)
    ./scripts/backup-offsite.sh   # the first run, by hand
    ```
 5. **Cron.** Add the cron line from `deploy.sh`. `host-monitor.sh` pages "never succeeded" until the first run completes.
 
 ### Restore drill
 
-`scripts/restore-drill.sh` restores the latest snapshot into a throwaway TimescaleDB container on any machine with Docker, restic and a copy of the env file, and never touches prod. It:
+`scripts/restore-drill.sh` restores the latest snapshot into a throwaway TimescaleDB container on any machine with Docker, restic, rclone (a current release: Ubuntu 24.04's 1.60 can't authorize a bucket-restricted B2 key) and a copy of the env file, and never touches prod. It:
 
 - runs the strict restore;
 - checks that job owners match table owners, a restored compression job runs, and a new `candles_1m` chunk lands in `ts_1m`;
@@ -176,8 +181,8 @@ The drill's fresh-target steps on a new host. Do **not** use `deploy.sh` or `scr
 
 ```bash
 DC=(docker compose -f docker-compose.yml -f docker-compose.prod.yml)
-# Loads the credentials for one restic command only.
-restic_env() { (set -a; . /root/restore/restic.env; set +a; exec restic "$@"); }
+# One restic command with the restore credentials, through the backup's own restic_run.
+restic_env() { (RESTIC_ENV_FILE=/root/restore/restic.env; . scripts/offsite-lib.sh; restic_run "$@"); }
 # SQL as the candles superuser; pass -d postgres or -d candle_collector.
 db_sql() { "${DC[@]}" exec -T db psql -X -v ON_ERROR_STOP=1 -U candles "$@"; }
 ```
@@ -190,7 +195,7 @@ db_sql() { "${DC[@]}" exec -T db psql -X -v ON_ERROR_STOP=1 -U candles "$@"; }
    - Mount the volume at `/mnt/pgvol` (fstab) before anything starts the db container. Docker's bind mount doesn't pick up a mount made after the container starts.
    - Create empty `/mnt/pgvol/pgdata_1m` and `/mnt/pgvol/restore`, owned by uid 70 (the image's `postgres`).
 2. **Credentials and snapshot.**
-   - Run `./deploy/install-restic.sh`.
+   - Run `./deploy/install-restic.sh` and `./deploy/install-rclone.sh`.
    - Copy the off-server `restic.env` and `restic-password` into `/root/restore/`, with `RESTIC_PASSWORD_FILE` pointing there. A new bucket key from the account works too; only the password must be the original.
    - Pick the snapshot with `restic_env snapshots --host candle-collector --latest 1`. Note its ID and its `timescaledb-<ver>` and `pg<major>` tags.
 3. **Image before first start.** On first start, the image installs TimescaleDB in every database at its own version, and the restore needs the snapshot's.
@@ -217,10 +222,14 @@ db_sql() { "${DC[@]}" exec -T db psql -X -v ON_ERROR_STOP=1 -U candles "$@"; }
    - Run `./scripts/backup-offsite.sh` once, then delete the dump.
    - Never run `compose pull db` or `deploy.sh` on this host unless you mean to move TimescaleDB versions.
 
-**Stuck repository lock.** Each run clears stale locks itself. Before a manual `restic unlock --remove-all`, check that no backup or drill is running: `pgrep restic` on the server, and any machine running a drill.
+**Stuck repository lock.** Each run clears stale locks itself. Before a manual `(. scripts/offsite-lib.sh; restic_run unlock --remove-all)`, check that no backup or drill is running: `pgrep restic` on the server, and any machine running a drill.
+
+**Read-back failure.** A Sunday page names the quarter that failed, as `--read-data-subset n/4`. A later night's success refreshes the success marker without rereading that quarter, so the page is not closed by it.
+1. Fetch each failing pack through the bucket's native API and compare its SHA-256 with its file name. A match means the transport cut the read off, not that the pack is damaged; repair nothing.
+2. Close the page only when `(. scripts/offsite-lib.sh; restic_run check --read-data-subset n/4)` rereads that quarter clean.
 
 **Compromised server.**
 1. Revoke the bucket key first.
 2. With the account's master key, restore each file's last version from before the compromise. Unhiding isn't enough if files were overwritten.
-3. Run `restic check --read-data`, which flags any altered pack, since restic's file names are content hashes.
+3. Run `(. scripts/offsite-lib.sh; restic_run check --read-data)`, which flags any altered pack, since restic's file names are content hashes.
 4. Issue a new key.

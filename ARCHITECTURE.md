@@ -90,19 +90,20 @@ Schema migrations and TimescaleDB hypertable setup. Candles hypertable partition
 
 A nightly host-cron job at 05:30 UTC, outside compose, that does nothing until `/etc/candle-collector/restic.env` exists.
 
-- **Dump.** It streams `pg_dump --format=custom --compress=0` from the db container into a restic repository in an S3-compatible bucket, via `restic backup --stdin-from-command`. A failed dump therefore makes no snapshot.
+- **Dump.** It streams `pg_dump --format=custom --compress=0` from the db container into a restic repository in a bucket, via `restic backup --stdin-from-command`. A failed dump therefore makes no snapshot.
   - Snapshots carry a fixed `--host candle-collector` and `timescaledb-<ver>`/`pg<major>` tags.
   - Retention is 7 daily, 5 weekly and 12 monthly snapshots, pruned nightly.
-- **After the dump.** `restic check`, then a success marker (`/var/lib/candle-collector/backup-ok`).
-- **Shared contract.** `scripts/offsite-lib.sh` is sourced by the backup, the drill and the monitor. It owns the env-file and marker paths, the snapshot host and file name, and `restic_run`.
-- **Credentials.** `restic_run` keeps the bucket credentials in restic's process only, and every caller handles its failure. `env -u` strips them from the dump command, so compose keeps reading the HL pull's `AWS_*` from `.env`.
+- **After the dump.** `restic check`, then a success marker (`/var/lib/candle-collector/backup-ok`). On Sundays the check adds `--read-data-subset n/4` from `read_back_subset` (ISO week mod 4, plus 1), so the stored data is read back a quarter at a time.
+- **Shared contract.** `scripts/offsite-lib.sh` is sourced by the backup, the drill and the monitor. It owns the env-file and marker paths, the snapshot host and file name, `restic_run`, `restic_strip_env_args` and `read_back_subset`.
+- **Transport.** On B2 the repository is `rclone:b2:…`: restic starts rclone, whose `b2` remote is defined by `RCLONE_CONFIG_B2_*` in the env file. `restic_run` overrides restic's `rclone.args` default to drop `--b2-hard-delete`, so removals are hides and the no-`deleteFiles` key works; other backends ignore it.
+- **Credentials.** `restic_run` keeps the env file's variables in restic's process and the rclone it starts, and every caller handles its failure. The dump command runs under `env` with every name `restic_strip_env_args` reads from the env file removed, so compose keeps reading the HL pull's `AWS_*` from `.env`.
 - **Locking.** A local `flock` stops runs from overlapping, and `restic unlock` clears stale locks only.
 - **Alerts.** Each restic step pages its own failure through `fail()`, and the `ERR` trap pages any other failing command. `deploy/host-monitor.sh` pages on a marker older than 26 h, with its own 6 h reminder file and a recovery ping. Reminder state moves only on a delivered page.
 - **Webhook.** `scripts/webhook-lib.sh` is the host scripts' alert transport, used by `backup.sh`, `backup-offsite.sh` and `host-monitor.sh`. It reads `WEBHOOK_URL` from the environment or `.env`, trimmed the way compose trims it, and posts both `text` (Slack) and `content` (Discord), as `collector/monitor.py` does. It returns whether the page was delivered.
 - **Drill.** `scripts/restore-drill.sh` restores the newest snapshot, by parsed instant, into a throwaway container of the tagged image. It cleans up only the run directory and container it created, and the container's PGDATA volume with it. The target mirrors prod: the `candles` superuser, a `ts_1m` tablespace, a `template0` database and the exact extension version.
   - The restore runs `--exit-on-error`. The drill then checks owners, runs a restored compression job, and confirms a new `candles_1m` chunk lands in `ts_1m`.
   - Last, it prints `scripts/drill-counts.sql`: counts over a window that only grows, so prod's counts before and after the dump bracket them.
-- **Installer.** `deploy/install-restic.sh` installs a SHA-256-pinned restic release.
+- **Installers.** `deploy/install-restic.sh` and `deploy/install-rclone.sh` each install a SHA-256-pinned release.
 
 ## Data Flow
 
