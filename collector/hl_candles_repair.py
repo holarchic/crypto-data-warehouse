@@ -7,9 +7,9 @@ minutes, 13% for BTC, measured 2026-10-19). This one-shot (`python -m hl_candles
 by cron) replaces each active coin's recent 1m bars with REST `candleSnapshot`'s closed values.
 
 **Budget.** HL counts REST and WS `post` requests against one per-IP weight budget (1200/min). In
-its busiest minute the collector spends ~1,110 of it (50 limiter-paced polls of ~21 weight at its
-1.2 s spacing, the 20-weight OI snapshot, which bypasses that limiter, and a 40-weight perp-only
-markets reload), so a minute holding one of this job's calls must leave room for the largest, 46.
+its busiest minute the collector spends ~1,131 of it (51 limiter-paced candle requests, each capped
+at 21, the 20-weight OI snapshot, which bypasses that limiter, and a 40-weight perp-only markets
+reload), so a minute holding one of this job's calls must leave room for the largest, 46.
 The job trickles: every call it makes is charged `20 + ceil(minutes / 60)` and the next call waits
 `weight × 60 / budget` seconds (an average 20 weight/min, one 46-weight call per 26 h slice every
 138 s). A 429 backs off and halves the budget for the rest of the run.
