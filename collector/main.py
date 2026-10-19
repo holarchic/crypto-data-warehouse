@@ -128,8 +128,11 @@ def _collect_pair(exchange, pair, config, tf, rate_limiter, conn, thread_name, s
     }
     stored_last = pair["last_timestamp"]
     if stored_last is None:
-        # Seed: fetch max history the exchange will return
+        # Seed: fetch max history the exchange will return. A window-capped venue walks the same
+        # depth forward one capped window a poll instead of one heavy tail request.
         since_ms = None
+        if config.poll_max_bars is not None:
+            since_ms = int(time.time() * 1000) - CANDLE_SEED_LIMIT * tf.interval_s * 1000
         limit = CANDLE_SEED_LIMIT
         label = "Seed"
     else:
@@ -236,6 +239,9 @@ def collect_loop(exchange, config: ExchangeConfig, tf: TimeframeConfig, dsn: str
             pairs = []
         if not pairs:
             pairs = _btc_fallback_pairs(config, exchange)
+        active_symbols = {p["symbol"] for p in pairs}
+        for symbol in [s for s in scan_from if s not in active_symbols]:
+            del scan_from[symbol]
 
         log.info("[%s] Cycle: %d active pairs", thread_name, len(pairs))
 
