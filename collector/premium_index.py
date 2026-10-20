@@ -111,6 +111,7 @@ def _heartbeat(conn, config: ExchangeConfig, thread_name: str) -> None:
     that runs but whose API calls persistently fail keeps a fresh heartbeat (same as funding/oi)."""
     try:
         upsert_loop_heartbeat(conn, config.name, config.market_type, PREMIUM_LOOP)
+        conn.commit()
     except Exception:
         log.exception("[%s] Heartbeat upsert failed", thread_name)
         if not conn.closed:

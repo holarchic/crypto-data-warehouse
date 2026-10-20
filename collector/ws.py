@@ -140,6 +140,7 @@ def _heartbeat(runtime: _WSRuntime, config: ExchangeConfig, spec: WSFeedSpec, ds
         return
     try:
         upsert_loop_heartbeat(runtime.conn, config.name, config.market_type, spec.loop_tf)
+        runtime.conn.commit()
     except Exception:
         log.exception("[%s] Heartbeat upsert failed", thread_name)
         _guarded_rollback(runtime)

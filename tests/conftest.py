@@ -9,7 +9,8 @@ for mod in ["psycopg", "psycopg.rows", "psycopg_pool", "dotenv"]:
         sys.modules[mod] = MagicMock()
 
 # Internal modules that cause circular imports
-# Stub before any collector module loads so `from db import connect_db` etc. resolve to mocks
-for mod in ["db", "main", "oi", "status", "backoff"]:
+# Stub before any collector module loads so `from db import connect_db` etc. resolve to mocks.
+# `status` stays real: it imports only the stdlib, and consumers' tests need its `Instrument`.
+for mod in ["db", "main", "oi", "backoff"]:
     if mod not in sys.modules:
         sys.modules[mod] = MagicMock()

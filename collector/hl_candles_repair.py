@@ -376,6 +376,7 @@ def active_pairs(conn) -> list[dict]:
 
 def advance_cursor(conn, end_ms: int) -> None:
     upsert_status_success(conn, EXCHANGE, MARKET_TYPE, LOOP_SENTINEL_SYMBOL, CANDLE_REPAIR, end_ms / 1000)
+    conn.commit()
 
 
 @dataclass

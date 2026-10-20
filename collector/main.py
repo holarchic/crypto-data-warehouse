@@ -80,6 +80,7 @@ INSERT_SQL = {table: _INSERT_TEMPLATE.format(table=table) for table in CANDLE_TA
 
 
 def insert_candles(conn, candles, table="candles"):
+    """Insert inside the caller's transaction; returns the inserted count."""
     if not candles:
         return 0
     sql = INSERT_SQL[table]  # KeyError on an unknown table = fail fast (config-validated at load)
@@ -88,7 +89,6 @@ def insert_candles(conn, candles, table="candles"):
         for row in candles:
             cur.execute(sql, row)
             inserted += cur.rowcount
-    conn.commit()
     return inserted
 
 
@@ -167,9 +167,12 @@ def _collect_pair(exchange, pair, config, tf, rate_limiter, conn, thread_name, s
             scan_from[pair["symbol"]] = until_ms + 1
         else:
             scan_from.pop(pair["symbol"], None)
+    # Bars and cursor commit together: a failed cursor write rolls the bars back with it, and the
+    # next poll re-fetches the same window.
     inserted = insert_candles(conn, candles, tf.table)
     last_ts = max((c["timestamp"] for c in candles), default=None) if candles else None
     upsert_status_success(conn, config.name, market_info["market_type"], pair["symbol"], tf.name, last_ts, asset_id=market_info["asset_id"])
+    conn.commit()
 
     log.info("[%s] %s %s: fetched=%d inserted=%d", thread_name, label, pair["asset_id"], len(candles), inserted)
     return True
@@ -201,6 +204,7 @@ def _record_pair_error(conn, config: ExchangeConfig, pair, tf: TimeframeConfig, 
     try:
         upsert_status_error(conn, config.name, pair.get("market_type", config.market_type),
                             pair["symbol"], tf.name, str(exc))
+        conn.commit()
     except Exception:
         safe_rollback(conn)
 

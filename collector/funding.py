@@ -200,6 +200,7 @@ def _heartbeat(conn, config: ExchangeConfig, thread_name: str):
     """
     try:
         upsert_loop_heartbeat(conn, config.name, config.market_type, FUNDING_LOOP)
+        conn.commit()
     except Exception:
         log.exception("[%s] Heartbeat upsert failed", thread_name)
         if not conn.closed:

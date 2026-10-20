@@ -8,8 +8,11 @@ import importlib.util
 from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import MagicMock
 
 import config as _config_mod  # real collector module — gives us the collector dir
+import pytest
+import status
 from candles import (
     CANDLE_LIMIT_MARGIN,
     CANDLE_LIMIT_MIN,
@@ -17,6 +20,8 @@ from candles import (
     poll_limit,
 )
 from rate_limiter import binance_kline_weight
+
+from tests.test_status import RecordingConn
 
 _MAIN_PATH = Path(_config_mod.__file__).parent / "main.py"
 
@@ -97,7 +102,7 @@ def _run_collect_pair(main_mod, monkeypatch, last_timestamp, weight_budget, poll
     tf = SimpleNamespace(name="5m", interval_s=300, table="candles")
     pair = {"asset_id": "BTC", "symbol": "BTC/USDT:USDT", "native_symbol": "BTCUSDT",
             "market_type": "perp", "last_timestamp": last_timestamp}
-    main_mod._collect_pair(object(), pair, config, tf, None, None, "binance/5m", {} if scan_from is None else scan_from)
+    main_mod._collect_pair(object(), pair, config, tf, None, MagicMock(), "binance/5m", {} if scan_from is None else scan_from)
     return captured, fixed_now
 
 
@@ -233,7 +238,7 @@ def test_capped_hl_requests_return_at_most_poll_max_bars_raw_candles(monkeypatch
     for last in (behind, None):  # then a seed
         pair = {"asset_id": "BTC", "symbol": "BTC/USDC:USDC", "native_symbol": "", "market_type": "perp",
                 "last_timestamp": last}
-        main_mod._collect_pair(exchange, pair, config, tf, main_mod.RateLimiter(0), None, "hyperliquid/5m", {})
+        main_mod._collect_pair(exchange, pair, config, tf, main_mod.RateLimiter(0), MagicMock(), "hyperliquid/5m", {})
     assert raw_counts == [60, 60]
 
 
@@ -286,8 +291,58 @@ def test_collect_pair_threads_tf_table(monkeypatch):
     tf = SimpleNamespace(name="1m", interval_s=60, table="candles_1m")
     pair = {"asset_id": "BTC", "symbol": "B", "native_symbol": "B",
             "market_type": "perp", "last_timestamp": None}
-    main_mod._collect_pair(object(), pair, config, tf, None, object(), "binance/1m", {})
+    main_mod._collect_pair(object(), pair, config, tf, None, MagicMock(), "binance/1m", {})
     assert captured["table"] == "candles_1m"
+
+
+# --- one transaction per pair: bars and cursor commit together -------------------------
+
+
+def _bars(n):
+    return [{"exchange": "binance", "market_type": "perp", "asset_id": "BTC", "symbol": "B", "native_symbol": "B",
+             "timeframe": "5m", "timestamp": 1_699_999_000.0 + 300 * i, "open": 1, "high": 1, "low": 1, "close": 1,
+             "volume": 1, "quote_volume": None, "trades": None} for i in range(n)]
+
+
+def _collect_into(main_mod, monkeypatch, conn):
+    monkeypatch.setattr(main_mod, "fetch_candles", lambda *a, **k: _bars(2))
+    config = SimpleNamespace(name="binance", market_type="perp", rate_limit_weight_budget=None, poll_max_bars=None)
+    tf = SimpleNamespace(name="5m", interval_s=300, table="candles")
+    pair = {"asset_id": "BTC", "symbol": "B", "native_symbol": "B", "market_type": "perp", "last_timestamp": None}
+    main_mod._collect_pair(object(), pair, config, tf, None, conn, "binance/5m", {})
+    return config, tf, pair
+
+
+def test_collect_pair_commits_bars_and_cursor_once(monkeypatch):
+    main_mod = _load_real_main()
+    conn = RecordingConn()
+    _collect_into(main_mod, monkeypatch, conn)
+    assert [e[0] for e in conn.events] == ["execute", "execute", "execute", "commit"]
+    assert all("INSERT INTO candles (" in e[1] for e in conn.events[:2])
+    assert conn.events[2][1] == status.UPSERT_SUCCESS_SQL
+
+
+class _CursorWriteFails(RecordingConn):
+    closed = False
+
+    def execute(self, sql, params=None):
+        super().execute(sql, params)
+        if sql == status.UPSERT_SUCCESS_SQL:
+            raise RuntimeError("cursor write failed")
+
+
+def test_a_failed_cursor_write_rolls_the_bars_back_then_commits_the_error(monkeypatch):
+    main_mod = _load_real_main()
+    monkeypatch.setattr(main_mod, "safe_rollback", lambda conn: conn.rollback())  # db.safe_rollback's effect
+    conn = _CursorWriteFails()
+    with pytest.raises(RuntimeError) as failure:
+        _collect_into(main_mod, monkeypatch, conn)
+    assert "commit" not in [e[0] for e in conn.events]
+    config, tf, pair = SimpleNamespace(name="binance", market_type="perp"), SimpleNamespace(name="5m"), {"symbol": "B"}
+    main_mod._record_pair_error(conn, config, pair, tf, failure.value)
+    tail = conn.events[3:]
+    assert [e[0] for e in tail] == ["rollback", "execute", "commit"]
+    assert tail[1][1] == status.UPSERT_ERROR_SQL
 
 
 # --- collect_loop pacing: each cycle paces from its own start ---------------------
