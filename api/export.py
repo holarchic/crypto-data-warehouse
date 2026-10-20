@@ -4,10 +4,11 @@ Owns the byte-contract between cc's landed tables and the backtester's frozen se
 backtester does NOT convert on ingest — it reads the raw exported parquet directly and validates each
 feed by a structural hash over schema(cols+types) + row content. The hash name-sorts the schema and
 sums per-row digests commutatively (feed_provenance.rs), so column and row ORDER do not affect it —
-what must match the seed is the column names + types, and SQL NULL must be written as a NaN *value*
-(null_count stays 0), not a parquet-null (a parquet-null changes the column's null-mask, which the
-per-cell row digest sees). cc writes columns in seed order anyway as a parity convention. Per feed,
-one FeedSpec holds the seed schema + the cc->seed column map.
+what must match the seed is the column names + types, and a SQL NULL must become exactly what the seed
+holds there (a NaN *value*, a seed default, or a refusal: per column, see `_KINDS`), never a parquet-null
+(a parquet-null changes the column's null-mask, which the per-cell row digest sees). cc writes columns in
+seed order anyway as a parity convention. Per feed, one FeedSpec holds the seed schema + the cc->seed
+column map.
 
 The module also builds each feed's SQL (`feed_query`), so the query and the serializer that consumes its
 rows are one contract. Kept free of fastapi/psycopg so it unit-tests against REAL pyarrow (a stubbed lib
@@ -19,6 +20,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from io import BytesIO
 from math import nan
+from types import MappingProxyType
 
 import pyarrow as pa
 import pyarrow.parquet as pq
@@ -53,13 +55,24 @@ class KindSpec:
     default_on_null: object  # a fill value (nan) or RAISE
 
 
-_KINDS: dict[str, KindSpec] = {
+_KINDS = MappingProxyType({
     "string": KindSpec(pa.string(), RAISE),
     "epoch_ms": KindSpec(pa.int64(), RAISE),  # cc timestamptz -> floor-to-ms epoch int64; ts is NOT NULL
     "float": KindSpec(pa.float64(), nan),  # SQL NULL -> NaN value (overridable per column via on_null)
     "native_symbol": KindSpec(pa.string(), RAISE),  # ccxt symbol -> exchange-native (BTC/USDT:USDT -> BTCUSDT)
     "int": KindSpec(pa.int64(), RAISE),  # BIGINT identity pass-through (oid/tid) — NOT epoch-converted
-}
+})
+
+# A resampled column's aggregate over its bucket's source rows (TimescaleDB first/last order by time).
+# Each is wrapped so a NULL anywhere in the bucket makes the result NULL: max/min skip NULLs, and a
+# skipped writer-bug NULL would otherwise export a plausible bar instead of reaching the column's RAISE.
+_AGG_SQL = MappingProxyType({
+    "first": "first({cc}, {ts})",
+    "last": "last({cc}, {ts})",
+    "max": "max({cc})",
+    "min": "min({cc})",
+})
+_BUCKET_TIMES = ("bucket_open", "bucket_close")  # a resampled column holding its bucket's open/close time
 
 
 @dataclass(frozen=True)
@@ -71,6 +84,14 @@ class Column:
     kind: str  # ∈ _KINDS — drives BOTH the arrow type and the cc->seed transform
     on_null: object = _UNSET  # SQL NULL -> this fill value, or RAISE; _UNSET -> the kind's _KINDS default
     agg: str | None = None  # resampled feeds only: ∈ _AGG_SQL or _BUCKET_TIMES; None = a group key
+
+    def __post_init__(self):
+        # Validated once, when the literal spec is built: an unregistered kind would mis-convert silently
+        # (the kind is explicit, never inferred), and an unknown agg would reach the SQL.
+        if self.kind not in _KINDS:
+            raise ValueError(f"unknown column kind {self.kind!r} for seed column {self.seed!r}")
+        if self.agg is not None and self.agg not in _AGG_SQL and self.agg not in _BUCKET_TIMES:
+            raise ValueError(f"unknown agg {self.agg!r} for seed column {self.seed!r}")
 
     @property
     def arrow(self) -> pa.DataType:
@@ -204,23 +225,12 @@ _BINANCE_PREMIUM_INDEX = FeedSpec(
     resample=Resample(bucket_s=3600, source_s=300),
 )
 
-FEED_SPECS: dict[str, FeedSpec] = {
+FEED_SPECS = MappingProxyType({
     "hl_asset_ctxs": _HL_ASSET_CTXS,
     "binance_oi": _BINANCE_OI,
     "hl_liquidations": _HL_LIQUIDATIONS,
     "binance_premium_index": _BINANCE_PREMIUM_INDEX,
-}
-
-# A resampled column's aggregate over its bucket's source rows (TimescaleDB first/last order by time).
-# Each is wrapped so a NULL anywhere in the bucket makes the result NULL: max/min skip NULLs, and a
-# skipped writer-bug NULL would otherwise export a plausible bar instead of reaching the column's RAISE.
-_AGG_SQL = {
-    "first": "first({cc}, {ts})",
-    "last": "last({cc}, {ts})",
-    "max": "max({cc})",
-    "min": "min({cc})",
-}
-_BUCKET_TIMES = ("bucket_open", "bucket_close")
+})
 _EPOCH = datetime(1970, 1, 1, tzinfo=timezone.utc)
 
 
@@ -273,15 +283,12 @@ def _resampled_query(spec: FeedSpec, start: datetime, end: datetime, filters: li
 
 
 def _resampled_expr(col: Column, ts: str, bucket: str, r: Resample) -> str:
-    """One resampled column's SQL expression (see `_AGG_SQL`)."""
     if col.agg is None:
         return col.cc
     if col.agg == "bucket_open":
         return bucket
     if col.agg == "bucket_close":
         return f"{bucket} + INTERVAL '{r.bucket_s} seconds' - INTERVAL '1 millisecond'"
-    if col.agg not in _AGG_SQL:
-        raise ValueError(f"unknown agg {col.agg!r} for seed column {col.seed!r}")
     return f"CASE WHEN count({col.cc}) = count(*) THEN {_AGG_SQL[col.agg].format(cc=col.cc, ts=ts)} END"
 
 
@@ -322,10 +329,7 @@ def _seed_value(col: Column, v: object) -> object:
 def _column_array(col: Column, rows: list[dict]) -> pa.Array:
     """Build one seed column's arrow array from the dict rows via `_seed_value`. Direct-key access
     `row[col.cc]` is fail-closed (a missing key raises, surfacing a spec/SELECT drift, vs `.get()`
-    silently None-filling). An unregistered `kind` raises here (not a silent mis-convert) — the kind
-    is explicit, never inferred."""
-    if col.kind not in _KINDS:
-        raise ValueError(f"unknown column kind {col.kind!r} for seed column {col.seed!r}")
+    silently None-filling)."""
     return pa.array([_seed_value(col, row[col.cc]) for row in rows], type=col.arrow)
 
 

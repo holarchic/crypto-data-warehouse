@@ -9,7 +9,7 @@ Two layers:
 
 import ast
 import math
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from io import BytesIO
 from pathlib import Path
 
@@ -152,11 +152,8 @@ def test_missing_mapped_column_fails_closed():
 def test_unknown_column_kind_fails_closed():
     # the transform is chosen by explicit `kind`, not inferred from the arrow type — an unregistered
     # kind (e.g. a future feed's column left mis-declared) must raise, not silently mis-convert.
-    try:
-        export._column_array(export.Column("x", "x", "bogus"), [{"x": 1}])
-    except ValueError:
-        return
-    raise AssertionError("expected ValueError on an unknown column kind")
+    with pytest.raises(ValueError, match="unknown column kind"):
+        export.Column("x", "x", "bogus")
 
 
 # ---- binance_oi feed (open_interest -> binance-oi-metrics seed) ----
@@ -483,14 +480,13 @@ def test_resample_rejects_widths_unsafe_to_format_into_sql(bucket_s, source_s):
         export.Resample(bucket_s=bucket_s, source_s=source_s)
 
 
-def test_unknown_agg_fails_closed():
-    spec = export.FEED_SPECS["binance_premium_index"]
-    bad = export.Column("x", "x", "float", agg="median")
+def test_unknown_agg_fails_at_spec_construction():
     with pytest.raises(ValueError, match="unknown agg"):
-        export._resampled_expr(bad, "timestamp", "b", spec.resample)
+        export.Column("x", "x", "float", agg="median")
 
 
-def test_ceil_to_keeps_a_boundary_and_rounds_anything_past_it_up():
+def test_premium_bound_just_past_the_hour_rounds_to_the_next():
     on = datetime(2026, 7, 6, 11, 0, tzinfo=timezone.utc)
-    assert export._ceil_to(on, 3600) == on
-    assert export._ceil_to(on.replace(microsecond=1), 3600) == datetime(2026, 7, 6, 12, 0, tzinfo=timezone.utc)
+    _, params = export.feed_query("binance_premium_index", on.replace(microsecond=1), on + timedelta(hours=2))
+    assert params["start"] == on + timedelta(hours=1)
+    assert params["end"] == on + timedelta(hours=2)

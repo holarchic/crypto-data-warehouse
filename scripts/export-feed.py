@@ -13,8 +13,9 @@ Usage:
 - 413 (window over the row cap): the window halves, and the smaller step is kept for the rest of the run.
 - 204 (no rows): the window is skipped.
 - Any other non-200 status, a timeout, or a schema change aborts the run.
-- The file is written as <out>.partial and renamed to <out> only after the last window, so an aborted
-  run leaves nothing that looks complete. A span with no rows writes nothing and exits 1, since the
+- The file is written to a staging file beside <out> that only this run owns (.<out>.<random>.partial)
+  and renamed to <out> only after the last window, so an aborted run leaves nothing that looks complete,
+  and two runs aimed at one <out> never share a staging file. A span with no rows writes nothing and exits 1, since the
   backtester's hash rejects an empty feed.
 - Windows are separate requests, not one database snapshot: a row backfilled into a window after it
   was read is missing, so re-export a span after a known backfill.
@@ -23,11 +24,15 @@ Requires: pyarrow
 """
 
 import argparse
+import math
+import os
 import sys
+import tempfile
 import urllib.error
 import urllib.parse
 import urllib.request
-from datetime import datetime, timedelta
+from contextlib import ExitStack
+from datetime import datetime, timedelta, timezone
 from io import BytesIO
 from pathlib import Path
 
@@ -58,12 +63,30 @@ def fetch_window(api: str, table: str, start: datetime, end: datetime, asset_id:
 def export_span(api: str, table: str, start: datetime, end: datetime, out: Path, *,
                 asset_id: str | None = None, step: timedelta = timedelta(hours=24), timeout: float = 300,
                 log=print) -> int:
-    """Write `table`'s rows in [start, end) to `out`; returns the row count. Raises ExportError (or a
-    network error) with no `out` written and no partial file left."""
-    partial = out.with_name(out.name + ".partial")
-    writer = None
-    total = 0
+    """Write `table`'s rows in [start, end) to `out`; returns the row count. On any failure (ExportError,
+    a network error, a failed close or rename) `out` is not written and this run's staging file is gone."""
+    fd, name = tempfile.mkstemp(dir=out.parent, prefix=f".{out.name}.", suffix=".partial")
+    os.close(fd)
+    staging = Path(name)
+    published = False
     try:
+        total = _write_windows(api, table, start, end, staging, asset_id, step, timeout, log)
+        if total == 0:
+            raise ExportError(f"no rows in {start.isoformat()} → {end.isoformat()}; nothing written")
+        staging.replace(out)
+        published = True
+        return total
+    finally:
+        if not published:
+            staging.unlink(missing_ok=True)
+
+
+def _write_windows(api, table, start, end, staging: Path, asset_id, step: timedelta, timeout, log) -> int:
+    """Stream every window of [start, end) into `staging`, one row group per window; returns the row count.
+    The writer is closed on every exit, so a published file is always a complete parquet."""
+    total = 0
+    with ExitStack() as stack:
+        writer = None
         t = start
         while t < end:
             w_end = min(t + step, end)
@@ -82,22 +105,13 @@ def export_span(api: str, table: str, start: datetime, end: datetime, out: Path,
                 raise ExportError(f"{t.isoformat()} → {w_end.isoformat()}: HTTP {status} {body[:300]!r}")
             window = pq.read_table(BytesIO(body))
             if writer is None:
-                writer = pq.ParquetWriter(partial, window.schema, compression="zstd")
+                writer = stack.enter_context(pq.ParquetWriter(staging, window.schema, compression="zstd"))
             elif not window.schema.equals(writer.schema):
                 raise ExportError(f"schema changed at {t.isoformat()}: {window.schema} != {writer.schema}")
             writer.write_table(window)
             total += window.num_rows
             log(f"{t.isoformat()} → {w_end.isoformat()}  200 rows={window.num_rows}")
             t = w_end
-    except BaseException:
-        if writer is not None:
-            writer.close()
-        partial.unlink(missing_ok=True)
-        raise
-    if writer is None:
-        raise ExportError(f"no rows in {start.isoformat()} → {end.isoformat()}; nothing written")
-    writer.close()
-    partial.replace(out)
     return total
 
 
@@ -105,7 +119,14 @@ def _utc(value: str) -> datetime:
     dt = datetime.fromisoformat(value)
     if dt.tzinfo is None:
         raise argparse.ArgumentTypeError(f"{value!r} has no timezone; use e.g. 2026-07-01T00:00:00Z")
-    return dt
+    return dt.astimezone(timezone.utc)
+
+
+def _positive(value: str) -> float:
+    number = float(value)
+    if not math.isfinite(number) or number <= 0:
+        raise argparse.ArgumentTypeError(f"{value!r} is not a positive finite number")
+    return number
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -115,8 +136,8 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--start", required=True, type=_utc, help="inclusive, timezone-aware ISO time")
     ap.add_argument("--end", required=True, type=_utc, help="exclusive, timezone-aware ISO time")
     ap.add_argument("--asset-id", help="one asset only")
-    ap.add_argument("--step-hours", type=float, default=24, help="initial window width (default 24)")
-    ap.add_argument("--timeout", type=float, default=300, help="seconds per request (default 300)")
+    ap.add_argument("--step-hours", type=_positive, default=24, help="initial window width (default 24)")
+    ap.add_argument("--timeout", type=_positive, default=300, help="seconds per request (default 300)")
     ap.add_argument("--out", required=True, type=Path, help="output parquet path")
     args = ap.parse_args(argv)
     if args.start >= args.end:
