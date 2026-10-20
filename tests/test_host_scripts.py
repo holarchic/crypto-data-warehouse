@@ -112,6 +112,89 @@ def test_a_held_lock_stops_the_backup_before_any_dump(host):
     assert (host / "backup.lock").is_dir()
 
 
+# `crontab -l` prints $CRONTAB_FILE, says "no crontab" when it is absent, and fails outright
+# when $CRONTAB_BROKEN is set; `crontab -` replaces the file.
+STUB_CRONTAB = r"""#!/bin/bash
+if [ "$1" = "-l" ]; then
+    [ -z "$CRONTAB_BROKEN" ] || { echo "crontab: permission denied" >&2; exit 1; }
+    [ -f "$CRONTAB_FILE" ] || { echo "no crontab for test" >&2; exit 1; }
+    cat "$CRONTAB_FILE"
+else
+    cat > "$CRONTAB_FILE"
+fi
+"""
+
+FOREIGN = [
+    "MAILTO=ops",
+    "15 3 * * * /usr/local/bin/certbot renew",
+    "0 1 * * * /srv/other/candle-collector-tools/run.sh",
+]
+
+
+def legacy_entries(project):
+    """The unmarked lines an earlier deploy.sh installed, as they stand on a live host."""
+    compose = f"cd {project} && docker compose -f docker-compose.yml -f docker-compose.prod.yml"
+    return [
+        "# candle-collector: daily discovery (02:00 UTC)",
+        f"0 2 * * * {compose} --profile discovery run --rm discovery >> /var/log/x.log 2>&1",
+        "# candle-collector: host monitor (every 5 min)",
+        f"*/5 * * * * {project}/deploy/host-monitor.sh 2>/dev/null",
+        f"30 5 * * * {project}/scripts/backup-offsite.sh >> /var/log/y.log 2>&1",
+    ]
+
+
+@pytest.fixture
+def cron_host(host):
+    (host / "bin" / "crontab").write_text(STUB_CRONTAB)
+    (host / "bin" / "crontab").chmod(0o755)
+    return host
+
+
+def install_cron(host, **env):
+    result = run_script(host, "deploy/install-cron.sh", CRONTAB_FILE=str(host / "crontab"), **env)
+    return result
+
+
+def jobs(lines):
+    return [line for line in lines if line and not line.startswith("#")]
+
+
+def test_install_cron_into_an_empty_crontab(cron_host):
+    result = install_cron(cron_host)
+    assert result.returncode == 0, result.stderr
+    lines = (cron_host / "crontab").read_text().splitlines()
+    assert lines[0].startswith("# >>> crypto-data-warehouse")
+    assert lines[-1] == "# <<< crypto-data-warehouse <<<"
+    assert len(jobs(lines)) == 5
+    assert all(str(ROOT) in job for job in jobs(lines))
+
+
+def test_install_cron_replaces_legacy_entries_and_keeps_foreign_ones(cron_host):
+    (cron_host / "crontab").write_text("\n".join(FOREIGN[:2] + legacy_entries(ROOT) + FOREIGN[2:]) + "\n")
+    assert install_cron(cron_host).returncode == 0
+    lines = (cron_host / "crontab").read_text().splitlines()
+    assert lines[:3] == FOREIGN
+    assert len(jobs(lines)) == len(FOREIGN) + 5
+    assert sum("deploy/host-monitor.sh" in line for line in lines) == 1
+    assert not any(line.startswith("# candle-collector:") for line in lines)
+
+
+def test_install_cron_is_a_fixed_point(cron_host):
+    (cron_host / "crontab").write_text("\n".join(FOREIGN) + "\n")
+    install_cron(cron_host)
+    first = (cron_host / "crontab").read_text()
+    install_cron(cron_host)
+    assert (cron_host / "crontab").read_text() == first
+
+
+def test_install_cron_writes_nothing_when_the_crontab_cannot_be_read(cron_host):
+    (cron_host / "crontab").write_text("\n".join(FOREIGN) + "\n")
+    result = install_cron(cron_host, CRONTAB_BROKEN="1")
+    assert result.returncode == 1
+    assert "cannot read the crontab" in result.stderr
+    assert (cron_host / "crontab").read_text() == "\n".join(FOREIGN) + "\n"
+
+
 def test_verify_compression_passes_each_table_as_a_psql_variable(host):
     result = run_script(host, "scripts/verify-compression.sh")
     assert result.returncode == 0, result.stdout + result.stderr
