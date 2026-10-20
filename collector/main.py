@@ -113,7 +113,8 @@ def _collect_pair(exchange, pair, config, tf, rate_limiter, conn, thread_name, s
     """Fetch and insert candles for a single pair. Returns True on success.
 
     Gap-aware: fetches from last_timestamp forward (`since`), so a pair that
-    missed N cycles backfills N candles on its next successful run. The fixed
+    missed N cycles backfills N candles over its next successful runs (`poll_max_bars` a poll on a
+    capped venue). The fixed
     limit=10 approach lost data permanently after 10 consecutive failures.
 
     `scan_from` ({symbol: ms}, owned by the calling loop) carries a window-capped venue past empty
