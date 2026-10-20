@@ -184,7 +184,8 @@ def test_a_stalled_request_times_out_without_output(serve, tmp_path):
 
 
 @pytest.mark.parametrize("bad", [["--start", "2026-07-01T00:00"], ["--step-hours", "nan"], ["--step-hours", "0"],
-                                 ["--timeout", "-1"], ["--step-hours", "inf"]])
+                                 ["--timeout", "-1"], ["--step-hours", "inf"], ["--step-hours", "1e-300"],
+                                 ["--step-hours", "1e300"]])
 def test_cli_rejects_bad_arguments(tmp_path, bad):
     args = {"--api": "x", "--table": "t", "--start": "2026-07-01T00:00:00Z", "--end": "2026-07-02T00:00:00Z",
             "--out": str(tmp_path / "f.parquet")}

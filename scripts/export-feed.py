@@ -129,6 +129,17 @@ def _positive(value: str) -> float:
     return number
 
 
+def _step(value: str) -> timedelta:
+    """Hours as a window width of at least MIN_STEP."""
+    try:
+        step = timedelta(hours=_positive(value))
+    except OverflowError:
+        raise argparse.ArgumentTypeError(f"{value!r} hours is too large") from None
+    if step < MIN_STEP:
+        raise argparse.ArgumentTypeError(f"{value!r} hours is under {MIN_STEP}")
+    return step
+
+
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     ap.add_argument("--api", required=True, help="API base URL, e.g. http://localhost:8000")
@@ -136,7 +147,7 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--start", required=True, type=_utc, help="inclusive, timezone-aware ISO time")
     ap.add_argument("--end", required=True, type=_utc, help="exclusive, timezone-aware ISO time")
     ap.add_argument("--asset-id", help="one asset only")
-    ap.add_argument("--step-hours", type=_positive, default=24, help="initial window width (default 24)")
+    ap.add_argument("--step-hours", type=_step, default=timedelta(hours=24), help="initial window width (default 24)")
     ap.add_argument("--timeout", type=_positive, default=300, help="seconds per request (default 300)")
     ap.add_argument("--out", required=True, type=Path, help="output parquet path")
     args = ap.parse_args(argv)
@@ -144,7 +155,7 @@ def main(argv: list[str] | None = None) -> int:
         ap.error("--start must be before --end")
     try:
         rows = export_span(args.api, args.table, args.start, args.end, args.out, asset_id=args.asset_id,
-                           step=timedelta(hours=args.step_hours), timeout=args.timeout)
+                           step=args.step_hours, timeout=args.timeout)
     except (ExportError, OSError) as exc:
         print(f"export failed: {exc}", file=sys.stderr)
         return 1

@@ -257,29 +257,31 @@ def feed_query(table: str, start: datetime, end: datetime, asset_id: str | None 
     if asset_id is not None:
         filters.append("asset_id = %(asset_id)s")
         params["asset_id"] = asset_id
-    if spec.resample is None:
+    r = spec.resample
+    # A bucket is in [start, end) iff its open time is, so a resampled feed reads source rows over
+    # [ceil(start), ceil(end)) on bucket boundaries: any split point is seamless, never halving a bucket.
+    if r is None:
         params.update(start=start, end=end)
-        where = " AND ".join([f"{spec.ts_col} >= %(start)s", f"{spec.ts_col} < %(end)s", *filters])
+    else:
+        params.update(start=_ceil_to(start, r.bucket_s), end=_ceil_to(end, r.bucket_s))
+    where = " AND ".join([f"{spec.ts_col} >= %(start)s", f"{spec.ts_col} < %(end)s", *filters])
+    if r is None:
         cols = ", ".join(c.cc for c in spec.columns)
         return f"SELECT {cols} FROM {spec.db_table} WHERE {where} ORDER BY {spec.ts_col} LIMIT %(limit)s", params
-    return _resampled_query(spec, start, end, filters, params)
+    return _resampled_query(spec, where), params
 
 
-def _resampled_query(spec: FeedSpec, start: datetime, end: datetime, filters: list, params: dict) -> tuple[str, dict]:
-    """A resampled feed's query. A bucket is in [start, end) iff its open time is, so the source rows are read
-    over [ceil(start), ceil(end)) on bucket boundaries: any split point is seamless, never halving a bucket."""
+def _resampled_query(spec: FeedSpec, where: str) -> str:
+    """A resampled feed's SQL: one row per complete bucket of the source rows matching `where`."""
     r = spec.resample
-    params.update(start=_ceil_to(start, r.bucket_s), end=_ceil_to(end, r.bucket_s))
     ts = spec.ts_col
     bucket = f"time_bucket(INTERVAL '{r.bucket_s} seconds', {ts})"
-    where = " AND ".join([f"{ts} >= %(start)s", f"{ts} < %(end)s", *filters])
     selects = ", ".join(f"{_resampled_expr(c, ts, bucket, r)} AS {c.cc}" for c in spec.columns)
     keys = ", ".join([c.cc for c in spec.columns if c.agg is None] + [bucket])
-    sql = (
+    return (
         f"SELECT {selects} FROM {spec.db_table} WHERE {where} GROUP BY {keys} "
         f"HAVING count(*) = {r.bucket_s // r.source_s} ORDER BY {bucket} LIMIT %(limit)s"
     )
-    return sql, params
 
 
 def _resampled_expr(col: Column, ts: str, bucket: str, r: Resample) -> str:
