@@ -23,6 +23,7 @@ import random
 import sys
 from datetime import datetime, timedelta, timezone
 from io import BytesIO
+from typing import NamedTuple
 
 import export
 import psycopg
@@ -31,6 +32,16 @@ from psycopg.rows import dict_row
 
 DAY = datetime(2026, 7, 6, tzinfo=timezone.utc)
 FIVE = timedelta(minutes=5)
+
+
+class Bar(NamedTuple):
+    """One stored 5m premium bar."""
+
+    ts: datetime
+    open: float | None
+    high: float | None
+    low: float | None
+    close: float | None
 
 
 def at(hour, minute=0):
@@ -59,13 +70,14 @@ def export_rows(conn, table, start, end, asset_id=None):
 
 
 def premium_bars(hour, base, skip=None):
-    """Twelve 5m bars for one hour: (timestamp, open, high, low, close); bar `skip` left out."""
+    """Twelve 5m bars for one hour, bar `skip` left out; the hour's high is bar 7's, its low bar 3's."""
     bars = []
     for i in range(12):
         if i == skip:
             continue
         o = base + i * 1e-5
-        bars.append((at(hour) + i * FIVE, o, o + 3e-5 + (2e-5 if i == 7 else 0), o - 2e-5 - (4e-5 if i == 3 else 0), o + 1e-5))
+        bars.append(Bar(ts=at(hour) + i * FIVE, open=o, high=o + 3e-5 + (2e-5 if i == 7 else 0),
+                        low=o - 2e-5 - (4e-5 if i == 3 else 0), close=o + 1e-5))
     return bars
 
 
@@ -75,7 +87,7 @@ def insert_premium(conn, exchange, symbol, native, bars):
     conn.cursor().executemany(
         "INSERT INTO premium_index (exchange, asset_id, symbol, native_symbol, timestamp, premium_open, "
         "premium_high, premium_low, premium_close) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)",
-        [(exchange, symbol.split("/")[0], symbol, native, *bar) for bar in rows],
+        [(exchange, symbol.split("/")[0], symbol, native, b.ts, b.open, b.high, b.low, b.close) for b in rows],
     )
 
 
@@ -86,7 +98,7 @@ def check_premium(conn):
     insert_premium(conn, "binance", "BTC/USDC:USDC", "BTCUSDC", premium_bars(10, 0.009))
     insert_premium(conn, "bybit", "BTC/USDT:USDT", "BTCUSDT", premium_bars(10, 0.008))
     null_hour = premium_bars(20, 0.005)
-    null_hour[6] = (*null_hour[6][:2], None, *null_hour[6][3:])
+    null_hour[6] = null_hour[6]._replace(high=None)
     insert_premium(conn, "binance", "ETH/USDT:USDT", "ETHUSDT", null_hour)
     conn.commit()
 
@@ -97,7 +109,7 @@ def check_premium(conn):
     check("asset_id filter", [r["coin"] for r in whole] == ["BTCUSDT"] * 3, str(whole))
     h10, src = whole[0], premium_bars(10, 0.001)
     check("first/max/min/last by time", (h10["premium_open"], h10["premium_high"], h10["premium_low"], h10["premium_close"])
-          == (src[0][1], max(b[2] for b in src), min(b[3] for b in src), src[-1][4]), str(h10))
+          == (src[0].open, max(b.high for b in src), min(b.low for b in src), src[-1].close), str(h10))
     check("close time is open + 3,599,999 ms", all(r["close_time_ms"] - r["open_time_ms"] == 3_599_999 for r in whole))
 
     a = export_rows(conn, "binance_premium_index", at(10), at(12, 30), asset_id="BTC")

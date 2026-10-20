@@ -88,7 +88,7 @@ def test_windows_stream_into_one_file_one_row_group_each(serve, tmp_path):
     assert f.read().column("time_ms").to_pylist() == [
         int((T0 + h * HOUR).timestamp()) * 1000 + i for h in range(3) for i in range(3)]
     assert [(s, e) for s, e, _ in api.windows] == [(T0 + h * HOUR, T0 + (h + 1) * HOUR) for h in range(3)]
-    assert not (tmp_path / "f.parquet.partial").exists()
+    assert list(tmp_path.iterdir()) == [out]  # no staging file left
 
 
 def test_413_halves_the_window_and_keeps_the_smaller_step(serve, tmp_path):
@@ -105,12 +105,43 @@ def test_out_appears_only_after_the_last_window(serve, tmp_path):
     seen = []
 
     def respond(s, e):
-        seen.append((out.exists(), (tmp_path / "f.parquet.partial").exists()))
+        seen.append((out.exists(), len(list(tmp_path.glob(".f.parquet.*.partial")))))
         return 200, _parquet(s, 1)
 
     _export(serve(respond), out, T0 + 3 * HOUR, step=HOUR)
-    assert seen == [(False, False), (False, True), (False, True)]
-    assert out.exists()
+    assert seen == [(False, 1)] * 3
+    assert list(tmp_path.iterdir()) == [out]
+
+
+def test_another_runs_staging_file_is_left_alone(serve, tmp_path):
+    # a concurrent run aimed at the same out has its own staging file; this run neither writes nor deletes it
+    other = tmp_path / ".f.parquet.other.partial"
+    other.write_bytes(b"theirs")
+    api = serve(lambda s, e: (500, b"boom"))
+    with pytest.raises(export_feed.ExportError):
+        _export(api, tmp_path / "f.parquet", T0 + HOUR, step=HOUR)
+    assert list(tmp_path.iterdir()) == [other] and other.read_bytes() == b"theirs"
+
+
+class _CloseFails(pq.ParquetWriter):
+    def close(self):
+        super().close()
+        raise OSError("close failed")
+
+
+@pytest.mark.parametrize("target", ["close", "replace"])
+def test_a_failed_close_or_rename_leaves_no_output_and_no_staging(serve, tmp_path, monkeypatch, target):
+    api = serve(lambda s, e: (200, _parquet(s, 1)))
+    if target == "close":
+        monkeypatch.setattr(export_feed.pq, "ParquetWriter", _CloseFails)
+    else:
+        def fail(*args, **kwargs):
+            raise OSError("replace failed")
+        monkeypatch.setattr(Path, "replace", fail)
+    with pytest.raises(OSError, match=f"{target} failed"):
+        _export(api, tmp_path / "f.parquet", T0 + HOUR, step=HOUR)
+    monkeypatch.undo()
+    assert list(tmp_path.iterdir()) == []
 
 
 def test_204_windows_are_skipped(serve, tmp_path):
@@ -152,11 +183,25 @@ def test_a_stalled_request_times_out_without_output(serve, tmp_path):
     assert list(tmp_path.iterdir()) == []
 
 
-def test_cli_rejects_naive_times_and_reports_failure(serve, tmp_path, capsys):
+@pytest.mark.parametrize("bad", [["--start", "2026-07-01T00:00"], ["--step-hours", "nan"], ["--step-hours", "0"],
+                                 ["--timeout", "-1"], ["--step-hours", "inf"]])
+def test_cli_rejects_bad_arguments(tmp_path, bad):
+    args = {"--api": "x", "--table": "t", "--start": "2026-07-01T00:00:00Z", "--end": "2026-07-02T00:00:00Z",
+            "--out": str(tmp_path / "f.parquet")}
+    args.update(dict(zip(bad[::2], bad[1::2])))
     with pytest.raises(SystemExit):
-        export_feed.main(["--api", "x", "--table", "t", "--start", "2026-07-01T00:00", "--end",
-                          "2026-07-02T00:00:00Z", "--out", str(tmp_path / "f.parquet")])
+        export_feed.main([x for kv in args.items() for x in kv])
+
+
+def test_cli_reports_failure(serve, tmp_path, capsys):
     api = serve(lambda s, e: (204, b""))
     assert export_feed.main(["--api", api.url, "--table", "t", "--start", "2026-07-01T00:00:00Z", "--end",
                              "2026-07-01T02:00:00Z", "--out", str(tmp_path / "f.parquet")]) == 1
     assert "no rows" in capsys.readouterr().err
+
+
+def test_cli_sends_utc_bounds(serve, tmp_path):
+    api = serve(lambda s, e: (200, _parquet(s, 1)))
+    assert export_feed.main(["--api", api.url, "--table", "t", "--start", "2026-07-01T02:00:00+02:00", "--end",
+                             "2026-07-01T01:00:00Z", "--out", str(tmp_path / "f.parquet")]) == 0
+    assert api.windows == [(T0, T0 + HOUR, None)] and api.windows[0][0].utcoffset() == timedelta(0)
