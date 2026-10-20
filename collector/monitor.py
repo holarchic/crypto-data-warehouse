@@ -28,6 +28,9 @@ LOOP_TIMEFRAMES = frozenset(LOOP_INTERVALS)
 # (up to ~10 min at a settlement), far past 4×60s. Only 1m sits below the floor; 5m is at it.
 ALARMING_DARK_FLOOR_S = 1200
 
+# Consecutive breaching cycles before an alarming page; ALARMING_SUSTAIN_CYCLES overrides it.
+DEFAULT_SUSTAIN_CYCLES = 3
+
 # Result of one alarming-signal evaluation (named, not positional). `should_record` carries the
 # baseline-update invariant (record only non-breaching counts) so the caller doesn't re-derive it.
 AlarmingDecision = namedtuple("AlarmingDecision", ["baseline", "should_fire", "next_consecutive", "should_record"])
@@ -388,7 +391,7 @@ _TF_SCAN_INTERVALS = {
 
 
 def monitor_loop(dsn, timeframe_intervals, webhook_url, poll_s=300, cooldown_s=3600,
-                 healthcheck_url="", heartbeat_hour_utc=0, delta_threshold=25, sustain_cycles=2,
+                 healthcheck_url="", heartbeat_hour_utc=0, delta_threshold=25, sustain_cycles=DEFAULT_SUSTAIN_CYCLES,
                  heartbeat_weekday=0, error_threshold=3):
     """Main monitor loop. Checks staleness + gaps on each cycle.
 
@@ -536,7 +539,7 @@ def run():
     heartbeat_hour_utc = int(os.environ.get("HEARTBEAT_HOUR_UTC", "0"))
     heartbeat_weekday = int(os.environ.get("HEARTBEAT_DAY_UTC", "0"))  # 0=Mon … 6=Sun; weekly status ping
     delta_threshold = int(os.environ.get("ALARMING_DELTA_THRESHOLD", "25"))
-    sustain_cycles = int(os.environ.get("ALARMING_SUSTAIN_CYCLES", "3"))
+    sustain_cycles = int(os.environ.get("ALARMING_SUSTAIN_CYCLES", str(DEFAULT_SUSTAIN_CYCLES)))
     error_threshold = int(os.environ.get("ALARMING_ERROR_THRESHOLD", "3"))
 
     # Candle TFs + per-loop heartbeat pseudo-TFs (funding/oi/liq_ws/premium/candle_ws/candle_repair) — so

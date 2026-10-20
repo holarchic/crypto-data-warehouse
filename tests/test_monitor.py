@@ -735,3 +735,22 @@ def test_format_alarming_alert_truncates_large_lists():
     assert "500 alarming-stale" in text
     assert "plus 485 more" in text
     assert len(text) < 2000
+
+
+
+def test_monitor_sustain_default_has_one_owner(monkeypatch):
+    """run() passes ALARMING_SUSTAIN_CYCLES, defaulting to the same 3 that monitor_loop's signature
+    uses, so a caller that omits it alarms on the cycle count the SPEC names."""
+    import inspect
+
+    loop_signature = inspect.signature(monitor.monitor_loop)
+    assert loop_signature.parameters["sustain_cycles"].default == monitor.DEFAULT_SUSTAIN_CYCLES == 3
+    captured = {}
+    monkeypatch.setattr(monitor, "monitor_loop",
+                        lambda *a, **k: captured.update(loop_signature.bind(*a, **k).arguments))
+    monkeypatch.setattr(monitor, "load_timeframe_intervals", lambda: {"5m": 300})
+    monkeypatch.setenv("POSTGRES_USER", "u")
+    monkeypatch.setenv("POSTGRES_PASSWORD", "p")
+    monkeypatch.delenv("ALARMING_SUSTAIN_CYCLES", raising=False)
+    monitor.run()
+    assert captured["sustain_cycles"] == 3
