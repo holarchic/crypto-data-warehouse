@@ -76,8 +76,8 @@ def premium_bars(hour, base, skip=None):
         if i == skip:
             continue
         o = base + i * 1e-5
-        bars.append(Bar(ts=at(hour) + i * FIVE, open=o, high=o + 3e-5 + (2e-5 if i == 7 else 0),
-                        low=o - 2e-5 - (4e-5 if i == 3 else 0), close=o + 1e-5))
+        bars.append(Bar(ts=at(hour) + i * FIVE, open=o, high=o + 3e-5 + (5e-4 if i == 7 else 0),
+                        low=o - 2e-5 - (5e-4 if i == 3 else 0), close=o + 1e-5))
     return bars
 
 
@@ -108,6 +108,8 @@ def check_premium(conn):
     whole = export_rows(conn, "binance_premium_index", at(10), at(14), asset_id="BTC")
     check("asset_id filter", [r["coin"] for r in whole] == ["BTCUSDT"] * 3, str(whole))
     h10, src = whole[0], premium_bars(10, 0.001)
+    check("fixture: the hour's extremes are interior bars", max(src, key=lambda b: b.high) is src[7]
+          and min(src, key=lambda b: b.low) is src[3])
     check("first/max/min/last by time", (h10["premium_open"], h10["premium_high"], h10["premium_low"], h10["premium_close"])
           == (src[0].open, max(b.high for b in src), min(b.low for b in src), src[-1].close), str(h10))
     check("close time is open + 3,599,999 ms", all(r["close_time_ms"] - r["open_time_ms"] == 3_599_999 for r in whole))
