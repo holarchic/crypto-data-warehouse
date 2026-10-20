@@ -1,16 +1,14 @@
 #!/usr/bin/env bash
-# Fresh install / full redeploy of crypto-data-warehouse. Idempotent, but NOT for routine code
-# updates: `compose pull db` + stack-wide `up -d` can recreate the db onto a moved
-# `latest-pg16`. Code updates follow deploy/README.md § Code updates (build + `up -d --no-deps <svc>`).
+# Fresh install / full redeploy of crypto-data-warehouse. NOT for routine code updates:
+# `compose pull db` + stack-wide `up -d` can recreate the db onto a moved `latest-pg16`.
+# Code updates follow deploy/README.md § Code updates (build + `up -d --no-deps <svc>`).
 #
 # Usage: ./deploy/deploy.sh
-#   Run from the project root (/opt/crypto-data-warehouse).
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
-COMPOSE="docker compose -f docker-compose.yml -f docker-compose.prod.yml"
-REPO_URL="https://github.com/holarchic/crypto-data-warehouse.git"
+DC=(docker compose -f docker-compose.yml -f docker-compose.prod.yml)
 
 # -- Helpers ------------------------------------------------------------------
 
@@ -47,15 +45,15 @@ fi
 # -- Build and deploy ---------------------------------------------------------
 
 info "Pulling base images"
-$COMPOSE pull db
+"${DC[@]}" pull db
 
 info "Building application images"
 # Include profile-gated services (discovery, liquidations-hl, hl-candles-repair) so they don't run
 # stale code after a git pull — `compose build` alone skips anything behind a profile flag.
-$COMPOSE --profile discovery --profile liquidations-hl --profile hl-candles-repair build
+"${DC[@]}" --profile discovery --profile liquidations-hl --profile hl-candles-repair build
 
 info "Starting services"
-$COMPOSE up -d
+"${DC[@]}" up -d
 
 # -- Wait for health ----------------------------------------------------------
 
@@ -74,39 +72,18 @@ done
 
 # -- Install crontab entries --------------------------------------------------
 
-info "Installing cron jobs"
-
-# Build crontab — preserve existing non-candle-collector entries
-EXISTING_CRON=$(crontab -l 2>/dev/null | grep -v "candle-collector" || true)
-NEW_CRON="$EXISTING_CRON
-# candle-collector: daily discovery (02:00 UTC)
-0 2 * * * cd $PROJECT_DIR && $COMPOSE --profile discovery run --rm discovery >> /var/log/candle-collector-discovery.log 2>&1
-# candle-collector: daily HL Grade-A liquidation pull (04:00 UTC — T-009.3)
-0 4 * * * cd $PROJECT_DIR && $COMPOSE --profile liquidations-hl run --rm liquidations-hl >> /var/log/candle-collector-liquidations-hl.log 2>&1
-# candle-collector: daily HL 1m repair from REST (06:30 UTC, ~6 h background trickle — T-019)
-30 6 * * * cd $PROJECT_DIR && $COMPOSE --profile hl-candles-repair run --rm --no-deps hl-candles-repair >> /var/log/candle-collector-hl-candles-repair.log 2>&1
-# candle-collector: nightly offsite backup (05:30 UTC; a no-op until the restic env file exists)
-30 5 * * * $PROJECT_DIR/scripts/backup-offsite.sh >> /var/log/candle-collector-backup.log 2>&1
-# candle-collector: host monitor (every 5 min)
-*/5 * * * * $PROJECT_DIR/deploy/host-monitor.sh 2>/dev/null
-"
-
-# Remove blank lines and install
-echo "$NEW_CRON" | grep -v '^$' | crontab -
-
-info "Cron jobs installed:"
-crontab -l | grep "candle-collector"
+"$SCRIPT_DIR/install-cron.sh"
 
 # -- Status -------------------------------------------------------------------
 
 echo ""
 info "Deployment complete"
 echo ""
-$COMPOSE ps
+"${DC[@]}" ps
 echo ""
 echo "  API:       http://localhost:8000/health"
 echo "  Status:    http://localhost:8000/status"
-echo "  Logs:      cd $PROJECT_DIR && $COMPOSE logs -f"
+echo "  Logs:      cd $PROJECT_DIR && ${DC[*]} logs -f"
 echo ""
 echo "Next: run discovery to populate pairs:"
-echo "  cd $PROJECT_DIR && $COMPOSE --profile discovery run --rm discovery"
+echo "  cd $PROJECT_DIR && ${DC[*]} --profile discovery run --rm discovery"

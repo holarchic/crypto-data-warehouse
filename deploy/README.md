@@ -114,7 +114,9 @@ TimescaleDB auto-tunes `max_connections` low (~25 on 8GB). Override via `command
 - **UFW** (defense-in-depth): SSH only
 - **Local access:** SSH tunnel — no firewall rule needed
 
-### Cron jobs (installed by `deploy.sh`)
+### Cron jobs (installed by `deploy/install-cron.sh`)
+
+`deploy.sh` runs it. It keeps the jobs as one marked block in the crontab, so a re-run replaces that block (and any unmarked entries an older install left) and keeps every other entry.
 
 | Schedule | Job |
 |----------|-----|
@@ -122,7 +124,7 @@ TimescaleDB auto-tunes `max_connections` low (~25 on 8GB). Override via `command
 | `0 4 * * *` | Daily HL Grade-A liquidation pull (last 3 complete days) |
 | `30 5 * * *` | Nightly offsite backup (does nothing until configured, see below) |
 | `30 6 * * *` | Daily HL 1m repair from REST (a ~6 h trickle at 20 weight/min; see HL 1m repair) |
-| `*/5 * * * *` | Host monitor |
+| `*/5 * * * *` | Host monitor (`/var/log/candle-collector-host-monitor.log`) |
 
 ## HL 1m repair
 
@@ -174,7 +176,7 @@ TimescaleDB auto-tunes `max_connections` low (~25 on 8GB). Override via `command
    (. scripts/offsite-lib.sh; restic_run init)
    ./scripts/backup-offsite.sh   # the first run, by hand
    ```
-5. **Cron.** Add the cron line from `deploy.sh`. `host-monitor.sh` pages "never succeeded" until the first run completes.
+5. **Cron.** Run `deploy/install-cron.sh`. `host-monitor.sh` pages "never succeeded" until the first run completes.
 
 ### Restore drill
 
@@ -232,7 +234,7 @@ db_sql() { "${DC[@]}" exec -T db psql -X -v ON_ERROR_STOP=1 -U candles "$@"; }
    - `db_sql -d candle_collector -c 'SELECT timescaledb_post_restore()'`
 7. **Bring it back.**
    - Build and start the rest with `"${DC[@]}" build` and `up -d --no-deps <services>`.
-   - Add the cron lines from `deploy.sh`.
+   - Run `deploy/install-cron.sh`.
    - Move the credentials to `/etc/candle-collector/` and fix `RESTIC_PASSWORD_FILE`.
    - Run `./scripts/backup-offsite.sh` once, then delete the dump.
    - Never run `compose pull db` or `deploy.sh` on this host unless you mean to move TimescaleDB versions.
