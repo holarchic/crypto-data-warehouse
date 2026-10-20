@@ -51,7 +51,7 @@ def fetch_candles(exchange, symbol, market_info, exchange_name, timeframe, inter
             "symbol": symbol,
             "native_symbol": market_info["native_symbol"],
             "timeframe": timeframe,
-            "timestamp": ts_ms / 1000,  # psycopg handles epoch -> timestamptz
+            "timestamp": ts_ms / 1000,  # epoch seconds; the INSERT's to_timestamp() makes the timestamptz
             "open": o,
             "high": h,
             "low": lo,
@@ -296,7 +296,6 @@ def run():
     rate_limiter = build_rate_limiter(config)
 
     # One daemon thread per timeframe
-    threads = []
     for tf in config.timeframes:
         t = threading.Thread(
             target=collect_loop,
@@ -305,7 +304,6 @@ def run():
             daemon=True,
         )
         t.start()
-        threads.append(t)
         log.info("Started thread %s", t.name)
 
     # Funding rate thread
@@ -317,7 +315,6 @@ def run():
             daemon=True,
         )
         t.start()
-        threads.append(t)
         log.info("Started thread %s", t.name)
 
     # Open interest thread
@@ -329,7 +326,6 @@ def run():
             daemon=True,
         )
         t.start()
-        threads.append(t)
         log.info("Started thread %s", t.name)
 
     # Liquidation WS feed thread (T-009.2) — the venue's spec injected into the generic engine.
@@ -342,7 +338,6 @@ def run():
             daemon=True,
         )
         t.start()
-        threads.append(t)
         log.info("Started thread %s", t.name)
 
     # Premium-index poll thread (T-010) — Binance premiumIndexKlines 5m → premium_index.
@@ -354,7 +349,6 @@ def run():
             daemon=True,
         )
         t.start()
-        threads.append(t)
         log.info("Started thread %s", t.name)
 
     # HL 1m candle feed (T-015.1) — a WS-only candle stream (real-time, zero REST; drop gaps and unclosed
@@ -371,7 +365,6 @@ def run():
             daemon=True,
         )
         t.start()
-        threads.append(t)
         log.info("Started thread %s", t.name)
 
     # Main thread waits — daemon threads die with the process

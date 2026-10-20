@@ -72,8 +72,8 @@ exchanges:
     # Binance USDM budgets per *weight* not per request. fapi/v1/klines weight
     # scales with limit (limit<=1000 → weight 5). Setting a weight budget
     # routes this exchange through WeightRateLimiter, which paces against the
-    # X-MBX-USED-WEIGHT-1M response header. rate_limit_ms is kept as a floor
-    # but not the primary gate.
+    # X-MBX-USED-WEIGHT-1M response header. rate_limit_ms is unused while a
+    # weight budget is set.
     rate_limit_ms: 100
     rate_limit_weight_budget: 2400   # Binance IP weight cap per minute
     rate_limit_window_s: 60
@@ -118,7 +118,7 @@ exchanges:
     # (10 req/s) can't sustain (a solo 1m cycle alone was 467/10 = 47s, no tick margin). 30ms drops
     # it to ~14s. Still 3.6× under Bybit's documented 600 req/5s (120 req/s) IP cap. Real-time 1m
     # keep-up is then RTT-bound (serial per-pair fetch), not limiter-bound — deploy-measured; missed
-    # bars backfill losslessly via poll_limit (T-015.3).
+    # bars backfill on the next poll, which fetches up to 1000 bars from the cursor.
     rate_limit_ms: 30
     enabled: true
     has_funding: true

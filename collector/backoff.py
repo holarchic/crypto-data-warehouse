@@ -1,7 +1,6 @@
-"""Exponential backoff for collector error recovery.
-
-Steps: 5s → 10s → 30s → 60s → 5m (per spec failure modes).
-Resets on success. Catches specific ccxt and psycopg exceptions.
+"""Exponential backoff for collector error recovery: the shared set of retriable exceptions and
+the sleep schedule (5s → 10s → 30s → 60s → 5m). Callers catch the exceptions and keep the
+consecutive-error count; this module only sleeps for a given count.
 """
 
 import logging
@@ -32,7 +31,3 @@ def backoff_sleep(error_count: int) -> None:
     log.warning("Backoff: sleeping %ds (error_count=%d)", delay, error_count)
     time.sleep(delay)
 
-
-def is_retriable(exc: Exception) -> bool:
-    """Check if an exception should trigger backoff rather than immediate crash."""
-    return isinstance(exc, RETRIABLE_EXCEPTIONS)
