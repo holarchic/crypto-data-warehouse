@@ -55,6 +55,8 @@
 | Collection status | `curl http://localhost:8000/status` |
 | Status (filtered) | `curl "http://localhost:8000/status?exchange=binance&timeframe=5m"` |
 | Gap check | `curl "http://localhost:8000/status/gaps?exchange=binance&timeframe=5m"` |
+| Export one window | `curl -o premium.parquet "http://localhost:8000/export/parquet?table=binance_premium_index&start=2026-10-01T00:00:00Z&end=2026-10-02T00:00:00Z"` |
+| Export a long span | `python3 scripts/export-feed.py --api http://localhost:8000 --table hl_asset_ctxs --start 2026-07-01T00:00:00Z --end 2026-10-01T00:00:00Z --out hl-asset-ctxs.parquet` (needs `pyarrow`) |
 
 ### DB-direct inspection
 
