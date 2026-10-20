@@ -160,7 +160,7 @@ The agent will ask whether you want a laptop trial or a server, check prerequisi
 | `GET /oi` · `/oi/latest` | Open interest |
 | `GET /liquidations` | Recent liquidations |
 | `GET /status` · `/status/gaps` | Collector health and gaps |
-| `GET /export/parquet` | HyperLiquid context, Binance open interest or HyperLiquid liquidations for a time window, as parquet |
+| `GET /export/parquet` | HyperLiquid context, Binance open interest, HyperLiquid liquidations or Binance 1h premium index for a time window, as parquet. Longer spans: `scripts/export-feed.py` |
 | `GET /health` | Liveness |
 
 Example queries: [`deploy/README.md`](deploy/README.md#api-queries).
