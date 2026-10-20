@@ -9,13 +9,12 @@
 # Disk alerts self-dedup per mount+band: an escalation (75->85->95) pages at once,
 # an unchanged band re-pings at most hourly, a drop below 75% clears (recovery ping).
 # A stale backup re-pings every 6h on its own reminder file and pings again on recovery.
-# Memory + container alerts share the ALERT_FILE cooldown: skip if touched this hour.
+# Memory and container alerts each re-ping at most hourly on their own reminder file, so
+# neither mutes the other. Every check runs every time; none exits early.
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
-ALERT_FILE="/tmp/candle-collector-host-alert"
-COOLDOWN_SECONDS=3600
 
 # -- Webhook --------------------------------------------------------------------
 # A checkout without scripts/webhook-lib.sh still runs every check below; it just can't page.
@@ -37,19 +36,30 @@ post_webhook() {
     webhook_post "$WEBHOOK_URL" "🚨 candle-collector ($(hostname)): $1"
 }
 
-# Memory/container alerts: post + arm the shared ALERT_FILE hourly cooldown.
-send_alert() {
-    local message="$1"
+# remind <file> <message>: pages unless <file> was touched within the hour. The file moves
+# only on a delivered page, so an undelivered one is retried next run.
+ALERT_REMIND_SECONDS=3600
+remind() {
+    local file="$1" message="$2" now last
+    now=$(date +%s)
+    last=$(stat -c %Y "$file" 2>/dev/null || stat -f %m "$file" 2>/dev/null || echo 0)
+    [ $(( now - last )) -ge "$ALERT_REMIND_SECONDS" ] || return 0
     echo "[host-monitor] ALERT: $message"
-    post_webhook "$message" || echo "[host-monitor] page not delivered"
-    touch "$ALERT_FILE"
+    if post_webhook "$message"; then
+        touch "$file" || echo "[host-monitor] cannot write ${file}; this page repeats every run"
+    else
+        echo "[host-monitor] page not delivered; retrying next run"
+    fi
 }
 
-# Disk alerts: post only — dedup is per-mount+band state below, NOT the shared cooldown.
+# Disk alerts dedup on the per-mount band state below, which the caller writes only when
+# this returns 0 (delivered), so an undelivered page is retried next run.
 disk_alert() {
     local message="$1"
     echo "[host-monitor] $message"
-    post_webhook "$message" || echo "[host-monitor] page not delivered"
+    post_webhook "$message" && return 0
+    echo "[host-monitor] page not delivered; retrying next run"
+    return 1
 }
 
 # -- Disk usage (tiered, per mount) -------------------------------------------
@@ -57,7 +67,7 @@ disk_alert() {
 # state file, so an escalation pages immediately, the same band re-pings at most
 # hourly, and dropping below 75% clears. Both the root disk and the data volume
 # are watched — the root does NOT overflow to the volume, so each fills alone.
-DISK_STATE_DIR="/tmp/candle-collector-disk-bands"
+DISK_STATE_DIR="${DISK_STATE_DIR:-/tmp/candle-collector-disk-bands}"
 DISK_REMIND_SECONDS=3600
 DISK_MOUNTS=("/" "/mnt/pgvol")
 mkdir -p "$DISK_STATE_DIR"
@@ -94,16 +104,18 @@ for mount in "${DISK_MOUNTS[@]}"; do
 
     if [ "$band" -eq 0 ]; then                         # below all bands
         if [ "${prev_band:-0}" -ge 75 ]; then
-            disk_alert "✅ RECOVERED: ${mount} back to ${pct}% (below 75%)"
+            disk_alert "✅ RECOVERED: ${mount} back to ${pct}% (below 75%)" \
+                && echo "0 $disk_now" > "$state_file"
+        else
+            echo "0 $disk_now" > "$state_file"
         fi
-        echo "0 $disk_now" > "$state_file"
     elif [ "$band" -gt "${prev_band:-0}" ]; then       # escalation — page immediately
-        disk_alert "$(disk_band_label "$band"): ${mount} at ${pct}% (crossed ${band}%)"
-        echo "$band $disk_now" > "$state_file"
+        disk_alert "$(disk_band_label "$band"): ${mount} at ${pct}% (crossed ${band}%)" \
+            && echo "$band $disk_now" > "$state_file"
     elif [ "$band" -eq "${prev_band:-0}" ]; then       # same band — hourly reminder
         if [ $(( disk_now - ${prev_ts:-0} )) -ge "$DISK_REMIND_SECONDS" ]; then
-            disk_alert "$(disk_band_label "$band"): ${mount} still at ${pct}% (>=${band}%)"
-            echo "$band $disk_now" > "$state_file"
+            disk_alert "$(disk_band_label "$band"): ${mount} still at ${pct}% (>=${band}%)" \
+                && echo "$band $disk_now" > "$state_file"
         fi
     else                                               # de-escalated but still >=75 — update quietly
         echo "$band $disk_now" > "$state_file"
@@ -156,28 +168,24 @@ if [ "$offsite_lib_loaded" -eq 1 ] && [ -f "$RESTIC_ENV_FILE" ]; then
     fi
 fi
 
-# -- Memory + container dedup gate (shared hourly cooldown) --------------------
-
-if [ -f "$ALERT_FILE" ]; then
-    last_alert=$(stat -c %Y "$ALERT_FILE" 2>/dev/null || stat -f %m "$ALERT_FILE" 2>/dev/null || echo 0)
-    now=$(date +%s)
-    elapsed=$((now - last_alert))
-    if [ "$elapsed" -lt "$COOLDOWN_SECONDS" ]; then
-        exit 0
-    fi
-fi
-
 # -- Memory -------------------------------------------------------------------
 
-avail_mb=$(awk '/MemAvailable/ {printf "%d", $2/1024}' /proc/meminfo 2>/dev/null || echo 9999)
-if [ "$avail_mb" -lt 500 ]; then
-    send_alert "Available memory: ${avail_mb}MB (threshold: 500MB)"
-    exit 0
+MEMORY_ALERT_FILE="${MEMORY_ALERT_FILE:-/tmp/candle-collector-memory-alert}"
+MEMINFO_FILE="${MEMINFO_FILE:-/proc/meminfo}"
+
+avail_mb=$(awk '/MemAvailable/ {printf "%d", $2/1024}' "$MEMINFO_FILE" 2>/dev/null) || avail_mb=""
+if [ -z "$avail_mb" ]; then
+    echo "[host-monitor] cannot read MemAvailable from ${MEMINFO_FILE}; memory not checked"
+elif [ "$avail_mb" -lt 500 ]; then
+    remind "$MEMORY_ALERT_FILE" "Available memory: ${avail_mb}MB (threshold: 500MB)"
 fi
 
 # -- Docker containers --------------------------------------------------------
+# Services are matched by exact compose service name. A failed `compose ps` pages as a failed
+# probe: it says nothing about which containers run.
 
-EXPECTED_CONTAINERS=(
+CONTAINER_ALERT_FILE="${CONTAINER_ALERT_FILE:-/tmp/candle-collector-container-alert}"
+EXPECTED_SERVICES=(
     "collector-hyperliquid"
     "collector-binance"
     "collector-bybit"
@@ -190,16 +198,15 @@ EXPECTED_CONTAINERS=(
 )
 
 cd "$PROJECT_DIR"
-running=$(docker compose -f docker-compose.yml -f docker-compose.prod.yml ps --format '{{.Name}}' 2>/dev/null || true)
-
-down_containers=()
-for container in "${EXPECTED_CONTAINERS[@]}"; do
-    if ! echo "$running" | grep -q "$container"; then
-        down_containers+=("$container")
+if running=$(docker compose -f docker-compose.yml -f docker-compose.prod.yml \
+        ps --status running --format '{{.Service}}' 2>/dev/null); then
+    down_services=()
+    for service in "${EXPECTED_SERVICES[@]}"; do
+        grep -qxF "$service" <<<"$running" || down_services+=("$service")
+    done
+    if [ ${#down_services[@]} -gt 0 ]; then
+        remind "$CONTAINER_ALERT_FILE" "Containers down: ${down_services[*]}"
     fi
-done
-
-if [ ${#down_containers[@]} -gt 0 ]; then
-    send_alert "Containers down: ${down_containers[*]}"
-    exit 0
+else
+    remind "$CONTAINER_ALERT_FILE" "Container check failed: docker compose ps did not answer"
 fi
