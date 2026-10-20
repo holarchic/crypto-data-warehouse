@@ -12,7 +12,15 @@ PROJECT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 BEGIN="# >>> crypto-data-warehouse (deploy/install-cron.sh) >>>"
 END="# <<< crypto-data-warehouse <<<"
 
-dir=$(printf '%q' "$PROJECT_DIR")
+# Cron hands each line to /bin/sh and treats `%` specially, so the checkout path goes in unquoted
+# and is limited to characters that need no quoting in either.
+case "$PROJECT_DIR" in
+    *[!A-Za-z0-9/._-]*)
+        echo "==> FATAL: checkout path ${PROJECT_DIR} has characters cron lines can't carry unquoted" >&2
+        exit 1
+        ;;
+esac
+dir="$PROJECT_DIR"
 compose="cd $dir && docker compose -f docker-compose.yml -f docker-compose.prod.yml"
 block="$BEGIN
 # daily discovery (02:00 UTC)
@@ -37,13 +45,14 @@ fi
 
 # A legacy job is one whose command (after the five schedule fields) starts in this checkout:
 # `<dir>/…` or `cd <dir> …`. A path elsewhere in a line, such as another job's argument, is not one.
-kept=$(awk -v begin="$BEGIN" -v end="$END" -v dir="$PROJECT_DIR" -v qdir="$dir" '
+# A marker without its partner (or a nested one) stops the install: dropping lines up to a missing
+# end marker would delete every entry after it.
+kept=$(BEGIN="$BEGIN" END="$END" DIR="$PROJECT_DIR" awk '
     function ours(cmd) {
-        return index(cmd, dir "/") == 1 || index(cmd, "cd " dir " ") == 1 \
-            || index(cmd, qdir "/") == 1 || index(cmd, "cd " qdir " ") == 1
+        return index(cmd, ENVIRON["DIR"] "/") == 1 || index(cmd, "cd " ENVIRON["DIR"] " ") == 1
     }
-    $0 == begin { inside = 1; next }
-    $0 == end { inside = 0; next }
+    $0 == ENVIRON["BEGIN"] { if (inside) bad = 1; inside = 1; next }
+    $0 == ENVIRON["END"] { if (!inside) bad = 1; inside = 0; next }
     inside { next }
     /^# candle-collector:/ { next }
     $1 ~ /^[0-9*]/ {
@@ -52,7 +61,8 @@ kept=$(awk -v begin="$BEGIN" -v end="$END" -v dir="$PROJECT_DIR" -v qdir="$dir" 
         if (ours(cmd)) next
     }
     { print }
-' <<<"$current")
+    END { if (inside || bad) exit 3 }
+' <<<"$current") || { echo "==> FATAL: the crontab's crypto-data-warehouse markers don't pair; fix it by hand" >&2; exit 1; }
 
 {
     [ -z "$kept" ] || printf '%s\n' "$kept"
