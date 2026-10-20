@@ -35,12 +35,22 @@ if ! current=$(crontab -l 2>&1); then
     esac
 fi
 
+# A legacy job is one whose command (after the five schedule fields) starts in this checkout:
+# `<dir>/…` or `cd <dir> …`. A path elsewhere in a line, such as another job's argument, is not one.
 kept=$(awk -v begin="$BEGIN" -v end="$END" -v dir="$PROJECT_DIR" -v qdir="$dir" '
+    function ours(cmd) {
+        return index(cmd, dir "/") == 1 || index(cmd, "cd " dir " ") == 1 \
+            || index(cmd, qdir "/") == 1 || index(cmd, "cd " qdir " ") == 1
+    }
     $0 == begin { inside = 1; next }
     $0 == end { inside = 0; next }
     inside { next }
     /^# candle-collector:/ { next }
-    index($0, dir "/") || index($0, "cd " dir " ") || index($0, qdir "/") || index($0, "cd " qdir " ") { next }
+    $1 ~ /^[0-9*]/ {
+        cmd = $0
+        sub(/^[ \t]*([^ \t]+[ \t]+){5}/, "", cmd)
+        if (ours(cmd)) next
+    }
     { print }
 ' <<<"$current")
 

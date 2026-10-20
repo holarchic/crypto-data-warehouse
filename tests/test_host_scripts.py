@@ -35,8 +35,8 @@ def test_every_compose_call_carries_the_prod_override(script):
     for number, line in enumerate(script.read_text().splitlines(), 1):
         if line.lstrip().startswith("#") or "docker compose" not in line:
             continue
-        # `docker compose version` and quoted prose name compose without running a project.
-        if re.search(r'docker compose version|"[^"]*docker compose[^"]*"', line):
+        # `docker compose version` and alert or log messages name compose without running it.
+        if "docker compose version" in line or re.match(r"\s*(echo|remind|info|fail|send_alert)\b", line):
             continue
         assert "docker-compose.prod.yml" in line, f"{script.name}:{number}: {line.strip()}"
 
@@ -167,14 +167,19 @@ def test_install_cron_into_an_empty_crontab(cron_host):
     assert lines[-1] == "# <<< crypto-data-warehouse <<<"
     assert len(jobs(lines)) == 5
     assert all(str(ROOT) in job for job in jobs(lines))
+    compose_jobs = [job for job in jobs(lines) if "docker compose" in job]
+    assert len(compose_jobs) == 3
+    assert all("-f docker-compose.yml -f docker-compose.prod.yml" in job for job in compose_jobs)
 
 
 def test_install_cron_replaces_legacy_entries_and_keeps_foreign_ones(cron_host):
-    (cron_host / "crontab").write_text("\n".join(FOREIGN[:2] + legacy_entries(ROOT) + FOREIGN[2:]) + "\n")
+    # A foreign job that only names the checkout as an argument is not ours.
+    foreign = [*FOREIGN, f"0 5 * * * /usr/local/bin/restic backup {ROOT}/backups"]
+    (cron_host / "crontab").write_text("\n".join(foreign[:2] + legacy_entries(ROOT) + foreign[2:]) + "\n")
     assert install_cron(cron_host).returncode == 0
     lines = (cron_host / "crontab").read_text().splitlines()
-    assert lines[:3] == FOREIGN
-    assert len(jobs(lines)) == len(FOREIGN) + 5
+    assert lines[:4] == foreign
+    assert len(jobs(lines)) == len(foreign) + 5
     assert sum("deploy/host-monitor.sh" in line for line in lines) == 1
     assert not any(line.startswith("# candle-collector:") for line in lines)
 
