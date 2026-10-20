@@ -17,10 +17,11 @@ pytestmark = pytest.mark.skipif(
     shutil.which("bash") is None or shutil.which("curl") is None, reason="needs bash and curl"
 )
 
-# Logs each call's argv as one line, then its stdin under "stdin:" when it is SQL for psql.
-# pg_dump writes $FAKE_DUMP; pg_restore exits $FAKE_RESTORE_EXIT; psql -At prints a version.
+# Logs each call's argv as one "argv:" line with the arguments joined by \x1f (none contains it),
+# then its stdin under "stdin:" when it is SQL for psql. pg_dump writes $FAKE_DUMP; pg_restore
+# exits $FAKE_RESTORE_EXIT; psql -At prints a version.
 STUB_DOCKER = r"""#!/bin/bash
-echo "argv: $*" >> "$DOCKER_LOG"
+(IFS=$'\x1f'; echo "argv: $*") >> "$DOCKER_LOG"
 case " $* " in
     *" pg_dump "*) printf '%s' "$FAKE_DUMP" ;;
     *" pg_restore "*) cat > /dev/null; exit "${FAKE_RESTORE_EXIT:-0}" ;;
@@ -62,15 +63,19 @@ def run_script(host, script, *args, **env):
 
 
 def docker_calls(host):
+    """Each docker call's argv, as a list of its arguments."""
     log = host / "docker.log"
-    return [line[len("argv: "):] for line in log.read_text().splitlines()
+    return [line[len("argv: "):].split("\x1f") for line in log.read_text().splitlines()
             if line.startswith("argv: ")] if log.exists() else []
+
+
+COMPOSE_PROD = ["compose", "-f", f"{ROOT}/docker-compose.yml", "-f", f"{ROOT}/docker-compose.prod.yml"]
 
 
 def assert_prod_override(calls):
     assert calls
     for call in calls:
-        assert f"-f {ROOT}/docker-compose.yml -f {ROOT}/docker-compose.prod.yml" in call, call
+        assert call[:5] == COMPOSE_PROD, call
 
 
 def backup_env(host, **env):
@@ -192,6 +197,33 @@ def test_install_cron_is_a_fixed_point(cron_host):
     assert (cron_host / "crontab").read_text() == first
 
 
+BEGIN_MARK = "# >>> crypto-data-warehouse (deploy/install-cron.sh) >>>"
+END_MARK = "# <<< crypto-data-warehouse <<<"
+
+
+@pytest.mark.parametrize("markers", [[BEGIN_MARK], [END_MARK], [BEGIN_MARK, BEGIN_MARK, END_MARK]],
+                         ids=["begin-only", "end-only", "nested"])
+def test_install_cron_refuses_unpaired_markers(cron_host, markers):
+    original = "\n".join([FOREIGN[0], *markers, *FOREIGN[1:]]) + "\n"
+    (cron_host / "crontab").write_text(original)
+    result = install_cron(cron_host)
+    assert result.returncode == 1
+    assert "markers don't pair" in result.stderr
+    assert (cron_host / "crontab").read_text() == original
+
+
+def test_install_cron_refuses_a_checkout_path_cron_cannot_carry(cron_host, tmp_path):
+    checkout = tmp_path / "my checkout" / "deploy"
+    checkout.mkdir(parents=True)
+    shutil.copy(ROOT / "deploy" / "install-cron.sh", checkout)
+    result = subprocess.run(["bash", str(checkout / "install-cron.sh")], capture_output=True, text=True,
+                            env={"PATH": f"{cron_host / 'bin'}:/usr/bin:/bin",
+                                 "CRONTAB_FILE": str(cron_host / "crontab")}, timeout=30)
+    assert result.returncode == 1
+    assert "can't carry unquoted" in result.stderr
+    assert not (cron_host / "crontab").exists()
+
+
 def test_install_cron_writes_nothing_when_the_crontab_cannot_be_read(cron_host):
     (cron_host / "crontab").write_text("\n".join(FOREIGN) + "\n")
     result = install_cron(cron_host, CRONTAB_BROKEN="1")
@@ -205,8 +237,9 @@ def test_verify_compression_passes_each_table_as_a_psql_variable(host):
     assert result.returncode == 0, result.stdout + result.stderr
     calls = docker_calls(host)
     assert_prod_override(calls)
-    assert all(any(f"-v tbl={table}" in call for call in calls)
-               for table in ("candles", "funding_rates", "open_interest"))
+    table_vars = [call[i + 1] for call in calls for i, arg in enumerate(call) if arg == "-v"
+                  and call[i + 1].startswith("tbl=")]
+    assert table_vars == ["tbl=candles", "tbl=funding_rates", "tbl=open_interest"]
     log = (host / "docker.log").read_text()
     assert log.count("hypertable_compression_stats(:'tbl')") == 3
     assert "policy_retention" in log

@@ -46,21 +46,17 @@ if ! mkdir "$LOCK_DIR" 2>/dev/null; then
     send_alert "Another backup holds ${LOCK_DIR}; if none is running, remove it"
     exit 1
 fi
-PARTIAL=""
-cleanup() {
-    [ -z "$PARTIAL" ] || rm -f "$PARTIAL"
-    rmdir "$LOCK_DIR" 2>/dev/null || true
-}
-trap cleanup EXIT
-
 TIMESTAMP=$(date -u +%Y%m%d-%H%M%S)
+readonly PARTIAL="${BACKUP_DIR}/candle_collector-${TIMESTAMP}.dump.partial"
+# After the rename there is no partial left, so rm -f is a no-op.
+trap 'rm -f "$PARTIAL"; rmdir "$LOCK_DIR" 2>/dev/null || true' EXIT
+
 # The name carries the TimescaleDB version, which a restore must match and the dump itself
 # does not record (scripts/restore.sh reads it from here).
 TSDB_VERSION=$("${DC[@]}" exec -T db psql -X -U candles -d candle_collector -Atc \
     "SELECT extversion FROM pg_extension WHERE extname = 'timescaledb'")
 FILENAME="candle_collector-${TIMESTAMP}-timescaledb-${TSDB_VERSION}.dump"
 FILEPATH="${BACKUP_DIR}/${FILENAME}"
-PARTIAL="${FILEPATH}.partial"
 
 echo "==> Backing up candle_collector to ${FILEPATH}"
 
@@ -74,7 +70,6 @@ echo "==> Backing up candle_collector to ${FILEPATH}"
 echo "==> Verifying backup..."
 "${DC[@]}" exec -T db pg_restore --file=/dev/null < "$PARTIAL"
 mv "$PARTIAL" "$FILEPATH"
-PARTIAL=""
 
 SIZE=$(du -h "$FILEPATH" | cut -f1)
 echo "==> Backup complete: ${FILEPATH} (${SIZE})"

@@ -125,9 +125,9 @@ done
 # -- Offsite backup freshness -------------------------------------------------
 # Checked only once offsite backup is configured (the env file scripts/backup-offsite.sh
 # reads). A failed run pages from that script; this catches the runs that never start.
-# Its own reminder file, not the shared cooldown below, so a stale backup never mutes a
-# container-down page. The env file and marker paths come from scripts/offsite-lib.sh; a
-# checkout without it skips this check, never the ones after it. Reminder state moves only
+# Its own reminder file, so a stale backup never mutes another check's page. The env file and
+# marker paths come from scripts/offsite-lib.sh; a checkout without it skips this check, never
+# the ones after it. Reminder state moves only
 # on a delivered page, so an undelivered one is retried next run.
 offsite_lib_loaded=0
 if [ -f "$PROJECT_DIR/scripts/offsite-lib.sh" ]; then
