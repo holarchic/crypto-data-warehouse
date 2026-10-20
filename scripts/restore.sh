@@ -23,6 +23,10 @@ if [ $# -lt 1 ]; then
 fi
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+PROJECT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
+# The prod override is part of every server compose command; absolute paths keep it independent
+# of the caller's directory.
+DC=(docker compose -f "$PROJECT_DIR/docker-compose.yml" -f "$PROJECT_DIR/docker-compose.prod.yml")
 BACKUP_FILE="$1"
 CONTAINER_DUMP="/tmp/candle_collector-restore-$$.dump"
 # mkdir is atomic on every platform the script runs on, unlike flock (absent on macOS). A fixed
@@ -33,13 +37,14 @@ if [ ! -f "$BACKUP_FILE" ]; then
     echo "Error: backup file not found: ${BACKUP_FILE}"
     exit 1
 fi
+BACKUP_FILE="$(cd "$(dirname "$BACKUP_FILE")" && pwd)/$(basename "$BACKUP_FILE")"
 
 fail() { echo "==> FATAL: $*" >&2; exit 1; }
 # Statements go in on stdin, so psql variables (-v) interpolate.
-db_sql() { docker compose exec -T db psql -X -v ON_ERROR_STOP=1 -U candles "$@"; }
+db_sql() { "${DC[@]}" exec -T db psql -X -v ON_ERROR_STOP=1 -U candles "$@"; }
 # A staged dump left behind is reported; the exit status stays the run's own.
 cleanup() {
-    if ! docker compose exec -T db rm -f "$CONTAINER_DUMP" > /dev/null 2>&1; then
+    if ! "${DC[@]}" exec -T db rm -f "$CONTAINER_DUMP" > /dev/null 2>&1; then
         echo "==> WARNING: ${CONTAINER_DUMP} may remain in the db container" >&2
     fi
     rmdir "$LOCK_DIR" 2>/dev/null || true
@@ -78,9 +83,9 @@ SQL
 [ "$available" = "1" ] || fail "TimescaleDB ${TSDB_VERSION} is not available in this db image; the restore needs the dump's version"
 
 echo "==> Copying the dump into the db container..."
-docker compose cp "$BACKUP_FILE" "db:${CONTAINER_DUMP}"
+"${DC[@]}" cp "$BACKUP_FILE" "db:${CONTAINER_DUMP}"
 echo "==> Checking the archive reads end to end, and the tablespaces it needs..."
-tablespaces=$(docker compose exec -T db sh -c \
+tablespaces=$("${DC[@]}" exec -T db sh -c \
     'set -o pipefail; pg_restore --file=- "$1" | sed -n "s/^SET default_tablespace = \(.*\);\$/\1/p" | sort -u' \
     _ "$CONTAINER_DUMP") \
     || fail "${BACKUP_FILE} is not a readable pg_dump archive; candle_collector is untouched"
@@ -109,7 +114,7 @@ SELECT timescaledb_pre_restore();
 SQL
 
 echo "==> Restoring from ${BACKUP_FILE} (strict: any error stops the restore)..."
-docker compose exec -T db pg_restore -U candles -d candle_collector --exit-on-error "$CONTAINER_DUMP"
+"${DC[@]}" exec -T db pg_restore -U candles -d candle_collector --exit-on-error "$CONTAINER_DUMP"
 
 # A dump taken before migration 013 carries retention jobs. Clear them before post_restore
 # restarts the job scheduler, or the next run drops old history.
