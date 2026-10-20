@@ -18,7 +18,7 @@ from dataclasses import dataclass, field
 
 from backoff import backoff_sleep
 from config import ExchangeConfig
-from status import query_active_pairs, upsert_loop_heartbeat
+from status import Instrument, active_instruments, upsert_loop_heartbeat
 from websocket import (
     WebSocketConnectionClosedException,
     WebSocketException,
@@ -60,7 +60,7 @@ class WSFeedSpec:
     name: str                                             # feed label for logs/thread name (NOT a DB key)
     loop_tf: str                                          # liveness heartbeat pseudo-TF (config.LOOP_INTERVALS key)
     url: str                                              # WS endpoint
-    topics_for_pairs: Callable[[list[dict]], list[str]]   # active pairs → topic list (constant for Binance)
+    topics_for_pairs: Callable[[list[Instrument]], list[str]]   # active instruments → topic list (constant for Binance)
     subscribe_frames: Callable[[list[str]], list[str]]    # topics → subscribe messages (batched; venue owns arg cap)
     unsubscribe_frames: Callable[[list[str]], list[str]]  # topics → unsubscribe messages
     parse_message: Callable[[str], list[dict]]            # raw frame → event dicts ([] for control/ignored frames)
@@ -115,7 +115,7 @@ def _guarded_rollback(runtime: _WSRuntime) -> None:
             pass
 
 
-def _active_pairs(runtime: _WSRuntime, config: ExchangeConfig, dsn: str, thread_name: str) -> list[dict] | None:
+def _active_pairs(runtime: _WSRuntime, config: ExchangeConfig, dsn: str, thread_name: str) -> list[Instrument] | None:
     """Active pairs for topic derivation, or None on DB failure (distinct from [] = no pairs).
 
     Commits immediately after the read: `connect_db` is NOT autocommit, so a bare SELECT would
@@ -124,11 +124,11 @@ def _active_pairs(runtime: _WSRuntime, config: ExchangeConfig, dsn: str, thread_
     if not _ensure_conn(runtime, dsn):
         return None
     try:
-        pairs = query_active_pairs(runtime.conn, config.name, "5m")
+        pairs = active_instruments(runtime.conn, config.name)
         runtime.conn.commit()
         return pairs
     except Exception:
-        log.exception("[%s] query_active_pairs failed", thread_name)
+        log.exception("[%s] active_instruments failed", thread_name)
         _guarded_rollback(runtime)
         return None
 

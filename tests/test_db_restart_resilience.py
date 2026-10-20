@@ -15,6 +15,8 @@ from types import SimpleNamespace
 import config as _config_mod
 import funding
 
+from tests.instruments import instrument
+
 
 class _StopLoop(Exception):
     """Break out of a `while True` loop-drive after N cycles."""
@@ -69,7 +71,7 @@ def test_funding_loop_survives_db_restart_during_bulk_insert(monkeypatch):
             raise _StopLoop
 
     monkeypatch.setattr(funding, "connect_db", fake_connect)
-    monkeypatch.setattr(funding, "_get_active_pairs", lambda c, name: [{"symbol": "BTC/USDT:USDT", "asset_id": "BTC"}])
+    monkeypatch.setattr(funding, "active_instruments", lambda c, name: [instrument(symbol="BTC/USDT:USDT", asset_id="BTC")])
     monkeypatch.setattr(funding, "_seed_funding", lambda *a: None)
     monkeypatch.setattr(funding, "_parse_funding_record", lambda *a, **k: None)
     monkeypatch.setattr(funding, "_insert_funding", boom_insert)

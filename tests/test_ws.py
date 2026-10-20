@@ -1,7 +1,7 @@
 """Tests for collector/ws.py — the generic WS engine.
 
 No real socket or DB: conftest stubs db/status/backoff as MagicMock, so we monkeypatch
-`ws.connect_db`/`ws.query_active_pairs`/`ws.upsert_loop_heartbeat` and drive a scripted
+`ws.connect_db`/`ws.active_instruments`/`ws.upsert_loop_heartbeat` and drive a scripted
 `FakeWS` + an injected clock. Buffer mechanics test the factored helpers (`_flush`,
 `_active_pairs`, `_ensure_conn`, `_cap_buffer`) directly; timer/reconnect behavior drives
 the full `ws_loop`. Real DB-engine behavior (ON CONFLICT, real rollback) is prod-verified.
@@ -13,6 +13,8 @@ from unittest.mock import MagicMock, call
 import ws  # ws is not stubbed by conftest → the real module
 from config import ExchangeConfig
 from websocket import WebSocketConnectionClosedException, WebSocketTimeoutException
+
+from tests.instruments import instrument
 
 # --- Test doubles ------------------------------------------------------------
 
@@ -116,7 +118,7 @@ def _spec(insert_batch, *, venue="bybit", parse_message=None, **overrides):
                     subscribe_frames=lambda topics: [], unsubscribe_frames=lambda topics: [],
                     ping_frame=None, ping_interval_s=None, proactive_reconnect_s=86400.0)
     else:
-        base = dict(topics_for_pairs=lambda pairs: [f"allLiquidation.{p['native_symbol']}" for p in pairs],
+        base = dict(topics_for_pairs=lambda pairs: [f"allLiquidation.{p.native_symbol}" for p in pairs],
                     subscribe_frames=_bybit_subs, unsubscribe_frames=_bybit_unsubs,
                     ping_frame='{"op":"ping"}', ping_interval_s=20.0, proactive_reconnect_s=None)
     base.update(name="liquidations", loop_tf="liq_ws", url=f"wss://fake/{venue}",
@@ -126,13 +128,13 @@ def _spec(insert_batch, *, venue="bybit", parse_message=None, **overrides):
 
 
 def _patch_db(monkeypatch, pairs=None, conn=None):
-    """Wire connect_db → a FakeConn and query_active_pairs → a fixed pair list (or side_effect)."""
+    """Wire connect_db → a FakeConn and active_instruments → a fixed instrument list (or side_effect)."""
     conn = conn or FakeConn()
     monkeypatch.setattr(ws, "connect_db", lambda dsn, **kw: conn)
     if callable(pairs):
-        monkeypatch.setattr(ws, "query_active_pairs", pairs)
+        monkeypatch.setattr(ws, "active_instruments", pairs)
     else:
-        monkeypatch.setattr(ws, "query_active_pairs", lambda c, name, tf: list(pairs or []))
+        monkeypatch.setattr(ws, "active_instruments", lambda c, name: list(pairs or []))
     hb = MagicMock()
     monkeypatch.setattr(ws, "upsert_loop_heartbeat", hb)
     return conn, hb
@@ -199,7 +201,7 @@ def test_insert_failure_caps_buffer():
 
 
 def test_reconnect_resubscribes(monkeypatch):
-    _patch_db(monkeypatch, pairs=[{"native_symbol": "BTCUSDT"}])
+    _patch_db(monkeypatch, pairs=[instrument(native_symbol="BTCUSDT")])
     spec = _spec(MagicMock(return_value=0), venue="bybit")
     ws1, ws2 = FakeWS([("drop", None)], [0.0]), FakeWS([("drop", None)], [0.0])
     _, clk = _clock()
@@ -213,12 +215,12 @@ def test_topics_survive_reconnect_during_db_outage(monkeypatch):
     """A per-symbol feed that reconnects while the DB is down must re-subscribe its LAST-KNOWN
     topics (cached in _WSRuntime), not come back subscribed to nothing until the DB returns."""
     pairs = MagicMock(side_effect=[
-        [{"native_symbol": "BTCUSDT"}],  # session1 initial subscribe → caches {BTCUSDT}
+        [instrument(native_symbol="BTCUSDT")],  # session1 initial subscribe → caches {BTCUSDT}
         RuntimeError("db down"),          # session2 initial subscribe → _active_pairs returns None
     ])
     conn = FakeConn()
     monkeypatch.setattr(ws, "connect_db", lambda dsn, **kw: conn)
-    monkeypatch.setattr(ws, "query_active_pairs", pairs)
+    monkeypatch.setattr(ws, "active_instruments", pairs)
     monkeypatch.setattr(ws, "upsert_loop_heartbeat", MagicMock())
     ws1, ws2 = FakeWS([("drop", None)], [0.0]), FakeWS([("drop", None)], [0.0])
     _, clk = _clock()
@@ -281,7 +283,7 @@ def test_error_count_resets_on_healthy_reconnect(monkeypatch):
 
 
 def test_ping_timer_fires_bybit_not_binance(monkeypatch):
-    _patch_db(monkeypatch, pairs=[{"native_symbol": "BTCUSDT"}])
+    _patch_db(monkeypatch, pairs=[instrument(native_symbol="BTCUSDT")])
     box, clk = _clock()
     fake = FakeWS([("jump", 25)], box)  # past ping_interval_s(20)
     ws.ws_loop(_spec(MagicMock(), venue="bybit"), _config(), "dsn", connect_fn=_connector([fake]), clock=clk, max_sessions=1)
@@ -308,7 +310,7 @@ def test_heartbeat_fires_while_silent(monkeypatch):
 
 
 def test_initial_subscribe_with_pairs(monkeypatch):
-    _patch_db(monkeypatch, pairs=[{"native_symbol": "BTCUSDT"}, {"native_symbol": "ETHUSDT"}])
+    _patch_db(monkeypatch, pairs=[instrument(native_symbol="BTCUSDT"), instrument(native_symbol="ETHUSDT")])
     box, clk = _clock()
     fake = FakeWS([("drop", None)], box)
     ws.ws_loop(_spec(MagicMock(), venue="bybit"), _config(), "dsn", connect_fn=_connector([fake]), clock=clk, max_sessions=1)
@@ -329,8 +331,8 @@ def test_initial_subscribe_zero_pairs_enters_recv(monkeypatch):
 
 def test_resubscribe_on_pair_set_change(monkeypatch):
     pairs = MagicMock(side_effect=[
-        [{"native_symbol": "BTCUSDT"}],                              # initial subscribe
-        [{"native_symbol": "BTCUSDT"}, {"native_symbol": "ETHUSDT"}],  # resubscribe: +ETH
+        [instrument(native_symbol="BTCUSDT")],                              # initial subscribe
+        [instrument(native_symbol="BTCUSDT"), instrument(native_symbol="ETHUSDT")],  # resubscribe: +ETH
     ])
     _patch_db(monkeypatch, pairs=pairs)
     box, clk = _clock()
@@ -431,10 +433,10 @@ def test_buffer_survives_reconnect(monkeypatch):
 
 
 def test_active_pairs_commits_to_close_read_txn(monkeypatch):
-    conn, _ = _patch_db(monkeypatch, pairs=[{"native_symbol": "BTCUSDT"}])
+    conn, _ = _patch_db(monkeypatch, pairs=[instrument(native_symbol="BTCUSDT")])
     runtime = ws._WSRuntime(conn=conn, buffer=[])
     pairs = ws._active_pairs(runtime, _config(), "dsn", "t")
-    assert pairs == [{"native_symbol": "BTCUSDT"}]
+    assert pairs == [instrument(native_symbol="BTCUSDT")]
     assert conn.commits == 1  # read txn closed → no idle-in-transaction on a quiet WS conn
 
 
@@ -442,7 +444,7 @@ def test_active_pairs_commits_to_close_read_txn(monkeypatch):
 
 
 def test_two_divergent_specs_drive_engine(monkeypatch):
-    _patch_db(monkeypatch, pairs=[{"native_symbol": "BTCUSDT"}])
+    _patch_db(monkeypatch, pairs=[instrument(native_symbol="BTCUSDT")])
     for venue in ("binance", "bybit"):
         insert = MagicMock(return_value=1)
         box, clk = _clock()

@@ -87,7 +87,7 @@ def _rebuild_map(native_to_asset, pairs):
     closures keep the same dict object). Single-threaded per ws_loop → no lock needed."""
     native_to_asset.clear()
     native_to_asset.update(
-        {p["native_symbol"]: p["asset_id"] for p in pairs if p.get("native_symbol")}
+        {p.native_symbol: p.asset_id for p in pairs if p.native_symbol}
     )
 
 
@@ -221,7 +221,7 @@ def build_bybit_liq_spec() -> WSFeedSpec:
 
     def topics_for_pairs(pairs):
         _rebuild_map(native_to_asset, pairs)
-        topics = [f"allLiquidation.{p['native_symbol']}" for p in pairs if p.get("native_symbol")]
+        topics = [f"allLiquidation.{p.native_symbol}" for p in pairs if p.native_symbol]
         _check_bybit_ceiling(topics)
         return topics
 

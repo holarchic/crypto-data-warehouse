@@ -6,9 +6,11 @@ import logging
 import liquidations as liq
 from config import LIQUIDATION_WS
 
+from tests.instruments import instrument
+
 PAIRS = [
-    {"native_symbol": "BTCUSDT", "asset_id": "BTC", "symbol": "BTC/USDT:USDT"},
-    {"native_symbol": "ETHUSDT", "asset_id": "ETH", "symbol": "ETH/USDT:USDT"},
+    instrument(native_symbol="BTCUSDT", asset_id="BTC", symbol="BTC/USDT:USDT"),
+    instrument(native_symbol="ETHUSDT", asset_id="ETH", symbol="ETH/USDT:USDT"),
 ]
 
 
@@ -111,7 +113,7 @@ def test_bybit_spec_topics_and_resolution_and_rebuild():
     assert spec.parse_message(_bybit_frame([
         {"T": 1739502302929, "s": "BTCUSDT", "S": "Buy", "v": "1", "p": "9"}]))[0]["asset_id"] == "BTC"
     # A pair-set change rebuilds the map: the old native no longer resolves.
-    spec.topics_for_pairs([{"native_symbol": "SOLUSDT", "asset_id": "SOL"}])
+    spec.topics_for_pairs([instrument(native_symbol="SOLUSDT", asset_id="SOL")])
     assert spec.parse_message(_bybit_frame([
         {"T": 1739502302929, "s": "BTCUSDT", "S": "Buy", "v": "1", "p": "9"}])) == []
 

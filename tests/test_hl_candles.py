@@ -11,12 +11,14 @@ from hl_candles import (
     build_hl_candle_spec,
 )
 
+from tests.instruments import instrument
+
 # DB rows carry cc's canonical (ccxt-uppercase) asset_id; ccxt `info.name` is HL's authoritative WS
 # coin name — equal for normals, lowercase-`k` for 1000× tokens (KPEPE→kPEPE).
 _PAIRS = [
-    {"symbol": "BTC/USDC:USDC", "asset_id": "BTC", "native_symbol": "0", "market_type": "perp"},
-    {"symbol": "AAVE/USDC:USDC", "asset_id": "AAVE", "native_symbol": "28", "market_type": "perp"},
-    {"symbol": "KPEPE/USDC:USDC", "asset_id": "KPEPE", "native_symbol": "15", "market_type": "perp"},
+    instrument(symbol="BTC/USDC:USDC", asset_id="BTC", native_symbol="0", market_type="perp"),
+    instrument(symbol="AAVE/USDC:USDC", asset_id="AAVE", native_symbol="28", market_type="perp"),
+    instrument(symbol="KPEPE/USDC:USDC", asset_id="KPEPE", native_symbol="15", market_type="perp"),
 ]
 
 

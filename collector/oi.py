@@ -31,7 +31,7 @@ from rate_limiter import (
     paced_call,
 )
 from slots import sleep_until_next_slot
-from status import query_active_pairs, upsert_loop_heartbeat
+from status import active_instruments, upsert_loop_heartbeat
 
 from db import connect_db, create_exchange, maybe_reload_markets, safe_rollback
 
@@ -105,12 +105,6 @@ def _to_float(x, field=None):
     if not math.isfinite(v):  # NaN or ±inf
         raise _CtxParseError(f"{field or '?'} not finite ({v})")
     return v
-
-
-def _get_active_pairs(conn, exchange_name):
-    """Get active pairs from collection_status. Every venue polls 5m, so its 5m rows are the
-    venue's active universe."""
-    return query_active_pairs(conn, exchange_name, "5m")
 
 
 def _exec_rows(cur, sql, rows):
@@ -274,8 +268,8 @@ def _build_hl_snapshots(universe, asset_ctxs, asset_to_pair, exchange, now_ts):
 
         oi_rows.append({
             "exchange": exchange,
-            "asset_id": pair["asset_id"],
-            "symbol": pair["symbol"],
+            "asset_id": pair.asset_id,
+            "symbol": pair.symbol,
             "timestamp": now_ts,
             "open_interest": oi_val,
             "oi_value_usd": oi_value_usd,
@@ -285,7 +279,7 @@ def _build_hl_snapshots(universe, asset_ctxs, asset_to_pair, exchange, now_ts):
             # passthrough. Differs from `open_interest.asset_id` (ccxt-canonical `KPEPE`) only for 1000×
             # tokens; `hl_asset_ctxs` is HL-only + seed-mirroring, `open_interest` is cross-venue.
             "asset_id": name,
-            "symbol": pair["symbol"],
+            "symbol": pair.symbol,
             "timestamp": now_ts,
             **bundle,
         })
@@ -313,7 +307,7 @@ def _oi_loop_hyperliquid(config: ExchangeConfig, dsn: str):
 
         # Get active pairs
         try:
-            pairs = _get_active_pairs(conn, config.name)
+            pairs = active_instruments(conn, config.name)
         except Exception:
             log.exception("[%s] Failed to query active pairs", thread_name)
             safe_rollback(conn)
@@ -327,7 +321,7 @@ def _oi_loop_hyperliquid(config: ExchangeConfig, dsn: str):
             continue
 
         # Build asset_id → pair lookup
-        asset_to_pair = {p["asset_id"]: p for p in pairs}
+        asset_to_pair = {p.asset_id: p for p in pairs}
 
         try:
             universe, asset_ctxs = _fetch_hl_meta_and_ctxs()
@@ -373,7 +367,7 @@ def _parse_bulk_oi_bybit(tickers, active, exchange_name, now_ts):
             dropped.append(f"{sym}({exc})")
             continue
         rows.append({
-            "exchange": exchange_name, "asset_id": pair["asset_id"], "symbol": sym,
+            "exchange": exchange_name, "asset_id": pair.asset_id, "symbol": sym,
             "timestamp": now_ts, "open_interest": oi_amt, "oi_value_usd": oi_usd,
         })
     return rows, dropped
@@ -396,7 +390,7 @@ def _parse_bulk_oi_okx(ois, price_map, active, exchange_name, now_ts):
             if price is not None:
                 oi_usd = oi_amt * price
         rows.append({
-            "exchange": exchange_name, "asset_id": pair["asset_id"], "symbol": sym,
+            "exchange": exchange_name, "asset_id": pair.asset_id, "symbol": sym,
             "timestamp": now_ts, "open_interest": oi_amt, "oi_value_usd": oi_usd,
         })
     return rows
@@ -418,7 +412,7 @@ def _oi_loop_bulk(exchange, config: ExchangeConfig, dsn: str, rate_limiter: Rate
                 continue
 
         try:
-            pairs = _get_active_pairs(conn, config.name)
+            pairs = active_instruments(conn, config.name)
         except Exception:
             log.exception("[%s] Failed to query active pairs", thread_name)
             safe_rollback(conn)
@@ -431,7 +425,7 @@ def _oi_loop_bulk(exchange, config: ExchangeConfig, dsn: str, rate_limiter: Rate
             sleep_until_next_slot(config.oi_poll_interval_s, OI_POLL_BUFFER_S, started, thread_name)
             continue
 
-        active = {p["symbol"]: p for p in pairs}
+        active = {p.symbol: p for p in pairs}
         now_ts = time.time()
         dropped = []
         try:
@@ -524,10 +518,10 @@ def _dense_row(oi_data, pair, exchange_name, funding_rates, now_ts):
     if oi_data is None:
         return None
     oi_amt = oi_data.get("openInterestAmount")
-    mark = (funding_rates.get(pair["symbol"]) or {}).get("markPrice")
+    mark = (funding_rates.get(pair.symbol) or {}).get("markPrice")
     oi_usd = oi_amt * mark if oi_amt is not None and mark is not None else None
     return {
-        "exchange": exchange_name, "asset_id": pair["asset_id"], "symbol": pair["symbol"],
+        "exchange": exchange_name, "asset_id": pair.asset_id, "symbol": pair.symbol,
         "timestamp": now_ts, "open_interest": oi_amt, "oi_value_usd": oi_usd,
     }
 
@@ -541,7 +535,7 @@ def _binance_dense_fetch(exchange, exchange_name, rate_limiter, dense_pairs, fun
     exactly why `_DenseFetchPool` parallelizes it — but with isolated per-worker sessions."""
     rows = []
     for pair in dense_pairs:
-        sym = pair["symbol"]
+        sym = pair.symbol
         try:
             # priority=True: dense OI rides the reserved weight lane (T-007.4) so it never
             # blocks on the candle-kline burst — an untaken instantaneous OI sample is unbackfillable.
@@ -610,7 +604,7 @@ class _DenseFetchPool:
         try:
             # priority=True: dense OI weight lane (T-007.4) — see _binance_dense_fetch.
             oi_data = paced_call(
-                rate_limiter, ex, BINANCE_OI_WEIGHT, ex.fetch_open_interest, pair["symbol"],
+                rate_limiter, ex, BINANCE_OI_WEIGHT, ex.fetch_open_interest, pair.symbol,
                 priority=True,
             )
             return _dense_row(oi_data, pair, exchange_name, funding_rates, now_ts)
@@ -634,7 +628,7 @@ class _DenseFetchPool:
             for p in dense_pairs
         }
         for fut in as_completed(futures):
-            sym = futures[fut]["symbol"]
+            sym = futures[fut].symbol
             try:
                 row = fut.result()
             except RETRIABLE_EXCEPTIONS as exc:
@@ -656,7 +650,7 @@ def _binance_baseline_sweep(exchange, exchange_name, rate_limiter, conn, due_pai
     successful commit — a fetch/insert failure leaves the cursor unadvanced (no gap)."""
     inserted_total = 0
     for pair in due_pairs:
-        sym = pair["symbol"]
+        sym = pair.symbol
         cursor = baseline_cursor.get(sym)
         since_ms = int(cursor * 1000) + 1 if cursor else None
         try:
@@ -677,7 +671,7 @@ def _binance_baseline_sweep(exchange, exchange_name, rate_limiter, conn, due_pai
                 continue
             ts_s = ts_ms / 1000
             rows.append({
-                "exchange": exchange_name, "asset_id": pair["asset_id"], "symbol": sym,
+                "exchange": exchange_name, "asset_id": pair.asset_id, "symbol": sym,
                 "timestamp": ts_s, "open_interest": h.get("openInterestAmount"),
                 "oi_value_usd": h.get("openInterestValue"),
             })
@@ -743,7 +737,7 @@ def _oi_loop_binance(exchange, config: ExchangeConfig, dsn: str, rate_limiter: R
                 continue
 
         try:
-            pairs = _get_active_pairs(conn, config.name)
+            pairs = active_instruments(conn, config.name)
         except Exception:
             log.exception("[%s] Failed to query active pairs", thread_name)
             safe_rollback(conn)
@@ -767,7 +761,7 @@ def _oi_loop_binance(exchange, config: ExchangeConfig, dsn: str, rate_limiter: R
                 if not conn.closed:
                     safe_rollback(conn)
 
-        active = {p["symbol"]: p for p in pairs}
+        active = {p.symbol: p for p in pairs}
         # Prune cross-tick state to currently-active symbols so the maps track the active
         # set, not every symbol ever seen (listing churn would otherwise grow them unbounded).
         _prune_binance_state(active.keys(), prev_next_ft, settlement_at, baseline_cursor, baseline_last_fetch)
@@ -829,7 +823,7 @@ def _oi_loop_binance(exchange, config: ExchangeConfig, dsn: str, rate_limiter: R
             batch = _baseline_batch_size(len(pairs), config.oi_poll_interval_s, config.oi_baseline_interval_s)
             due = [
                 p for p in pairs
-                if now - baseline_last_fetch.get(p["symbol"], 0) >= config.oi_baseline_interval_s
+                if now - baseline_last_fetch.get(p.symbol, 0) >= config.oi_baseline_interval_s
             ][:batch]
             base_inserted = _binance_baseline_sweep(
                 exchange, config.name, rate_limiter, conn, due,

@@ -8,6 +8,8 @@ import hl_candles_repair as hl
 import pytest
 from config import CANDLE_REPAIR, LOOP_INTERVALS
 
+from tests.instruments import instrument
+
 H = hl.HOUR_MS
 M = hl.MINUTE_MS
 NOW = 1_792_400_000_000 // M * M + 30_000  # mid-minute, so `end` floors
@@ -172,8 +174,8 @@ def test_coin_complete_refuses_a_stored_row_rest_lacks():
 
 
 PAIRS = [
-    {"symbol": "BTC/USDC:USDC", "asset_id": "BTC", "native_symbol": "0", "market_type": "perp"},
-    {"symbol": "KPEPE/USDC:USDC", "asset_id": "KPEPE", "native_symbol": "9", "market_type": "perp"},
+    instrument(symbol="BTC/USDC:USDC", asset_id="BTC", native_symbol="0", market_type="perp"),
+    instrument(symbol="KPEPE/USDC:USDC", asset_id="KPEPE", native_symbol="9", market_type="perp"),
 ]
 NAMES = {"BTC": "BTC", "KPEPE": "kPEPE"}
 
@@ -205,7 +207,7 @@ class World:
         monkeypatch.setattr(hl, "bootstrap_cursor", self._bootstrap)
         monkeypatch.setattr(hl, "active_pairs", lambda conn: self.pairs)
         monkeypatch.setattr(hl, "stored_minutes", lambda conn, pair, s, e: {
-            t for t in self.stored.get(pair["symbol"], set()) if s <= t < e})
+            t for t in self.stored.get(pair.symbol, set()) if s <= t < e})
         monkeypatch.setattr(hl, "write_bars", self._write)
         monkeypatch.setattr(hl, "advance_cursor", lambda conn, end: self.advanced.append(end))
 
@@ -214,7 +216,7 @@ class World:
         self.cursor = cursor
 
     def _write(self, conn, pair, bars):
-        self.writes.append((pair["symbol"], [b["t"] for b in bars]))
+        self.writes.append((pair.symbol, [b["t"] for b in bars]))
         return 0, len(bars)
 
     def fetch(self, coin, s, e):
@@ -340,7 +342,7 @@ def test_run_empty_universe_fails(monkeypatch):
 
 def test_run_meta_name_missing_is_a_coin_failure(monkeypatch):
     w = World(monkeypatch, cursor=END - 20 * H,
-              pairs=PAIRS + [{"symbol": "NEW/USDC:USDC", "asset_id": "NEW", "native_symbol": "", "market_type": "perp"}])
+              pairs=PAIRS + [instrument(symbol="NEW/USDC:USDC", asset_id="NEW", native_symbol="", market_type="perp")])
     assert w.run() == 1 and w.advanced == []
 
 
@@ -355,7 +357,7 @@ def test_run_429_retries_counts_and_exits_1(monkeypatch):
 def test_run_refuses_a_slice_that_aged_past_rest_through_pacing(monkeypatch):
     # A 72 h catch-up whose budget a 429 halved: by the time the oldest slice reaches its later coins,
     # that slice starts more than 82 h back and is refused rather than certified.
-    many = [{"symbol": f"C{i}/USDC:USDC", "asset_id": f"C{i}", "native_symbol": "", "market_type": "perp"}
+    many = [instrument(symbol=f"C{i}/USDC:USDC", asset_id=f"C{i}", native_symbol="", market_type="perp")
             for i in range(161)]
     w = World(monkeypatch, cursor=END - 70 * H, pairs=many)
     w.rate_limit_next = 1

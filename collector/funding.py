@@ -11,7 +11,7 @@ from rate_limiter import (
     RateLimiter,
     paced_call,
 )
-from status import query_active_pairs, upsert_loop_heartbeat
+from status import active_instruments, upsert_loop_heartbeat
 
 from db import connect_db, safe_rollback
 
@@ -28,11 +28,6 @@ FUNDING_INTERVAL_HOURS = {
     "hyperliquid": 1,
 }
 DEFAULT_FUNDING_INTERVAL = 8
-
-
-def _get_active_pairs(conn, exchange_name):
-    """Get active pairs from collection_status (5m timeframe = finest granularity)."""
-    return query_active_pairs(conn, exchange_name, "5m")
 
 
 def _parse_funding_record(record, exchange_name, pair, from_bulk=False):
@@ -56,8 +51,8 @@ def _parse_funding_record(record, exchange_name, pair, from_bulk=False):
 
     return {
         "exchange": exchange_name,
-        "asset_id": pair["asset_id"],
-        "symbol": pair["symbol"],
+        "asset_id": pair.asset_id,
+        "symbol": pair.symbol,
         "timestamp": ts_ms / 1000,
         "rate": record.get("fundingRate"),
         "predicted_rate": record.get("nextFundingRate"),
@@ -90,7 +85,7 @@ def _seed_funding(exchange, config, conn, pairs, rate_limiter):
         try:
             history = paced_call(
                 rate_limiter, exchange, BINANCE_FUNDING_HISTORY_WEIGHT,
-                exchange.fetch_funding_rate_history, pair["symbol"], limit=100,
+                exchange.fetch_funding_rate_history, pair.symbol, limit=100,
             )
             rows = []
             for record in history:
@@ -100,12 +95,12 @@ def _seed_funding(exchange, config, conn, pairs, rate_limiter):
             inserted = _insert_funding(conn, rows)
             total_inserted += inserted
         except RETRIABLE_EXCEPTIONS as exc:
-            log.warning("[%s/funding] Seed retriable error on %s: %s", config.name, pair["symbol"], exc)
+            log.warning("[%s/funding] Seed retriable error on %s: %s", config.name, pair.symbol, exc)
             if conn.closed:
                 return
             safe_rollback(conn)
         except Exception as exc:
-            log.warning("[%s/funding] Seed error on %s: %s", config.name, pair["symbol"], exc)
+            log.warning("[%s/funding] Seed error on %s: %s", config.name, pair.symbol, exc)
             if not conn.closed:
                 safe_rollback(conn)
 
@@ -131,7 +126,7 @@ def _poll_bulk(exchange, config, conn, pairs, rate_limiter):
         return 0
 
     # Build symbol lookup from active pairs
-    active_symbols = {p["symbol"]: p for p in pairs}
+    active_symbols = {p.symbol: p for p in pairs}
     rows = []
     for symbol, record in all_rates.items():
         if symbol not in active_symbols:
@@ -160,7 +155,7 @@ def _poll_dydx(exchange, config, conn, pairs, rate_limiter):
         try:
             history = paced_call(
                 rate_limiter, exchange, BINANCE_FUNDING_HISTORY_WEIGHT,
-                exchange.fetch_funding_rate_history, pair["symbol"], limit=1,
+                exchange.fetch_funding_rate_history, pair.symbol, limit=1,
             )
             rows = []
             for record in history:
@@ -169,12 +164,12 @@ def _poll_dydx(exchange, config, conn, pairs, rate_limiter):
                     rows.append(row)
             total_inserted += _insert_funding(conn, rows)
         except RETRIABLE_EXCEPTIONS as exc:
-            log.warning("[%s/funding] dYdX retriable error on %s: %s", config.name, pair["symbol"], exc)
+            log.warning("[%s/funding] dYdX retriable error on %s: %s", config.name, pair.symbol, exc)
             if conn.closed:
                 return total_inserted
             safe_rollback(conn)
         except Exception as exc:
-            log.warning("[%s/funding] dYdX error on %s: %s", config.name, pair["symbol"], exc)
+            log.warning("[%s/funding] dYdX error on %s: %s", config.name, pair.symbol, exc)
             if not conn.closed:
                 safe_rollback(conn)
 
@@ -225,7 +220,7 @@ def funding_loop(exchange, config: ExchangeConfig, dsn: str, rate_limiter: RateL
 
         # Get active pairs
         try:
-            pairs = _get_active_pairs(conn, config.name)
+            pairs = active_instruments(conn, config.name)
         except Exception:
             log.exception("[%s] Failed to query active pairs", thread_name)
             safe_rollback(conn)

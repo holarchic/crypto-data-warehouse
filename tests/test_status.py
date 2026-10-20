@@ -97,3 +97,17 @@ def test_collector_success_write_never_reactivates_a_pair():
     pair list must not resurrect a pair discovery just dropped (it would then re-enter at the keep threshold)."""
     on_conflict = status.UPSERT_SUCCESS_SQL.split("DO UPDATE SET", 1)[1]
     assert not re.search(r"\bactive\s*=", on_conflict)
+
+
+COLLECTOR = Path(status.__file__).parent
+UNIVERSE_CONSUMERS = ["funding.py", "oi.py", "premium_index.py", "ws.py", "hl_candles_repair.py"]
+
+
+def test_the_universe_has_one_reader():
+    """Feeds take the venue's instruments from active_instruments; only the candle loop reads the
+    per-timeframe rows (with their cursor) through query_active_pairs."""
+    callers = {path.name for path in COLLECTOR.glob("*.py")
+               if path.name != "status.py" and re.search(r"\bquery_active_pairs\(", path.read_text())}
+    assert callers == {"main.py"}
+    for name in UNIVERSE_CONSUMERS:
+        assert re.search(r"\bactive_instruments\(", (COLLECTOR / name).read_text()), name

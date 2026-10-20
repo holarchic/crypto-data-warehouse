@@ -86,7 +86,7 @@ def _ts_seconds(ms):
 def _hl_name(pair, name_by_asset):
     """The HL WS coin name for a pair: ccxt's authoritative `info.name` (falls back to the cc asset_id
     when absent — correct for every coin whose HL name already equals its uppercase base)."""
-    return name_by_asset.get(pair["asset_id"], pair["asset_id"])
+    return name_by_asset.get(pair.asset_id, pair.asset_id)
 
 
 def _rebuild_map(asset_map, pairs, name_by_asset):
@@ -96,12 +96,12 @@ def _rebuild_map(asset_map, pairs, name_by_asset):
     asset_map.clear()
     asset_map.update({
         _hl_name(p, name_by_asset): {
-            "asset_id": p["asset_id"],
-            "symbol": p["symbol"],
-            "native_symbol": p.get("native_symbol") or "",
-            "market_type": p.get("market_type") or "perp",
+            "asset_id": p.asset_id,
+            "symbol": p.symbol,
+            "native_symbol": p.native_symbol or "",
+            "market_type": p.market_type,
         }
-        for p in pairs if p.get("asset_id")
+        for p in pairs if p.asset_id
     })
 
 
