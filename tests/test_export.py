@@ -16,6 +16,7 @@ from pathlib import Path
 import export
 import pyarrow as pa
 import pyarrow.parquet as pq
+import pytest
 
 # The real backtester seed schema (`hl-asset-ctxs.parquet`), read-verified 2026-07-06 against the
 # 240,336,969-row file. Names + types are the backtester-hash contract (it name-sorts, so order is not
@@ -62,6 +63,16 @@ def _read(data: bytes) -> pa.Table:
     return pq.read_table(BytesIO(data))
 
 
+_T0 = datetime(2026, 7, 6, 10, 30, tzinfo=timezone.utc)
+_T1 = datetime(2026, 7, 6, 12, 0, tzinfo=timezone.utc)
+
+
+def _select_list(table: str) -> list[str]:
+    """The SELECT list `feed_query` builds for `table` (the cc names the serializer will look up)."""
+    sql, _ = export.feed_query(table, _T0, _T1)
+    return sql[len("SELECT "):sql.index(" FROM ")].split(", ")
+
+
 # ---- pure module: schema contract ----
 
 
@@ -73,7 +84,7 @@ def test_feed_schema_byte_matches_seed():
 
 
 def test_select_columns_are_cc_names_not_seed_names():
-    cols = export.select_columns("hl_asset_ctxs")
+    cols = _select_list("hl_asset_ctxs")
     # cc DB column names (so the SELECT is valid) — NOT the seed names.
     assert cols[0] == "asset_id" and cols[1] == "timestamp"
     assert "coin" not in cols and "time_ms" not in cols
@@ -179,7 +190,7 @@ def test_binance_oi_feed_schema_matches_seed():
 
 def test_binance_oi_select_columns_are_cc_names():
     # coin derives from `symbol` (native transform), so the SELECT pulls symbol, not asset_id.
-    assert export.select_columns("binance_oi") == ["symbol", "timestamp", "open_interest", "oi_value_usd"]
+    assert _select_list("binance_oi") == ["symbol", "timestamp", "open_interest", "oi_value_usd"]
 
 
 def test_native_symbol_transform_ccxt_to_binance_native():
@@ -238,17 +249,34 @@ def test_endpoint_rejects_reversed_window():
     assert "start >= end" in _export_endpoint_source()
 
 
-def test_endpoint_uses_half_open_window_not_inclusive():
+def test_endpoint_queries_through_feed_query():
+    # the endpoint builds no SQL itself: export.feed_query owns the window, filters and row cap.
     body = _export_endpoint_source()
-    assert "< %(end)s" in body  # half-open
-    assert "<= %(end)s" not in body  # guards the copy-paste-from-/candles-inclusive regression
+    assert "export.feed_query(table, start, end, asset_id)" in body
+    assert "SELECT" not in body
+
+
+def test_plain_feed_query_uses_half_open_window_not_inclusive():
+    sql, params = export.feed_query("hl_asset_ctxs", _T0, _T1)
+    assert "timestamp >= %(start)s AND timestamp < %(end)s" in sql
+    assert "<= %(end)s" not in sql  # guards the copy-paste-from-/candles-inclusive regression
+    assert params["start"] == _T0 and params["end"] == _T1  # a plain feed's bounds are not rounded
+    assert sql.endswith("ORDER BY timestamp LIMIT %(limit)s")
+    assert params["limit"] == export.EXPORT_MAX_ROWS + 1
+
+
+def test_feed_query_parameterizes_asset_id_and_venue():
+    sql, params = export.feed_query("hl_liquidations", _T0, _T1, asset_id="BTC")
+    assert "venue = %(venue)s" in sql and params["venue"] == "hyperliquid"
+    assert "asset_id = %(asset_id)s" in sql and params["asset_id"] == "BTC"
+    assert "BTC" not in sql and "hyperliquid" not in sql
 
 
 def test_endpoint_returns_204_on_empty_not_empty_parquet():
     body = _export_endpoint_source()
     assert "status_code=204" in body
     # the 204 guard must precede serialization — no rows_to_parquet on an empty result.
-    assert body.index("status_code=204") < body.index("rows_to_parquet")
+    assert body.index("status_code=204") < body.index("export.rows_to_parquet(")
 
 
 def test_endpoint_caps_rows_with_413():
@@ -305,7 +333,7 @@ def test_hl_liquidations_feed_schema_matches_seed():
 
 
 def test_hl_liquidations_select_columns_are_cc_names():
-    assert export.select_columns("hl_liquidations") == [
+    assert _select_list("hl_liquidations") == [
         "timestamp", "asset_id", "side", "dir", "px", "sz", "mark_px",
         "closed_pnl", "method", "liquidated_user", "oid", "tid", "day",
     ]
@@ -366,7 +394,103 @@ def test_liquidations_endpoint_registered_reads_liquidations_table():
     assert "ge=1, le=5000" in src
 
 
-def test_endpoint_applies_symbol_like_universe_filter():
+def test_feed_query_applies_symbol_like_universe_filter():
     # a feed with `symbol_like` (binance_oi) restricts to the seed universe via a parameterized LIKE.
-    body = _export_endpoint_source()
-    assert "symbol LIKE %(symbol_like)s" in body
+    sql, params = export.feed_query("binance_oi", _T0, _T1)
+    assert "symbol LIKE %(symbol_like)s" in sql and params["symbol_like"] == "%/USDT:USDT"
+
+
+# ---- binance_premium_index feed (premium_index 5m resampled to the 1h binance-premium-index seed) ----
+
+# The backtester's binance-premium-index.parquet schema (13,229,212 rows, 696 all-USDT coins), read-verified
+# 2026-10-20; close_time_ms - open_time_ms is 3,599,999 on every row.
+_PREMIUM_SEED_SCHEMA = pa.schema(
+    [
+        ("coin", pa.string()),
+        ("open_time_ms", pa.int64()),
+        ("premium_open", pa.float64()),
+        ("premium_high", pa.float64()),
+        ("premium_low", pa.float64()),
+        ("premium_close", pa.float64()),
+        ("close_time_ms", pa.int64()),
+    ]
+)
+
+
+def _premium_row(**overrides) -> dict:
+    """One resampled premium row as `feed_query` selects it (cc aliases)."""
+    row = {
+        "native_symbol": "BTCUSDT",
+        "bucket_open": datetime(2026, 7, 6, 11, 0, tzinfo=timezone.utc),
+        "premium_open": -0.0001,
+        "premium_high": 0.0003,
+        "premium_low": -0.0004,
+        "premium_close": 0.0002,
+        "bucket_close": datetime(2026, 7, 6, 11, 59, 59, 999000, tzinfo=timezone.utc),
+    }
+    row.update(overrides)
+    return row
+
+
+def test_premium_feed_schema_matches_seed():
+    schema = export.feed_schema("binance_premium_index")
+    assert schema.equals(_PREMIUM_SEED_SCHEMA)
+    assert schema.names == _PREMIUM_SEED_SCHEMA.names
+
+
+def test_premium_query_rounds_bounds_up_to_the_hour():
+    # an hour is in [start, end) iff its open is: source rows are read over [ceil(start), ceil(end)).
+    _, params = export.feed_query("binance_premium_index", _T0, _T1)
+    assert params["start"] == datetime(2026, 7, 6, 11, 0, tzinfo=timezone.utc)
+    assert params["end"] == _T1  # already on the hour: unchanged
+
+
+def test_premium_query_resamples_complete_hours_only():
+    sql, params = export.feed_query("binance_premium_index", _T0, _T1)
+    bucket = "time_bucket(INTERVAL '3600 seconds', timestamp)"
+    assert f"{bucket} AS bucket_open" in sql
+    assert f"{bucket} + INTERVAL '3600 seconds' - INTERVAL '1 millisecond' AS bucket_close" in sql
+    assert "CASE WHEN count(premium_open) = count(*) THEN first(premium_open, timestamp) END AS premium_open" in sql
+    assert "CASE WHEN count(premium_high) = count(*) THEN max(premium_high) END AS premium_high" in sql
+    assert "CASE WHEN count(premium_low) = count(*) THEN min(premium_low) END AS premium_low" in sql
+    assert "CASE WHEN count(premium_close) = count(*) THEN last(premium_close, timestamp) END AS premium_close" in sql
+    assert f"GROUP BY native_symbol, {bucket} HAVING count(*) = 12" in sql
+    assert "exchange = %(venue)s" in sql and params["venue"] == "binance"
+    assert "symbol LIKE %(symbol_like)s" in sql and params["symbol_like"] == "%/USDT:USDT"
+    assert sql.endswith(f"ORDER BY {bucket} LIMIT %(limit)s")
+
+
+def test_premium_row_maps_bucket_times_to_seed_ms():
+    t = _read(export.rows_to_parquet("binance_premium_index", [_premium_row()]))
+    assert t.schema.equals(_PREMIUM_SEED_SCHEMA)
+    row = t.to_pylist()[0]
+    assert row["coin"] == "BTCUSDT"
+    assert row["open_time_ms"] == int(datetime(2026, 7, 6, 11, 0, tzinfo=timezone.utc).timestamp()) * 1000
+    assert row["close_time_ms"] - row["open_time_ms"] == 3_599_999  # as on every seed row
+    assert (row["premium_open"], row["premium_high"], row["premium_low"], row["premium_close"]) == (
+        -0.0001, 0.0003, -0.0004, 0.0002)
+
+
+def test_premium_null_price_raises_not_nan():
+    # the seed has no NaN: a NULL aggregate (a NULL anywhere in the hour) is a writer bug, not a missing value.
+    with pytest.raises(ValueError, match="premium_high"):
+        export.rows_to_parquet("binance_premium_index", [_premium_row(premium_high=None)])
+
+
+@pytest.mark.parametrize("bucket_s, source_s", [(3600, 7), (3600.0, 300), (True, 1), (0, 300), (3600, -300)])
+def test_resample_rejects_widths_unsafe_to_format_into_sql(bucket_s, source_s):
+    with pytest.raises(ValueError, match="Resample widths"):
+        export.Resample(bucket_s=bucket_s, source_s=source_s)
+
+
+def test_unknown_agg_fails_closed():
+    spec = export.FEED_SPECS["binance_premium_index"]
+    bad = export.Column("x", "x", "float", agg="median")
+    with pytest.raises(ValueError, match="unknown agg"):
+        export._resampled_expr(bad, "timestamp", "b", spec.resample)
+
+
+def test_ceil_to_keeps_a_boundary_and_rounds_anything_past_it_up():
+    on = datetime(2026, 7, 6, 11, 0, tzinfo=timezone.utc)
+    assert export._ceil_to(on, 3600) == on
+    assert export._ceil_to(on.replace(microsecond=1), 3600) == datetime(2026, 7, 6, 12, 0, tzinfo=timezone.utc)

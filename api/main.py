@@ -427,10 +427,9 @@ def export_parquet(
     end: datetime,
     asset_id: str | None = None,
 ):
-    # Forward-feed parquet export for the backtester's T-031 ingest (T-011.1). Thin wrapper: validate →
-    # parameterized range query → api/export.py owns the byte-contract (schema + NULL→NaN). `table`,
-    # its columns, and `ts_col` come from the FEED_SPECS literal (never user input), so they are safe
-    # to interpolate — same trust model as `_candle_table`; only values are parameterized.
+    # Forward-feed parquet export for the backtester's forward ingest (T-011). Thin wrapper: validate →
+    # api/export.py's feed_query (parameterized, half-open window) → rows_to_parquet, which owns the
+    # byte-contract (schema + NULL policy).
     spec = export.FEED_SPECS.get(table)
     if spec is None:
         raise HTTPException(status_code=400, detail=f"unknown table {table!r}; valid: {sorted(export.FEED_SPECS)}")
@@ -445,23 +444,7 @@ def export_parquet(
     if start >= end:
         raise HTTPException(status_code=400, detail="start must be < end")
 
-    cols = ", ".join(export.select_columns(table))
-    # Half-open [start, end): `< end` (NOT `<= end`) so consecutive windows never double-count the
-    # seam row — the backtester's row-content hash is duplicate-sensitive.
-    conditions = [f"{spec.ts_col} >= %(start)s", f"{spec.ts_col} < %(end)s"]
-    params: dict = {"start": start, "end": end, "limit": export.EXPORT_MAX_ROWS + 1}
-    if spec.venue_col is not None:
-        conditions.append(f"{spec.venue_col} = %(venue)s")
-        params["venue"] = spec.venue
-    if spec.symbol_like is not None:
-        # Restrict to the seed's universe (e.g. binance OI seed is USDT-perps only).
-        conditions.append("symbol LIKE %(symbol_like)s")
-        params["symbol_like"] = spec.symbol_like
-    if asset_id is not None:
-        conditions.append("asset_id = %(asset_id)s")
-        params["asset_id"] = asset_id
-    where = " AND ".join(conditions)
-    query = f"SELECT {cols} FROM {spec.db_table} WHERE {where} ORDER BY {spec.ts_col} LIMIT %(limit)s"
+    query, params = export.feed_query(table, start, end, asset_id)
 
     with pool.connection() as conn:
         rows = conn.execute(query, params).fetchall()
