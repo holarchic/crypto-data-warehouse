@@ -98,6 +98,7 @@ Pass: returns ≥1 candle with all OHLCV fields populated, correct exchange/symb
 
 - Code updates never touch the db container. `git pull`, then `build` only the services whose code or config changed, including the profile one-shots `discovery` and `liquidations-hl` (they bake in `collector/` and `exchanges.yaml`), then `up -d --no-deps <svc…>`.
 - Deploy mid-interval (e.g. xx:20 – xx:40), away from the 00/08/16 UTC funding settlements.
+- Restart the HyperLiquid collector only while no `hl-candles-repair` run is active (`docker ps`; cron starts it at 06:30). Its startup funding seed (one 100 h `fundingHistory` call per pair, ~25 weight each) shares HL's per-IP weight budget with the repair.
 - `deploy/deploy.sh` is for fresh installs and full redeploys only: its `compose pull db` and stack-wide `up -d` can recreate the db onto a moved `latest-pg16`.
 
 ### DB tuning
