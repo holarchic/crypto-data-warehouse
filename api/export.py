@@ -9,12 +9,14 @@ what must match the seed is the column names + types, and SQL NULL must be writt
 per-cell row digest sees). cc writes columns in seed order anyway as a parity convention. Per feed,
 one FeedSpec holds the seed schema + the cc->seed column map.
 
-Kept free of fastapi/psycopg so it unit-tests against REAL pyarrow (a stubbed lib can't verify a
-byte-contract); the /export/parquet endpoint is a thin wrapper that pulls rows and calls in here.
+The module also builds each feed's SQL (`feed_query`), so the query and the serializer that consumes its
+rows are one contract. Kept free of fastapi/psycopg so it unit-tests against REAL pyarrow (a stubbed lib
+can't verify a byte-contract); the /export/parquet endpoint validates the request, runs `feed_query` and
+calls `rows_to_parquet`.
 """
 
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from io import BytesIO
 from math import nan
 
@@ -65,13 +67,28 @@ class Column:
     """One seed column, its cc source, its transform kind, and its SQL-NULL policy (pure data)."""
 
     seed: str  # parquet/seed column name
-    cc: str  # cc DB column to SELECT
+    cc: str  # cc DB column to SELECT (a resampled feed: the source column, or the bucket alias)
     kind: str  # ∈ _KINDS — drives BOTH the arrow type and the cc->seed transform
     on_null: object = _UNSET  # SQL NULL -> this fill value, or RAISE; _UNSET -> the kind's _KINDS default
+    agg: str | None = None  # resampled feeds only: ∈ _AGG_SQL or _BUCKET_TIMES; None = a group key
 
     @property
     def arrow(self) -> pa.DataType:
         return _KINDS[self.kind].arrow
+
+
+@dataclass(frozen=True)
+class Resample:
+    """Resample source bars of `source_s` seconds into seed bars of `bucket_s` (pure data). A bucket is
+    exported only when all bucket_s / source_s source bars are stored: a partial bucket's OHLC is wrong
+    yet hash-valid. Both widths are formatted into SQL, so they must be ints from this literal spec."""
+
+    bucket_s: int
+    source_s: int
+
+    def __post_init__(self):
+        if not all(type(v) is int and v > 0 for v in (self.bucket_s, self.source_s)) or self.bucket_s % self.source_s:
+            raise ValueError(f"Resample widths must be positive ints, bucket a multiple of source: {self}")
 
 
 @dataclass(frozen=True)
@@ -88,6 +105,7 @@ class FeedSpec:
     venue: str | None = None
     symbol_like: str | None = None  # SQL LIKE on `symbol` to restrict to the seed universe (e.g.
     #                                 binance OI seed is USDT-perps only, cc also holds USDC/coin-margined)
+    resample: Resample | None = None  # None: one source row per seed row
 
 
 # hl_asset_ctxs -> the backtester's hl-asset-ctxs.parquet seed. Column names/types verified 2026-07-06
@@ -164,11 +182,46 @@ _HL_LIQUIDATIONS = FeedSpec(
     venue="hyperliquid",
 )
 
+# premium_index (binance 5m) -> the backtester's binance-premium-index.parquet seed, which holds Binance's own
+# 1h premiumIndexKlines (fetch_binance_premium_index.py --interval 1h: k[0], k[1..4], k[6]). Resampled
+# first/max/min/last per hour; close_time_ms = open + 3,599,999 as in every seed row. coin is native_symbol
+# (`BTCUSDT`); the seed is all USDT. The seed has no NaN, so a NULL price raises.
+_BINANCE_PREMIUM_INDEX = FeedSpec(
+    db_table="premium_index",
+    ts_col="timestamp",
+    columns=(
+        Column("coin", "native_symbol", "string"),
+        Column("open_time_ms", "bucket_open", "epoch_ms", agg="bucket_open"),
+        Column("premium_open", "premium_open", "float", on_null=RAISE, agg="first"),
+        Column("premium_high", "premium_high", "float", on_null=RAISE, agg="max"),
+        Column("premium_low", "premium_low", "float", on_null=RAISE, agg="min"),
+        Column("premium_close", "premium_close", "float", on_null=RAISE, agg="last"),
+        Column("close_time_ms", "bucket_close", "epoch_ms", agg="bucket_close"),
+    ),
+    venue_col="exchange",
+    venue="binance",
+    symbol_like="%/USDT:USDT",
+    resample=Resample(bucket_s=3600, source_s=300),
+)
+
 FEED_SPECS: dict[str, FeedSpec] = {
     "hl_asset_ctxs": _HL_ASSET_CTXS,
     "binance_oi": _BINANCE_OI,
     "hl_liquidations": _HL_LIQUIDATIONS,
+    "binance_premium_index": _BINANCE_PREMIUM_INDEX,
 }
+
+# A resampled column's aggregate over its bucket's source rows (TimescaleDB first/last order by time).
+# Each is wrapped so a NULL anywhere in the bucket makes the result NULL: max/min skip NULLs, and a
+# skipped writer-bug NULL would otherwise export a plausible bar instead of reaching the column's RAISE.
+_AGG_SQL = {
+    "first": "first({cc}, {ts})",
+    "last": "last({cc}, {ts})",
+    "max": "max({cc})",
+    "min": "min({cc})",
+}
+_BUCKET_TIMES = ("bucket_open", "bucket_close")
+_EPOCH = datetime(1970, 1, 1, tzinfo=timezone.utc)
 
 
 def feed_schema(table: str) -> pa.Schema:
@@ -176,9 +229,66 @@ def feed_schema(table: str) -> pa.Schema:
     return pa.schema([(c.seed, c.arrow) for c in FEED_SPECS[table].columns])
 
 
-def select_columns(table: str) -> list[str]:
-    """The cc DB columns to SELECT for `table` (cc names, not seed names), in seed order."""
-    return [c.cc for c in FEED_SPECS[table].columns]
+def feed_query(table: str, start: datetime, end: datetime, asset_id: str | None = None) -> tuple[str, dict]:
+    """The SQL and params for `table`'s rows whose seed timestamp is in the half-open [start, end) (tz-aware),
+    keyed by cc column name, at most EXPORT_MAX_ROWS + 1 rows so the caller can tell an over-cap window.
+    Half-open so consecutive windows never double-count the seam row (the backtester's row hash is
+    duplicate-sensitive). Table, columns and bucket widths come from the FEED_SPECS literal, never the
+    caller, so they are formatted in; every value is a parameter."""
+    spec = FEED_SPECS[table]
+    params: dict = {"limit": EXPORT_MAX_ROWS + 1}
+    filters = []
+    if spec.venue_col is not None:
+        filters.append(f"{spec.venue_col} = %(venue)s")
+        params["venue"] = spec.venue
+    if spec.symbol_like is not None:
+        filters.append("symbol LIKE %(symbol_like)s")
+        params["symbol_like"] = spec.symbol_like
+    if asset_id is not None:
+        filters.append("asset_id = %(asset_id)s")
+        params["asset_id"] = asset_id
+    if spec.resample is None:
+        params.update(start=start, end=end)
+        where = " AND ".join([f"{spec.ts_col} >= %(start)s", f"{spec.ts_col} < %(end)s", *filters])
+        cols = ", ".join(c.cc for c in spec.columns)
+        return f"SELECT {cols} FROM {spec.db_table} WHERE {where} ORDER BY {spec.ts_col} LIMIT %(limit)s", params
+    return _resampled_query(spec, start, end, filters, params)
+
+
+def _resampled_query(spec: FeedSpec, start: datetime, end: datetime, filters: list, params: dict) -> tuple[str, dict]:
+    """A resampled feed's query. A bucket is in [start, end) iff its open time is, so the source rows are read
+    over [ceil(start), ceil(end)) on bucket boundaries: any split point is seamless, never halving a bucket."""
+    r = spec.resample
+    params.update(start=_ceil_to(start, r.bucket_s), end=_ceil_to(end, r.bucket_s))
+    ts = spec.ts_col
+    bucket = f"time_bucket(INTERVAL '{r.bucket_s} seconds', {ts})"
+    where = " AND ".join([f"{ts} >= %(start)s", f"{ts} < %(end)s", *filters])
+    selects = ", ".join(f"{_resampled_expr(c, ts, bucket, r)} AS {c.cc}" for c in spec.columns)
+    keys = ", ".join([c.cc for c in spec.columns if c.agg is None] + [bucket])
+    sql = (
+        f"SELECT {selects} FROM {spec.db_table} WHERE {where} GROUP BY {keys} "
+        f"HAVING count(*) = {r.bucket_s // r.source_s} ORDER BY {bucket} LIMIT %(limit)s"
+    )
+    return sql, params
+
+
+def _resampled_expr(col: Column, ts: str, bucket: str, r: Resample) -> str:
+    """One resampled column's SQL expression (see `_AGG_SQL`)."""
+    if col.agg is None:
+        return col.cc
+    if col.agg == "bucket_open":
+        return bucket
+    if col.agg == "bucket_close":
+        return f"{bucket} + INTERVAL '{r.bucket_s} seconds' - INTERVAL '1 millisecond'"
+    if col.agg not in _AGG_SQL:
+        raise ValueError(f"unknown agg {col.agg!r} for seed column {col.seed!r}")
+    return f"CASE WHEN count({col.cc}) = count(*) THEN {_AGG_SQL[col.agg].format(cc=col.cc, ts=ts)} END"
+
+
+def _ceil_to(dt: datetime, width_s: int) -> datetime:
+    """`dt` rounded up to a multiple of `width_s` seconds since the epoch (unchanged when already on one)."""
+    rem = (dt - _EPOCH) % timedelta(seconds=width_s)
+    return dt if not rem else dt - rem + timedelta(seconds=width_s)
 
 
 def _to_ms(dt: datetime) -> int:
