@@ -12,7 +12,7 @@ YAML_PATH = Path(__file__).parent / "exchanges.yaml"
 # collection_status row under these pseudo-timeframes (symbol "*") at the end of
 # each poll cycle; the monitor's staleness check flags a silently-dead loop.
 # NOT candle timeframes — deliberately kept out of exchanges.yaml. Intervals feed
-# feed_health.paging_threshold_s, `interval + max(interval, 1800)`: funding → 2h, oi → 35m.
+# feed_health.paging_threshold_s: funding → 2h, oi → 35m.
 #
 # LIQUIDATION_WS is the streaming variant (collector/ws.py): the heartbeat fires on
 # a ~60s connection timer *while the socket is up*, not per event — a WS feed is

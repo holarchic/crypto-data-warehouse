@@ -417,7 +417,6 @@ def monitor_loop(dsn, timeframe_intervals, webhook_url, poll_s=300, cooldown_s=3
                 if interval_s is None:
                     continue
 
-                # Tiered scanning — check slower TFs less often, per (exchange, timeframe)
                 scan_interval = max(interval_s, GAP_SCAN_MIN_S)
                 if not gap_scan_due(last_gap_scan, (exchange, timeframe), scan_interval, now):
                     continue

@@ -19,7 +19,8 @@ def paging_threshold_s(interval_s: int) -> int:
 def is_stale_for_paging(seconds_since_success: float | None, interval_s: int | None) -> bool:
     """The monitor's raw-staleness and loop-liveness rule: no success, or none within
     `paging_threshold_s`. A stale loop sentinel pages; candle pages go through the monitor's separate
-    alarming gate. /status uses the stricter `is_stale_for_status`. An unknown interval is never stale."""
+    alarming gate. /status uses `is_stale_for_status`, stricter below an 1800 s interval. An unknown
+    interval is never stale."""
     if interval_s is None:
         return False
     return seconds_since_success is None or seconds_since_success > paging_threshold_s(interval_s)
@@ -27,8 +28,8 @@ def is_stale_for_paging(seconds_since_success: float | None, interval_s: int | N
 
 def is_stale_for_status(seconds_since_success: float | None, interval_s: int | None) -> bool:
     """/status's per-pair freshness for a reader: no success, or none within two intervals (120 s at
-    1m). Stricter than the monitor's `is_stale_for_paging`, which waits out a serial fetch cycle. An
-    unknown interval is never stale."""
+    1m). Below an 1800 s interval it is stricter than the monitor's `is_stale_for_paging`, which waits
+    out a serial fetch cycle; at 1800 s and above the two agree. An unknown interval is never stale."""
     if interval_s is None:
         return False
     return seconds_since_success is None or seconds_since_success > 2 * interval_s
