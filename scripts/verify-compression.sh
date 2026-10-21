@@ -20,9 +20,9 @@ SQL
 echo "=== Compression stats (per hypertable) ==="
 for TABLE in candles funding_rates open_interest; do
     echo "--- ${TABLE} ---"
-    db_sql -v tbl="$TABLE" 2>/dev/null <<'SQL' \
-        || echo "  (no compression stats yet — chunks may not be old enough)"
-SELECT total_chunks, compressed_chunks,
+    # A hypertable with no compressed chunk yet reports 0 here; an error is a real failure.
+    db_sql -v tbl="$TABLE" <<'SQL'
+SELECT total_chunks, number_compressed_chunks,
        pg_size_pretty(before_compression_total_bytes) AS before_size,
        pg_size_pretty(after_compression_total_bytes) AS after_size
 FROM hypertable_compression_stats(:'tbl');
