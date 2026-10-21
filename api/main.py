@@ -328,7 +328,7 @@ def get_status(exchange: str | None = None, timeframe: str | None = None):
     compression_sql = """
         SELECT ht.hypertable_name,
                s.total_chunks,
-               s.compressed_chunks
+               s.number_compressed_chunks AS compressed_chunks
         FROM timescaledb_information.hypertables ht
         CROSS JOIN LATERAL hypertable_compression_stats(ht.hypertable_name) s
         WHERE ht.hypertable_schema = 'public'
