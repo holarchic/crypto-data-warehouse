@@ -49,11 +49,12 @@ STEP = timedelta(minutes=5)          # the timeframe's interval
 CAP = 5000
 
 def candles(exchange, asset_id, timeframe, start, end):
-    """Every bar with open time in [start, end), oldest first."""
+    """Every bar with open time in [start, end), oldest first. `start` must be on a bar boundary."""
     rows = []
+    last_open = start + ((end - start - timedelta(microseconds=1)) // STEP) * STEP   # the last open before `end`
     window_start = start
-    while window_start < end:
-        window_end = min(window_start + (CAP - 1) * STEP, end - STEP)   # inclusive bound
+    while window_start <= last_open:
+        window_end = min(window_start + (CAP - 1) * STEP, last_open)   # inclusive bound
         query = urllib.parse.urlencode({"exchange": exchange, "asset_id": asset_id, "timeframe": timeframe,
                                         "start": window_start.isoformat(), "end": window_end.isoformat(),
                                         "limit": CAP})
@@ -94,7 +95,7 @@ LEFT JOIN LATERAL (
     SELECT o.open_interest FROM open_interest o
     WHERE o.exchange = c.exchange AND o.symbol = c.symbol
       AND o.timestamp <= c.timestamp + interval '5 minutes'      -- the bar's close
-      AND o.timestamp >  c.timestamp - interval '1 hour'         -- a bound, so a dead feed shows as null
+      AND o.timestamp >= c.timestamp + interval '5 minutes' - interval '1 hour'   -- at most an hour stale
     ORDER BY o.timestamp DESC LIMIT 1
 ) oi ON true
 WHERE c.exchange = 'binance' AND c.asset_id = 'BTC' AND c.timeframe = '5m'
@@ -118,10 +119,11 @@ With pandas, `pd.merge_asof(bars, oi, left_on="close_time", right_on="timestamp"
 
 ## Larger pulls on the server
 
-Through the API, ask for one exchange, asset and timeframe per request. For research across many assets, read the database directly on the server and stream to a file:
+Through the API, ask for one exchange, asset and timeframe per request. For research across many assets, read the database directly on the server and stream to a file. From the checkout, `scripts/ops-lib.sh` supplies the production compose command and runs psql as the database's own user:
 
 ```bash
-docker compose exec -T db psql -U candles candle_collector -c "COPY (
+. scripts/ops-lib.sh
+"${DB_TOOL[@]}" psql -X -c "COPY (
   SELECT exchange, asset_id, timestamp, open, high, low, close, volume FROM candles
   WHERE timeframe = '1h' AND timestamp >= '2026-07-01' AND timestamp < '2026-10-01'
   ORDER BY exchange, asset_id, timestamp
