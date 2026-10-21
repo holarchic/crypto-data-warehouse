@@ -1,4 +1,6 @@
-# Production overrides — use with:
+# Production overrides — every server compose command takes both files. Start: the db, then
+# ./scripts/migrate.sh, then the rest (deploy/README.md):
+#   docker compose -f docker-compose.yml -f docker-compose.prod.yml up -d db && ./scripts/migrate.sh &&
 #   docker compose -f docker-compose.yml -f docker-compose.prod.yml up -d
 #
 # Changes from dev:

@@ -7,6 +7,7 @@ import re
 import shutil
 import subprocess
 from pathlib import Path
+from typing import NamedTuple
 
 import pytest
 import yaml
@@ -14,41 +15,51 @@ import yaml
 ROOT = Path(__file__).resolve().parent.parent
 MIGRATIONS = ROOT / "db" / "migrations"
 MIGRATE = ROOT / "scripts" / "migrate.sh"
+LIB = ROOT / "scripts" / "migrations-lib.sh"
 
 # A schema change goes in a new migration; init.sql changes only when the baseline moves (with
-# db/ledger.sql's list and this hash together).
+# db/ledger.sql's list, db/baseline-check.sql's expected catalog and this hash together).
 INIT_SQL_SHA256 = "eb6502daa7c7540641b0e4a3f44cbcb0d534d56823354e6d207d54cc34db4296"
 
-TRANSACTION_CONTROL = re.compile(r"^\s*(BEGIN|COMMIT|ROLLBACK|START\s+TRANSACTION|SAVEPOINT)\s*;", re.I | re.M)
+needs_bash = pytest.mark.skipif(shutil.which("bash") is None, reason="needs bash")
+
+
+class BaselineRow(NamedTuple):
+    version: str
+    name: str
 
 
 def _baseline_rows():
     values = (ROOT / "db" / "ledger.sql").read_text().split("VALUES", 1)[1]
-    return re.findall(r"\('(\d{3})', '([^']+)'\)", values)
+    return [BaselineRow(*m) for m in re.findall(r"\('(\d{3})', '([^']+)'\)", values)]
 
 
 def test_the_baseline_is_every_migration_up_to_it():
     rows = _baseline_rows()
-    baseline = max(version for version, _ in rows)
+    baseline = max(row.version for row in rows)
     files = sorted(p.name for p in MIGRATIONS.glob("*.sql"))
-    assert [name for _, name in rows] == [f for f in files if f[:3] <= baseline]
-    assert all(version == name[:3] for version, name in rows)
+    assert [row.name for row in rows] == [f for f in files if f[:3] <= baseline]
+    assert all(row.version == row.name[:3] for row in rows)
 
 
-def test_migration_files_are_numbered_once_and_hold_no_transaction_control():
-    names = sorted(p.name for p in MIGRATIONS.iterdir())
-    assert all(re.fullmatch(r"\d{3}-[a-z0-9-]+\.sql", n) for n in names), names
-    versions = [n[:3] for n in names]
-    assert len(versions) == len(set(versions))
-    for path in MIGRATIONS.glob("*.sql"):
-        assert not TRANSACTION_CONTROL.search(path.read_text()), path.name
+def _lib(*commands, cwd=None):
+    return subprocess.run(["bash", "-c", f'. "{LIB}"; ' + " ".join(commands)],
+                          capture_output=True, text=True, timeout=30, cwd=cwd)
+
+
+@needs_bash
+def test_the_repo_migrations_pass_the_lib_file_check():
+    result = _lib(f'migrations_check_files "{MIGRATIONS}"')
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.split() == [str(p) for p in sorted(MIGRATIONS.iterdir())]
 
 
 def test_init_sql_is_frozen_at_the_baseline():
     digest = hashlib.sha256((ROOT / "db" / "init.sql").read_bytes()).hexdigest()
     assert digest == INIT_SQL_SHA256, (
         "db/init.sql changed. A schema change belongs in a new db/migrations/NNN-<name>.sql applied by "
-        "scripts/migrate.sh; edit init.sql only to move the baseline, with db/ledger.sql's list and this hash."
+        "scripts/migrate.sh; edit init.sql only to move the baseline, with db/ledger.sql's list, "
+        "db/baseline-check.sql's expected catalog and this hash."
     )
 
 
@@ -59,8 +70,6 @@ def test_initdb_runs_init_sql_then_ledger_sql():
 
 
 # --- scripts/migrate.sh through a stub docker -------------------------------------------------------
-
-pytestmark_bash = pytest.mark.skipif(shutil.which("bash") is None, reason="needs bash")
 
 # Logs each call's argv ("argv:", arguments joined by \x1f) and psql's stdin ("stdin:"). pg_isready
 # fails $FAKE_READY_FAILS times, then succeeds (or always, when FAKE_READY_FAILS=always). psql answers
@@ -79,14 +88,31 @@ case " $* " in
         case "$sql" in
             *"THEN 'adopted'"*) echo "$FAKE_STATE"; exit "${FAKE_STATE_EXIT:-0}" ;;
             *"SELECT version FROM public.schema_migrations"*) printf '%b' "$FAKE_APPLIED" ;;
-            *"SELECT count(*) FROM public.schema_migrations"*) echo 7 ;;
-            *"SELECT 'table ' ||"*) printf '%b' "$FAKE_CHECK"; exit "${FAKE_CHECK_EXIT:-0}" ;;
+            *"SELECT count(*) FROM public.schema_migrations"*) echo 7; exit "${FAKE_COUNT_EXIT:-0}" ;;
+            *"WITH baseline_tables"*) printf '%b' "$FAKE_CHECK"; exit "${FAKE_CHECK_EXIT:-0}" ;;
             *"CREATE TABLE public.schema_migrations"*) exit "${FAKE_LEDGER_EXIT:-0}" ;;
             *)
                 if [ -n "$FAKE_FAIL_ON" ] && [[ "$sql" == *"$FAKE_FAIL_ON"* ]]; then exit 3; fi ;;
         esac ;;
 esac
 """
+
+
+class Call(NamedTuple):
+    argv: list[str]
+    stdin: str
+
+    @property
+    def is_psql(self):
+        return any("exec psql " in arg for arg in self.argv)
+
+    @property
+    def is_apply(self):
+        return self.is_psql and "-1" in self.argv
+
+    def var(self, name):
+        """The value of `-v name=…` on this call."""
+        return next(arg.split("=", 1)[1] for arg in self.argv if arg.startswith(f"{name}="))
 
 
 @pytest.fixture
@@ -104,76 +130,96 @@ def host(tmp_path):
 
 
 def migrate(host, *args, **env):
+    """Run migrate.sh against the stub; its migrations dir is the fixture's, through a copy of the lib."""
+    scripts = host / "scripts"
+    if not scripts.exists():
+        scripts.mkdir()
+        (scripts / "migrate.sh").write_text(MIGRATE.read_text())
+        (scripts / "migrations-lib.sh").write_text(LIB.read_text())
+        db = host / "db"
+        db.mkdir()
+        (db / "migrations").symlink_to(host / "migrations")
+        for name in ("ledger.sql", "baseline-check.sql"):
+            (db / name).write_text((ROOT / "db" / name).read_text())
     full_env = {
         "PATH": f"{host / 'bin'}:/usr/bin:/bin",
         "DOCKER_LOG": str(host / "docker.log"),
-        "MIGRATIONS_DIR": str(host / "migrations"),
         "MIGRATE_READY_TRIES": "3",
         "FAKE_STATE": "adopted",
         "FAKE_APPLIED": "001\\n",
         "FAKE_CHECK": "",
         **env,
     }
-    result = subprocess.run(["bash", str(MIGRATE), *args], env=full_env, capture_output=True, text=True, timeout=30)
+    result = subprocess.run(["bash", str(scripts / "migrate.sh"), *args], env=full_env,
+                            capture_output=True, text=True, timeout=30)
     log = (host / "docker.log").read_text() if (host / "docker.log").exists() else ""
-    return result, log
+    return result, [Call(block.partition("\n")[0].split("\x1f"), block.partition("\n")[2].removeprefix("stdin:\n"))
+                    for block in log.split("argv: ")[1:]]
 
 
-def _calls(log):
-    """Each docker call as (argv list, stdin text)."""
-    calls = []
-    for block in log.split("argv: ")[1:]:
-        argv_line, _, rest = block.partition("\n")
-        calls.append((argv_line.split("\x1f"), rest.removeprefix("stdin:\n")))
-    return calls
+def _applies(calls):
+    return [c for c in calls if c.is_apply]
 
 
-def _applies(log):
-    return [(argv, stdin) for argv, stdin in _calls(log) if "-1" in argv]
-
-
-@pytestmark_bash
+@needs_bash
 def test_apply_sends_each_pending_file_in_one_transaction_with_its_ledger_row(host):
-    result, log = migrate(host)
+    result, calls = migrate(host)
     assert result.returncode == 0, result.stderr
-    applies = _applies(log)
-    for (argv, stdin), version in zip(applies, ("002", "003"), strict=True):
-        joined = " ".join(argv)
-        assert "psql -X -U candles -d candle_collector -v ON_ERROR_STOP=1 -1" in joined
-        assert f"-v version={version} -v name={version}-step.sql -f -" in joined
-        assert stdin.startswith(f"CREATE TABLE t{version} (x INTEGER);")
-        assert "INSERT INTO public.schema_migrations (version, name) VALUES (:'version', :'name');" in stdin
+    applies = _applies(calls)
+    assert [(c.var("version"), c.var("name")) for c in applies] == [("002", "002-step.sql"), ("003", "003-step.sql")]
+    for call in applies:
+        assert call.argv[-2:] == ["-f", "-"]
+        assert call.var("ON_ERROR_STOP") == "1"
+        lines = call.stdin.splitlines()
+        assert lines[0] == r"SELECT txid_current() AS migration_txid \gset"
+        assert lines[1] == f"CREATE TABLE t{call.var('version')} (x INTEGER);"
+        guard = lines.index(r"\if :migration_one_transaction")
+        assert lines[guard + 1] == "INSERT INTO public.schema_migrations (version, name) VALUES (:'version', :'name');"
 
 
-@pytestmark_bash
+@needs_bash
+def test_psql_and_pg_isready_use_the_containers_user_and_database(host):
+    _, calls = migrate(host)
+    commands = [arg for c in calls for arg in c.argv if arg.startswith("exec ")]
+    assert commands and all('-U "$POSTGRES_USER" -d "$POSTGRES_DB"' in cmd for cmd in commands)
+    assert not any("candles" in arg for c in calls for arg in c.argv)
+
+
+@needs_bash
 def test_every_psql_call_stops_on_error(host):
     for args, env in [((), {}), (("--status",), {}), (("--adopt",), {"FAKE_STATE": "pre-ledger"})]:
         (host / "docker.log").unlink(missing_ok=True)
-        _, log = migrate(host, *args, **env)
-        psql_calls = [argv for argv, _ in _calls(log) if "psql" in argv]
+        _, calls = migrate(host, *args, **env)
+        psql_calls = [c for c in calls if c.is_psql]
         assert psql_calls, args
-        for argv in psql_calls:
-            assert "ON_ERROR_STOP=1" in argv and argv[argv.index("ON_ERROR_STOP=1") - 1] == "-v", (args, argv)
+        for call in psql_calls:
+            assert call.var("ON_ERROR_STOP") == "1", (args, call.argv)
 
 
-@pytestmark_bash
+@needs_bash
 def test_a_failing_migration_stops_the_run(host):
-    result, log = migrate(host, FAKE_FAIL_ON="CREATE TABLE t002")
+    result, calls = migrate(host, FAKE_FAIL_ON="CREATE TABLE t002")
     assert result.returncode != 0
     assert "002-step.sql failed" in result.stderr
-    assert [next(x for x in a if x.startswith("name=")) for a, _ in _applies(log)] == ["name=002-step.sql"]
+    assert [c.var("name") for c in _applies(calls)] == ["002-step.sql"]
 
 
-@pytestmark_bash
+@needs_bash
 def test_status_lists_pending_and_applies_nothing(host):
-    result, log = migrate(host, "--status")
+    result, calls = migrate(host, "--status")
     assert result.returncode == 0, result.stderr
-    assert "state: adopted" in result.stdout
-    assert "pending: 2\n  002-step.sql\n  003-step.sql" in result.stdout
-    assert _applies(log) == []
+    assert "state: adopted\napplied: 7\npending: 2\n  002-step.sql\n  003-step.sql" in result.stdout
+    assert _applies(calls) == []
 
 
-@pytestmark_bash
+@needs_bash
+def test_status_fails_when_the_applied_count_fails(host):
+    result, _ = migrate(host, "--status", FAKE_COUNT_EXIT="2")
+    assert result.returncode != 0
+    assert "could not read schema_migrations" in result.stderr
+
+
+@needs_bash
 @pytest.mark.parametrize("env, message", [
     ({"FAKE_STATE": "pre-ledger"}, "the database is pre-ledger"),
     ({"FAKE_STATE": "empty"}, "the database is empty"),
@@ -182,72 +228,94 @@ def test_status_lists_pending_and_applies_nothing(host):
     ({"FAKE_STATE_EXIT": "2"}, "could not read the database state"),
 ])
 def test_apply_refuses_without_sending_a_migration(host, env, message):
-    result, log = migrate(host, **env)
+    result, calls = migrate(host, **env)
     assert result.returncode != 0
     assert message in result.stderr
-    assert _applies(log) == []
+    assert _applies(calls) == []
 
 
-@pytestmark_bash
+@needs_bash
 @pytest.mark.parametrize("bad_file, body, message", [
     ("4-short.sql", "SELECT 1;", "not NNN-<name>.sql"),
     ("002-again.sql", "SELECT 1;", "version 002 is used twice"),
-    ("004-commits.sql", "CREATE TABLE t (x INTEGER);\nCOMMIT;\n", "holds its own transaction control"),
+    ("004-commits.sql", "CREATE TABLE t (x INTEGER);\nCOMMIT;\n", "holds transaction control"),
+    ("004-commits.sql", "CREATE TABLE t (x INTEGER); commit work;\n", "holds transaction control"),
+    ("004-commits.sql", "BEGIN TRANSACTION;\nCREATE TABLE t (x INTEGER);\n", "holds transaction control"),
+    ("004-commits.sql", "CREATE TABLE t (x INTEGER);\nEND;\n", "holds transaction control"),
+    ("004-saves.sql", "SAVEPOINT s;\n", "holds transaction control"),
+    ("004-dir.sql", None, "not a readable file"),
 ])
 def test_bad_migration_files_are_refused(host, bad_file, body, message):
-    (host / "migrations" / bad_file).write_text(body)
-    result, log = migrate(host)
+    target = host / "migrations" / bad_file
+    if body is None:
+        target.mkdir()
+    else:
+        target.write_text(body)
+    result, calls = migrate(host)
     assert result.returncode != 0
     assert message in result.stderr
-    assert _applies(log) == []
+    assert _applies(calls) == []
 
 
-def _ledger_sent(log):
-    return any("CREATE TABLE public.schema_migrations" in stdin for _, stdin in _calls(log))
-
-
-@pytestmark_bash
-def test_adopt_checks_the_baseline_then_records_it(host):
-    result, log = migrate(host, "--adopt", FAKE_STATE="pre-ledger", FAKE_CHECK="table candles|t\\nno retention policy|t\\n")
+@needs_bash
+def test_comments_and_plpgsql_blocks_are_not_transaction_control(host):
+    (host / "migrations" / "004-block.sql").write_text(
+        "-- COMMIT; in a comment is fine\n"
+        "DO $$\nBEGIN\n    IF true THEN\n        PERFORM 1;\n    END IF;\nEND\n$$;\n"
+    )
+    result, calls = migrate(host)
     assert result.returncode == 0, result.stderr
-    stdins = [stdin for _, stdin in _calls(log) if stdin]
-    check = next(i for i, s in enumerate(stdins) if "SELECT 'table ' ||" in s)
+    assert [c.var("name") for c in _applies(calls)][-1] == "004-block.sql"
+
+
+def _ledger_sent(calls):
+    return any("CREATE TABLE public.schema_migrations" in c.stdin for c in calls)
+
+
+@needs_bash
+def test_adopt_checks_the_baseline_then_records_it(host):
+    result, calls = migrate(host, "--adopt", FAKE_STATE="pre-ledger", FAKE_CHECK="column a: text|t\\nno retention policy|t\\n")
+    assert result.returncode == 0, result.stderr
+    stdins = [c.stdin for c in calls if c.stdin]
+    check = next(i for i, s in enumerate(stdins) if "WITH baseline_tables" in s)
     ledger = next(i for i, s in enumerate(stdins) if "CREATE TABLE public.schema_migrations" in s)
     assert check < ledger
 
 
-@pytestmark_bash
+@needs_bash
 @pytest.mark.parametrize("env, message", [
-    ({"FAKE_CHECK": "table candles|t\\ntable discovery_volumes|f\\n"}, "table discovery_volumes"),
+    ({"FAKE_CHECK": "column a: text|t\\nindex discovery_volumes_pkey: CREATE UNIQUE INDEX|f\\n"},
+     "index discovery_volumes_pkey: CREATE UNIQUE INDEX"),
     ({"FAKE_CHECK_EXIT": "3"}, "the baseline check did not run"),
+    ({"FAKE_CHECK": ""}, "the baseline check returned no rows"),
     ({"FAKE_STATE": "adopted"}, "only a pre-ledger database is adopted"),
 ])
 def test_adopt_refuses_and_records_nothing(host, env, message):
-    result, log = migrate(host, "--adopt", **{"FAKE_STATE": "pre-ledger", **env})
+    result, calls = migrate(host, "--adopt", **{"FAKE_STATE": "pre-ledger", "FAKE_CHECK": "column a: text|t\\n", **env})
     assert result.returncode != 0
     assert message in result.stderr
-    assert not _ledger_sent(log)
+    assert not _ledger_sent(calls)
 
 
-@pytestmark_bash
+@needs_bash
 def test_a_failing_ledger_fails_the_adopt(host):
-    result, log = migrate(host, "--adopt", FAKE_STATE="pre-ledger", FAKE_CHECK="table candles|t\\n", FAKE_LEDGER_EXIT="3")
+    result, calls = migrate(host, "--adopt", FAKE_STATE="pre-ledger", FAKE_CHECK="column a: text|t\\n", FAKE_LEDGER_EXIT="3")
     assert result.returncode != 0
     assert "recording the baseline failed" in result.stderr
-    assert _ledger_sent(log)
+    assert _ledger_sent(calls)
 
 
-@pytestmark_bash
+@needs_bash
 def test_no_query_runs_before_the_db_answers_over_tcp(host):
-    result, log = migrate(host, FAKE_READY_FAILS="2")
+    result, calls = migrate(host, FAKE_READY_FAILS="2")
     assert result.returncode == 0, result.stderr
-    argvs = [argv for argv, _ in _calls(log)]
-    first_psql = next(i for i, a in enumerate(argvs) if "psql" in a)
-    assert [("pg_isready" in a, "127.0.0.1" in a) for a in argvs[:first_psql]] == [(True, True)] * 3
+    first_psql = next(i for i, c in enumerate(calls) if c.is_psql)
+    readiness = [" ".join(c.argv) for c in calls[:first_psql]]
+    assert len(readiness) == 3 and all("pg_isready -q -h 127.0.0.1" in r for r in readiness)
 
     (host / "docker.log").unlink()
     (host / "docker.log.ready").unlink()
-    result, log = migrate(host, FAKE_READY_FAILS="always")
+    result, calls = migrate(host, FAKE_READY_FAILS="always")
     assert result.returncode != 0
     assert "did not accept TCP connections" in result.stderr
-    assert not any("psql" in argv for argv, _ in _calls(log))
+    assert not any(c.is_psql for c in calls)
