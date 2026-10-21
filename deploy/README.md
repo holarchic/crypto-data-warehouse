@@ -4,7 +4,7 @@
 
 - Python 3.12+
 - PostgreSQL 16 + TimescaleDB
-- Docker + Docker Compose 2.17 or later, with BuildKit (the default builder): the api build uses a named build context
+- Docker + Docker Compose 2.24.4 or later (the prod override's `!override`; the api build's named context needs 2.17), with BuildKit, the default builder
 - Copy `.env.example` → `.env` and set `POSTGRES_PASSWORD`
 
 ### Monitor env vars
