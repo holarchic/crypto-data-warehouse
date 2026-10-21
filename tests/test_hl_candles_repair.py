@@ -7,6 +7,7 @@ import math
 import hl_candles_repair as hl
 import pytest
 from config import CANDLE_REPAIR, LOOP_INTERVALS
+from feed_health import paging_threshold_s
 
 from tests.instruments import instrument
 
@@ -52,8 +53,7 @@ def test_slices_are_oldest_first_contiguous_and_at_most_26h():
 
 
 def test_failed_bootstrap_pages_before_its_anchor_reaches_the_cap():
-    interval = LOOP_INTERVALS[CANDLE_REPAIR]
-    page_after_ms = (interval + max(interval, 1800)) * 1000
+    page_after_ms = paging_threshold_s(LOOP_INTERVALS[CANDLE_REPAIR]) * 1000
     assert hl.DEFAULT_LOOKBACK_MS + page_after_ms < hl.CAP_MS
 
 

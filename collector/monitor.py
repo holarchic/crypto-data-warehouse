@@ -12,6 +12,7 @@ import urllib.request
 from collections import deque, namedtuple
 from datetime import datetime, timezone
 
+import feed_health
 from config import CANDLE_TABLES, LOOP_INTERVALS, load_candle_tables, load_timeframe_intervals
 from dotenv import load_dotenv
 from status import LOOP_SENTINEL_SYMBOL
@@ -31,6 +32,10 @@ ALARMING_DARK_FLOOR_S = 1200
 # Consecutive breaching cycles before an alarming page; ALARMING_SUSTAIN_CYCLES overrides it.
 DEFAULT_SUSTAIN_CYCLES = 3
 
+# The finest gap-scan tier: the monitor's default tick. A timeframe is gap-scanned at most once per
+# max(its interval, this), so 1m and 5m scan every cycle and 12h every 12 hours.
+GAP_SCAN_MIN_S = 300
+
 # Result of one alarming-signal evaluation (named, not positional). `should_record` carries the
 # baseline-update invariant (record only non-breaching counts) so the caller doesn't re-derive it.
 AlarmingDecision = namedtuple("AlarmingDecision", ["baseline", "should_fire", "next_consecutive", "should_record"])
@@ -41,25 +46,12 @@ AlarmingDecision = namedtuple("AlarmingDecision", ["baseline", "should_fire", "n
 
 
 def compute_staleness(status_rows, timeframe_intervals):
-    """Given collection_status rows + {tf: interval_s}, return rows where
-    seconds_since_success > threshold or last_success is NULL.
-
-    Threshold is interval_s + max(interval_s, 1800). The 30-minute floor
-    absorbs the serial-fetch cycle time across hundreds of pairs per TF —
-    without it, short-TF pairs near the end of a fetch cycle trip the 2x
-    interval threshold every cycle, drowning real signal in noise.
-    """
-    stale = []
-    for row in status_rows:
-        tf = row["timeframe"]
-        interval_s = timeframe_intervals.get(tf)
-        if interval_s is None:
-            continue
-        threshold = interval_s + max(interval_s, 1800)
-        since = row.get("seconds_since_success")
-        if since is None or since > threshold:
-            stale.append(row)
-    return stale
+    """The collection_status rows stale under feed_health.is_stale_for_paging, given {tf: interval_s}.
+    A row whose timeframe has no interval is skipped."""
+    return [
+        row for row in status_rows
+        if feed_health.is_stale_for_paging(row.get("seconds_since_success"), timeframe_intervals.get(row["timeframe"]))
+    ]
 
 
 def compute_alarming(status_rows, timeframe_intervals, error_threshold=3):
@@ -161,7 +153,7 @@ def format_gap_alert(exchange, timeframe, gaps):
         return ""
     lines = [f"⚠️ {len(gaps)} candle gap(s) on {exchange}/{timeframe}:"]
     for g in gaps:
-        lines.append(f"  • {g['symbol']}: {int(g['missing_count'])} missing after {g['gap_after']}")
+        lines.append(f"  • {g['symbol']}: {int(g['missing_count'])} missing after {g['gap_after'].isoformat()}")
     return "\n".join(lines)
 
 
@@ -234,29 +226,6 @@ STALENESS_SQL = """
     WHERE active = TRUE
     ORDER BY exchange, timeframe, symbol
 """
-
-# One gap-scan query per candle table (candles, candles_1m). The FROM table is substituted at
-# import from the closed CANDLE_TABLES allowlist — NOT interpolated from a runtime value — so 1m
-# gap detection scans candles_1m (else it would query `candles`, find no 1m rows, and be silently
-# blind to 1m bar-gaps). Mirrors the collector's INSERT_SQL routing (same single source).
-_GAP_TEMPLATE = """
-    WITH consecutive AS (
-        SELECT symbol, timestamp,
-               LEAD(timestamp) OVER (PARTITION BY symbol ORDER BY timestamp) AS next_ts
-        FROM {table}
-        WHERE exchange = %(exchange)s
-          AND timeframe = %(timeframe)s
-          AND timestamp > NOW() - INTERVAL '1 second' * %(lookback_s)s
-    )
-    SELECT symbol, timestamp AS gap_after, next_ts AS gap_before,
-           EXTRACT(EPOCH FROM next_ts - timestamp) / %(interval_s)s - 1 AS missing_count
-    FROM consecutive
-    WHERE next_ts IS NOT NULL
-      AND EXTRACT(EPOCH FROM next_ts - timestamp) > %(interval_s)s * 1.5
-    ORDER BY symbol, timestamp
-"""
-GAP_SQL_BY_TABLE = {table: _GAP_TEMPLATE.format(table=table) for table in CANDLE_TABLES}
-
 
 def send_webhook(url, text):
     """POST alert to Slack/Discord webhook. Returns True on success.
@@ -346,24 +315,14 @@ def fetch_status_rows(conn):
 
 
 def detect_gaps(conn, exchange, timeframe, interval_s, table="candles", lookback_count=10):
-    """Detect candle gaps for an exchange/timeframe in its storage table. Returns list of gap dicts."""
-    lookback_s = lookback_count * interval_s
-    params = {
-        "exchange": exchange,
-        "timeframe": timeframe,
-        "lookback_s": lookback_s,
-        "interval_s": interval_s,
-    }
+    """Candle gaps for an exchange/timeframe in its storage table (1m reads candles_1m): one dict per
+    run of missing bars, with gap_after/gap_before as datetimes."""
+    sql, params = feed_health.gap_query(table, exchange=exchange, timeframe=timeframe, interval_s=interval_s,
+                                        lookback_count=lookback_count)
     with conn.cursor() as cur:
-        cur.execute(GAP_SQL_BY_TABLE[table], params)
+        cur.execute(sql, params)
         cols = [desc[0] for desc in cur.description]
-        rows = [dict(zip(cols, row)) for row in cur.fetchall()]
-    # Convert timestamps to ISO strings for readability
-    for row in rows:
-        for key in ("gap_after", "gap_before"):
-            if row.get(key) and hasattr(row[key], "isoformat"):
-                row[key] = row[key].isoformat()
-    return rows
+        return [dict(zip(cols, row)) for row in cur.fetchall()]
 
 
 def _get_exchange_timeframe_pairs(conn):
@@ -372,22 +331,6 @@ def _get_exchange_timeframe_pairs(conn):
     with conn.cursor() as cur:
         cur.execute(sql)
         return cur.fetchall()
-
-
-# Slower timeframes checked less frequently — map of minimum cycle interval in seconds
-_TF_SCAN_INTERVALS = {
-    "1m": 300,    # every cycle (candles_1m; the 300s monitor tick is the finest cadence anyway)
-    "5m": 300,    # every cycle
-    "15m": 900,
-    "30m": 1800,
-    "1h": 3600,
-    "2h": 7200,
-    "4h": 14400,
-    "12h": 43200,
-    "1d": 86400,
-    "3d": 259200,
-    "1w": 604800,
-}
 
 
 def monitor_loop(dsn, timeframe_intervals, webhook_url, poll_s=300, cooldown_s=3600,
@@ -470,13 +413,13 @@ def monitor_loop(dsn, timeframe_intervals, webhook_url, poll_s=300, cooldown_s=3
                 if timeframe in LOOP_TIMEFRAMES:
                     continue
 
-                # Tiered scanning — check slower TFs less often, per (exchange, timeframe)
-                scan_interval = _TF_SCAN_INTERVALS.get(timeframe, 300)
-                if not gap_scan_due(last_gap_scan, (exchange, timeframe), scan_interval, now):
-                    continue
-
                 interval_s = timeframe_intervals.get(timeframe)
                 if interval_s is None:
+                    continue
+
+                # Tiered scanning — check slower TFs less often, per (exchange, timeframe)
+                scan_interval = max(interval_s, GAP_SCAN_MIN_S)
+                if not gap_scan_due(last_gap_scan, (exchange, timeframe), scan_interval, now):
                     continue
 
                 gaps = detect_gaps(conn, exchange, timeframe, interval_s, candle_tables.get(timeframe, "candles"))
