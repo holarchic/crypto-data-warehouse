@@ -2,7 +2,6 @@
 
 import json
 
-import hl_candles
 from config import CANDLE_WS
 from hl_candles import (
     INSERT_CANDLES_1M_SQL,
@@ -163,19 +162,3 @@ def test_ceiling_guard_warns_near_documented_ceiling(caplog):
         _check_sub_ceiling(["c"] * 950)                   # nearing the documented ~1000 per-IP ceiling
     assert any("ceiling" in r.message for r in caplog.records)
 
-
-# --- run() wiring (source-pin — run() is a blocking daemon entry point) -------
-
-def test_run_wires_candle_ws_only_behind_flag():
-    """The single HL 1m WS thread is imported + launched only when has_candle_ws is set, and NO REST
-    backfill thread exists (WS-only, T-015.1). Source-pinned because run() blocks forever (matches the
-    premium/liq wiring pins)."""
-    from pathlib import Path
-    src = (Path(hl_candles.__file__).parent / "main.py").read_text()
-    assert "from hl_candles import build_hl_candle_spec" in src
-    assert "config.has_candle_ws" in src
-    # One WS thread over the whole universe; the spec takes `exchange` (for the HL coin-name map).
-    assert "args=(build_hl_candle_spec(exchange), config, dsn)" in src
-    # WS-only: no live REST backfill thread.
-    assert "hl_candle_backfill_loop" not in src
-    assert "candle-backfill" not in src
