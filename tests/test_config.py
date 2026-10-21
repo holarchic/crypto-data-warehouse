@@ -65,7 +65,7 @@ def test_candle_ws_loop_sentinel_registered():
 
 def test_hl_1m_streamed_not_polled():
     # T-015.1: HL 1m must NEVER be a configured timeframe (regardless of the has_candle_ws flag) — else
-    # run() would launch the per-symbol REST 1m collect_loop that starves HL's shared limiter.
+    # build_feeds would add the per-symbol REST 1m candle_loop that starves HL's shared limiter.
     cfg = load_config("hyperliquid")
     assert "1m" not in {tf.name for tf in cfg.timeframes}
 
