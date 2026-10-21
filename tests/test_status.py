@@ -73,6 +73,6 @@ def test_the_universe_has_one_reader():
     per-timeframe rows (with their cursor) through query_active_pairs."""
     callers = {path.name for path in COLLECTOR.glob("*.py")
                if path.name != "status.py" and re.search(r"\bquery_active_pairs\(", path.read_text())}
-    assert callers == {"main.py"}
+    assert callers == {"candles.py"}
     for name in UNIVERSE_CONSUMERS:
         assert re.search(r"\bactive_instruments\(", (COLLECTOR / name).read_text()), name
