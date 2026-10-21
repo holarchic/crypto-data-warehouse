@@ -1,6 +1,6 @@
 """Tests for collector/ws.py — the generic WS engine.
 
-No real socket or DB: conftest stubs db/status/backoff as MagicMock, so we monkeypatch
+No real socket or DB: conftest stubs db/backoff as MagicMock, so we monkeypatch
 `ws.connect_db`/`ws.active_instruments`/`ws.upsert_loop_heartbeat` and drive a scripted
 `FakeWS` + an injected clock. Buffer mechanics test the factored helpers (`_flush`,
 `_active_pairs`, `_ensure_conn`, `_cap_buffer`) directly; timer/reconnect behavior drives

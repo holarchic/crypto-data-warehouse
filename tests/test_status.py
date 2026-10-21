@@ -9,41 +9,7 @@ import pytest
 import status
 from status import UNIVERSE_TIMEFRAME, Instrument, active_instruments
 
-
-class RecordingConn:
-    """Records every execute and every transaction call; fetchall answers `rows`."""
-
-    rowcount = 0
-    description = ()
-
-    def __init__(self, rows=()):
-        self.rows = list(rows)
-        self.events = []
-
-    def cursor(self):
-        return self
-
-    def __enter__(self):
-        return self
-
-    def __exit__(self, *exc):
-        return False
-
-    def execute(self, sql, params=None):
-        self.events.append(("execute", sql, params))
-
-    def executemany(self, sql, rows):
-        self.events.append(("executemany", sql, rows))
-
-    def fetchall(self):
-        return self.rows
-
-    def commit(self):
-        self.events.append(("commit",))
-
-    def rollback(self):
-        self.events.append(("rollback",))
-
+from tests.fakes import RecordingConn
 
 HELPERS = [
     lambda c: status.upsert_status_success(c, "binance", "perp", "BTC/USDT:USDT", "5m", 1.0, asset_id="BTC"),
@@ -65,8 +31,7 @@ HELPERS = [
 def test_no_helper_ends_the_callers_transaction(helper):
     conn = RecordingConn()
     helper(conn)
-    kinds = [event[0] for event in conn.events]
-    assert kinds and set(kinds) <= {"execute", "executemany"}
+    assert conn.kinds() and set(conn.kinds()) <= {"execute", "executemany"}
 
 
 def test_status_module_never_commits_or_rolls_back():
@@ -80,9 +45,9 @@ def test_active_instruments_reads_the_universe_timeframe_as_instruments():
     instruments = active_instruments(conn, "binance")
     assert instruments == [Instrument("BTC/USDT:USDT", "BTC", "BTCUSDT", "perp"),
                            Instrument("ETH/USDT:USDT", None, None, "perp")]
-    (_, sql, params), = conn.events
-    assert params == {"exchange": "binance", "timeframe": UNIVERSE_TIMEFRAME}
-    assert "last_timestamp" not in sql
+    (query,) = conn.events
+    assert query.params == {"exchange": "binance", "timeframe": UNIVERSE_TIMEFRAME}
+    assert "last_timestamp" not in query.sql
     assert UNIVERSE_TIMEFRAME == "5m"
 
 

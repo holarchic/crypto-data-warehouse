@@ -1,17 +1,19 @@
 """Tests for collector/oi.py — HL 1-min cadence + asset_ctxs bundle dual-write.
 
-The repo has NO real-DB test harness (conftest stubs psycopg/db/status/backoff with
-MagicMock). So DB-engine behaviour (real ON-CONFLICT dedup, real rollback) is verified
+The repo has NO real-DB test harness (conftest stubs psycopg/db/backoff with MagicMock).
+So DB-engine behaviour (real ON-CONFLICT dedup, real rollback) is verified
 in prod; here we test cc's own logic: parsing, the pacing call, and the loop's
 insert/commit/rollback discipline via a fake conn/cursor that records calls.
 """
 
 import sys
+from unittest.mock import MagicMock
 
 import pytest
 
-# conftest stubs `oi` to a MagicMock; remove the stub so we test the real module.
-sys.modules.pop("oi", None)
+# conftest stubs `oi` to a MagicMock; remove the stub (never an already-loaded real module).
+if isinstance(sys.modules.get("oi"), MagicMock):
+    del sys.modules["oi"]
 
 import oi  # noqa: E402, I001  (must follow stub removal)
 from tests.instruments import instrument  # noqa: E402

@@ -21,7 +21,7 @@ from candles import (
 )
 from rate_limiter import binance_kline_weight
 
-from tests.test_status import RecordingConn
+from tests.fakes import RecordingConn
 
 _MAIN_PATH = Path(_config_mod.__file__).parent / "main.py"
 
@@ -317,14 +317,12 @@ def test_collect_pair_commits_bars_and_cursor_once(monkeypatch):
     main_mod = _load_real_main()
     conn = RecordingConn()
     _collect_into(main_mod, monkeypatch, conn)
-    assert [e[0] for e in conn.events] == ["execute", "execute", "execute", "commit"]
-    assert all("INSERT INTO candles (" in e[1] for e in conn.events[:2])
-    assert conn.events[2][1] == status.UPSERT_SUCCESS_SQL
+    assert conn.kinds() == ["execute", "execute", "execute", "commit"]
+    assert all("INSERT INTO candles (" in e.sql for e in conn.events[:2])
+    assert conn.events[2].sql == status.UPSERT_SUCCESS_SQL
 
 
 class _CursorWriteFails(RecordingConn):
-    closed = False
-
     def execute(self, sql, params=None):
         super().execute(sql, params)
         if sql == status.UPSERT_SUCCESS_SQL:
@@ -337,12 +335,12 @@ def test_a_failed_cursor_write_rolls_the_bars_back_then_commits_the_error(monkey
     conn = _CursorWriteFails()
     with pytest.raises(RuntimeError) as failure:
         _collect_into(main_mod, monkeypatch, conn)
-    assert "commit" not in [e[0] for e in conn.events]
+    assert "commit" not in conn.kinds()
     config, tf, pair = SimpleNamespace(name="binance", market_type="perp"), SimpleNamespace(name="5m"), {"symbol": "B"}
     main_mod._record_pair_error(conn, config, pair, tf, failure.value)
     tail = conn.events[3:]
-    assert [e[0] for e in tail] == ["rollback", "execute", "commit"]
-    assert tail[1][1] == status.UPSERT_ERROR_SQL
+    assert [e.kind for e in tail] == ["rollback", "execute", "commit"]
+    assert tail[1].sql == status.UPSERT_ERROR_SQL
 
 
 # --- collect_loop pacing: each cycle paces from its own start ---------------------
