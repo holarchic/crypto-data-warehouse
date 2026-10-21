@@ -1,3 +1,8 @@
+-- The baseline schema: the database after migrations 001-013, without tablespace placement (prod's
+-- ts_1m comes from 010). Frozen: a schema change is a new file in db/migrations/, applied by
+-- scripts/migrate.sh, never an edit here. initdb runs this file, then db/ledger.sql, which records
+-- 001-013 as applied.
+
 CREATE EXTENSION IF NOT EXISTS timescaledb;
 
 CREATE TABLE IF NOT EXISTS candles (
