@@ -36,7 +36,7 @@ ORDER BY day;
 
 ## Pulling a long history through the API
 
-`/candles`, `/funding`, `/oi` and `/liquidations` return the newest rows first, up to `limit` (at most 5,000), between `start` and `end` (both inclusive). For a long span, walk forward in fixed windows sized to the cap, so every request is complete and nothing is fetched twice:
+`/candles`, `/funding`, `/oi` and `/liquidations` return the newest rows first, up to `limit` (at most 5,000), between `start` and `end` (both inclusive). Candles have one row per interval, so a long span can be walked forward in fixed windows sized to the cap: every request is complete and nothing is fetched twice.
 
 ```python
 import json
@@ -67,7 +67,9 @@ bars = candles("binance", "BTC", "5m",
                datetime(2026, 7, 1, tzinfo=timezone.utc), datetime(2026, 10, 1, tzinfo=timezone.utc))
 ```
 
-Check what came back before using it. The expected count is `(end - start) / interval`, less any untraded bars on the venues above, and a shortfall is a gap.
+Check what came back before using it. The expected count is `ceil((end - start) / interval)`, less any untraded bars on the venues above, and a shortfall is a gap.
+
+Funding, OI and liquidations have no fixed row count per window. A response of exactly `limit` rows may be truncated: narrow the window and ask again. Several liquidations can share a timestamp, so time windows can't always split them; for long liquidation and OI spans, use the parquet export below or a bounded database read.
 
 ## Funding
 
