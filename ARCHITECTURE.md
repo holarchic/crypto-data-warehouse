@@ -87,19 +87,27 @@ Separate always-on container (`python -m monitor`). One `collection_status` fetc
 
 - **Loop-liveness** — presence-based: any stale per-loop heartbeat sentinel row (funding/OI/liq_ws/premium/candle_ws/candle_repair) pages (own cooldown key). Every alert's cooldown starts only when the webhook accepts it (`send_alert`), and a gap scan whose alert failed stays due, so a failed delivery is retried next cycle. A single dead loop is one row, so it is kept off the count-delta signal below. The `candle_ws` sentinel is HL 1m's liveness surface (it is streamed, not per-pair-status tracked).
 - **Candle alarming-mass** — `compute_alarming` counts collectors that are *alarming* (`error_count >= ALARMING_ERROR_THRESHOLD`, default 3, or was-working-now-dark past `max(4×interval, ALARMING_DARK_FLOOR_S)` — the 1200 s floor lifts only 1m, whose serial RTT-bound REST cycle runs minutes, not the interval; excludes the benign new-listing floor, the HL 5m and REST 1m within-cycle cursors, and transient single-cycle rate-limit blips whose `error_count` resets on the next success). `evaluate_alarming` pages when that count exceeds its rolling-1h median by `ALARMING_DELTA_THRESHOLD` for `ALARMING_SUSTAIN_CYCLES` consecutive cycles, returning a named `AlarmingDecision` that owns the record-only-quiescent baseline invariant.
-- **Gap detection** (tiered by timeframe, **routed to the timeframe's candle table** via `load_candle_tables()` so 1m gaps scan `candles_1m`, not the 1m-empty `candles`) + a weekly heartbeat summary (24h candle count summed across `candles` + `candles_1m`; its stale count is that cycle's `compute_staleness` count, per timeframe) + a per-cycle healthcheck dead-man's-switch ping.
+- **Gap detection** (each (exchange, timeframe) scanned at most every `max(interval, GAP_SCAN_MIN_S)`, 300 s; **routed to the timeframe's candle table** via `load_candle_tables()` so 1m gaps scan `candles_1m`, not the 1m-empty `candles`) + a weekly heartbeat summary (24h candle count summed across `candles` + `candles_1m`; its stale count is that cycle's `compute_staleness` count, per timeframe) + a per-cycle healthcheck dead-man's-switch ping. `detect_gaps` returns datetimes; `format_gap_alert` renders them.
+
+### collector/feed_health.py — staleness rules and the gap query
+
+The rules the monitor and the api share. It imports only `config` and the stdlib, so the api image carries it beside `config.py`.
+- **`is_stale_for_paging`** is the monitor's raw-staleness and loop-liveness rule (`compute_staleness`): no success, or none within `paging_threshold_s` = `interval + max(interval, PAGING_STALE_FLOOR_S)`. The 1800 s floor absorbs a serial REST cycle. Candle pages go through the separate alarming gate above.
+- **`is_stale_for_status`** is `/status`'s per-pair freshness for a reader: no success, or none within 2 × interval.
+- Both treat an unknown interval as not stale.
+- **`gap_query(table, *, exchange, timeframe, interval_s, lookback_count, asset_id=None)`** returns `(sql, params)`. It uses SQL built at import for each `CANDLE_TABLES` table, with and without the asset filter, so no runtime value becomes an identifier. The monitor's `detect_gaps` and `/status/gaps` both run it. `tests/integration/check_gap_query.py` runs it on TimescaleDB.
 
 ### api/
 
 FastAPI read-only REST API. Queries PostgreSQL, serves downstream consumers.
 
-**Feed metadata.** The api image copies `collector/config.py` and `exchanges.yaml` beside `main.py` through the `project` named build context, and `main.py` imports `config`.
+**Feed metadata.** The api image copies `collector/config.py`, `collector/feed_health.py` and `exchanges.yaml` beside `main.py` through the `project` named build context, and `main.py` imports `config` and `feed_health` (a module name kept distinct from its `health()` endpoint).
 
 - **Routing:** `_candle_table` reads `config.load_candle_tables()`, defaulting to `candles`.
 - **Intervals:** `TIMEFRAME_INTERVALS` is `config.load_timeframe_intervals()` plus the API-owned `RETIRED_TIMEFRAME_INTERVALS` (1d/3d/1w: no longer collected, still served).
 - **Loop names:** `LOOP_TIMEFRAMES` is `config.LOOP_INTERVALS`' keys, and every candle-facing status query excludes those sentinel rows.
-- **Constraint:** both images import `config.py`, so it must import only the stdlib and `yaml`; `tests/integration/check_api_metadata.sh` imports it inside the built api image. A test requires every configured interval to be a positive integer.
-- **Staleness:** `/status`'s `is_stale` is `_status_is_stale`: no success, or none within 2 × interval. The monitor's paging threshold, `interval + max(interval, 1800)`, is a separate rule. The gap query is still written in both `api/main.py` and `monitor.py` until T-032.2.
+- **Constraint:** both images import `config.py` and `feed_health.py`, so `config.py` imports only the stdlib and `yaml`, and `feed_health.py` only `config` and the stdlib. `tests/integration/check_api_metadata.sh` imports both inside the built api image. `config._interval_s` rejects a non-positive or non-int `interval_s` at load, in every process.
+- **Staleness and gaps:** `/status`'s `is_stale` is `feed_health.is_stale_for_status`, and `/status/gaps` runs `feed_health.gap_query` (see feed_health above).
 
 **Release version.** `pyproject.toml` holds the warehouse's one release version. The api build takes the repo root as a second, named build context (`project`, compose `additional_contexts`) and copies just that file to `/pyproject.toml`. `main.py` reads `RELEASE_VERSION` from it with `tomllib` at import and passes it to `FastAPI(version=…)`, so `/openapi.json` reports the image's release. `tests/test_api_version.py` pins that wiring.
 
