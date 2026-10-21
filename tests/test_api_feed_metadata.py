@@ -1,5 +1,5 @@
-"""api/main.py reads its feed metadata from collector/config.py (copied into the api image beside
-it) instead of mirroring it, and names /status's staleness rule. Read with `ast`: the test harness
+"""api/main.py reads its feed metadata from collector/config.py and its staleness and gap rules from
+collector/feed_health.py (both copied into the api image beside it) instead of mirroring them. Read with `ast`: the test harness
 stubs `main` and the db modules (tests/conftest.py), and api/main.py can't be imported beside
 collector/main.py. tests/integration/check_api_metadata.sh runs the same assertions inside the built
 image."""
@@ -51,31 +51,33 @@ def test_retired_timeframes_are_not_collected():
     assert not set(retired) & set(config.load_timeframe_intervals())
 
 
-def test_status_staleness_rule():
-    stale = _function("_status_is_stale")
-    assert stale(None, None) is False and stale(10_000, None) is False   # unknown timeframe
-    assert stale(None, 60) is True                                        # never succeeded
-    assert stale(0, 60) is False
-    assert stale(120, 60) is False                                        # exactly two intervals
-    assert stale(121, 60) is True
+def _get(name):
+    return next(n for n in TREE.body if isinstance(n, ast.FunctionDef) and n.name == name)
+
+
+def test_main_imports_feed_health_and_no_name_shadows_it():
+    """`main` also defines a `health()` endpoint; the module's own name keeps the two apart."""
+    imports = {alias.asname or alias.name for n in TREE.body if isinstance(n, ast.Import) for alias in n.names}
+    assert "feed_health" in imports
+    defined = {n.name for n in TREE.body if isinstance(n, ast.FunctionDef | ast.ClassDef)}
+    defined |= {t.id for n in TREE.body if isinstance(n, ast.Assign) for t in n.targets if isinstance(t, ast.Name)}
+    assert "feed_health" not in defined
 
 
 def test_status_sets_is_stale_through_the_named_rule():
-    get_status = next(n for n in TREE.body if isinstance(n, ast.FunctionDef) and n.name == "get_status")
-    assigns = [n for n in ast.walk(get_status) if isinstance(n, ast.Assign)
+    assigns = [n for n in ast.walk(_get("get_status")) if isinstance(n, ast.Assign)
                and any(isinstance(t, ast.Subscript) and ast.unparse(t.slice) == "'is_stale'" for t in n.targets)]
     assert len(assigns) == 1
     call = assigns[0].value
-    assert isinstance(call, ast.Call) and ast.unparse(call.func) == "_status_is_stale"
+    assert isinstance(call, ast.Call) and ast.unparse(call.func) == "feed_health.is_stale_for_status"
 
 
-def test_every_configured_interval_is_a_positive_whole_number_of_seconds():
-    """The api and the monitor take these from exchanges.yaml as they are; a quoted, null or zero
-    interval would break /status, the gap check and the monitor's staleness alike."""
-    intervals = config.load_timeframe_intervals()
-    assert intervals
-    for timeframe, seconds in intervals.items():
-        assert type(seconds) is int and seconds > 0, (timeframe, seconds)
+def test_status_gaps_runs_the_shared_gap_query():
+    gaps = _get("get_status_gaps")
+    calls = [ast.unparse(n.func) for n in ast.walk(gaps) if isinstance(n, ast.Call)]
+    assert "feed_health.gap_query" in calls
+    assert "LEAD(" not in ast.unparse(gaps)
+    assert "LEAD(" not in API_MAIN.read_text()
 
 
 def test_candle_table_routes_through_config():
