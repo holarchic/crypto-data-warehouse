@@ -148,7 +148,7 @@ TimescaleDB auto-tunes `max_connections` low (~25 on 8GB). Override via `command
   - **Funding-slot occupancy** (≥ 99 %): slots at the collector's own assumed interval (1 h HL, 8 h elsewhere) that hold a settlement.
   - **OI bucket occupancy** (≥ 95 %): 60 s buckets on HyperLiquid and 300 s elsewhere that hold a snapshot.
   - **Primary keys** on `candles`, `candles_1m`, `funding_rates` and `open_interest`.
-  - **Discovery:** the latest run is no more than a day old, and every asset it qualified is active on some venue.
+  - **Discovery:** the latest run is dated today or yesterday (UTC), and every asset it qualified is active on some venue.
   - A pair re-activated inside the window (a weekend volume dip) counts its inactive time as missed.
 - **API p95.** 50 requests for 500 BTC 5m rows, each of which must return all 500. Under 0.5 s passes.
 - **Not measured:**
