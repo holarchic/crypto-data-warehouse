@@ -113,7 +113,11 @@ services:
     restart: "no"
 
   api:
-    build: ./api
+    build:
+      context: ./api
+      # The image copies pyproject.toml from here: it holds the release version the API reports.
+      additional_contexts:
+        project: .
     depends_on:
       db:
         condition: service_healthy

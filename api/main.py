@@ -1,6 +1,8 @@
 import os
+import tomllib
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
+from pathlib import Path
 
 import export
 from dotenv import load_dotenv
@@ -10,6 +12,11 @@ from psycopg.rows import dict_row
 from psycopg_pool import ConnectionPool
 
 load_dotenv()
+
+# pyproject.toml holds the one release version. It sits one directory above this file both in the
+# repo and in the image (/app/main.py, /pyproject.toml). A missing file stops the import, so the API
+# never reports a wrong version.
+RELEASE_VERSION = tomllib.loads((Path(__file__).resolve().parents[1] / "pyproject.toml").read_text())["project"]["version"]
 
 
 def build_dsn():
@@ -36,7 +43,7 @@ async def lifespan(app: FastAPI):
     pool.close()
 
 
-app = FastAPI(title="candle-collector", version="0.7.0", lifespan=lifespan)
+app = FastAPI(title="candle-collector", version=RELEASE_VERSION, lifespan=lifespan)
 
 
 @app.get("/health")

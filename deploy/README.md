@@ -4,7 +4,7 @@
 
 - Python 3.12+
 - PostgreSQL 16 + TimescaleDB
-- Docker + Docker Compose
+- Docker + Docker Compose 2.17 or later, with BuildKit (the default builder): the api build uses a named build context
 - Copy `.env.example` → `.env` and set `POSTGRES_PASSWORD`
 
 ### Monitor env vars
@@ -99,6 +99,7 @@ Pass: returns ≥1 candle with all OHLCV fields populated, correct exchange/symb
 ### Code updates
 
 - Code updates never touch the db container. `git pull`, then `build` only the services whose code or config changed, including the profile one-shots `discovery` and `liquidations-hl` (they bake in `collector/` and `exchanges.yaml`), then `up -d --no-deps <svc…>`.
+- **Releases.** `pyproject.toml` holds the release version, and the api reports it on `/openapi.json`. A deploy that rebuilds images bumps it (minor for a feature, patch for a fix) and tags the deployed commit `vX.Y.Z`. Every release rebuilds and recreates `api` too, collector-only ones included, since the api image carries the version. After the deploy, `curl -s localhost:8000/openapi.json | jq -r .info.version` on the server prints the tag's version.
 - Deploy mid-interval (e.g. xx:20 – xx:40), away from the 00/08/16 UTC funding settlements.
 - Restart the HyperLiquid collector only outside a repair run: not while `hl-candles-repair` is running (`docker ps`), not within 1 min of its exit, and not from 06:15 until the 06:30 cron run exits. Its startup funding seed (one 100 h `fundingHistory` call per pair, ~25 weight each, ~10 min for ~170 pairs) shares HL's per-IP weight budget with the repair.
 - `deploy/deploy.sh` is for fresh installs and full redeploys only: its `compose pull db` and stack-wide `up -d` can recreate the db onto a moved `latest-pg16`.
