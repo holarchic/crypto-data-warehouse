@@ -85,7 +85,7 @@ Pass: returns ≥1 candle with all OHLCV fields populated, correct exchange/symb
 
 | Action | Command |
 |--------|---------|
-| Start prod | `docker compose -f docker-compose.yml -f docker-compose.prod.yml up -d` |
+| Start prod | `docker compose -f docker-compose.yml -f docker-compose.prod.yml up -d db && ./scripts/migrate.sh && docker compose -f docker-compose.yml -f docker-compose.prod.yml up -d` |
 | Stop prod | `docker compose -f docker-compose.yml -f docker-compose.prod.yml down` |
 | Prod logs | `docker compose -f docker-compose.yml -f docker-compose.prod.yml logs -f` |
 | Code update | `git pull` → `build <changed svcs>` → `up -d --no-deps <svcs>` (see Code updates below) |

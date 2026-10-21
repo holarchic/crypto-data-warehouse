@@ -2,37 +2,52 @@
 # The migration ledger's operations, sourced by scripts/migrate.sh and tests/integration/check_migrations.sh.
 #
 # The caller defines `migrations_psql`, which runs psql against the target database with the given
-# arguments and SQL on stdin, and may set MIGRATIONS_DIR, LEDGER_SQL and BASELINE_CHECK_SQL. Every
-# function returns non-zero, with a message on stderr, rather than continue past a failure.
+# arguments and SQL on stdin. Each operation takes its files as arguments (defaulting to the repo's
+# db/ files) and returns non-zero, with a message on stderr, rather than continue past a failure.
 #
-# A migration is db/migrations/NNN-<name>.sql. It runs in one transaction with its ledger row, so
-# it must not hold transaction control of its own, and DDL that can't run in a transaction
-# (CREATE TABLESPACE, CREATE INDEX CONCURRENTLY) is a runbook step, not a migration.
+# A migration is db/migrations/NNN-<name>.sql. It runs in one transaction with its ledger row, so it
+# holds no transaction control of its own, and DDL that can't run in a transaction (CREATE
+# TABLESPACE, CREATE INDEX CONCURRENTLY) is a runbook step, not a migration.
 
-_MIGRATIONS_DB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../db" && pwd)"
-MIGRATIONS_DIR="${MIGRATIONS_DIR:-$_MIGRATIONS_DB_DIR/migrations}"
-LEDGER_SQL="${LEDGER_SQL:-$_MIGRATIONS_DB_DIR/ledger.sql}"
-BASELINE_CHECK_SQL="${BASELINE_CHECK_SQL:-$_MIGRATIONS_DB_DIR/baseline-check.sql}"
+_MIGRATIONS_DB="$(cd "$(dirname "${BASH_SOURCE[0]}")/../db" && pwd)"
+readonly MIGRATIONS_DEFAULT_DIR="$_MIGRATIONS_DB/migrations"
+readonly MIGRATIONS_DEFAULT_LEDGER="$_MIGRATIONS_DB/ledger.sql"
+readonly MIGRATIONS_DEFAULT_CHECK="$_MIGRATIONS_DB/baseline-check.sql"
+
+# Transaction control anywhere outside a `--` comment. Deliberately broad: a word in a string or a
+# nested PL/pgSQL `END;` is refused too, and is reworded, because a missed COMMIT would commit part
+# of a migration without its ledger row.
+_MIGRATIONS_TXN='(^|[^[:alnum:]_])(COMMIT|ROLLBACK|ABORT|SAVEPOINT|RELEASE|PREPARE[[:space:]]+TRANSACTION|(BEGIN|START|END)[[:space:]]+(TRANSACTION|WORK)|BEGIN[[:space:]]*;|END[[:space:]]*;)'
 
 _migrations_fail() { echo "migrate: $*" >&2; return 1; }
 
-# Every lib query stops at its first SQL error, so psql's exit status is the query's outcome.
+# Every query stops at its first SQL error, so psql's exit status is the query's outcome.
 _migrations_sql() { migrations_psql -v ON_ERROR_STOP=1 "$@"; }
 
-# Each migration file's path, in version order, after checking the whole directory.
+# A migration's text, read once: the bytes that are checked are the bytes that run.
+_migrations_read() {
+    local f=$1 sql
+    [ -f "$f" ] && [ -r "$f" ] || _migrations_fail "$(basename "$f"): not a readable file" || return 1
+    sql=$(cat "$f") || _migrations_fail "$(basename "$f"): read failed" || return 1
+    # shellcheck disable=SC2001  # per-line comment strip; a parameter expansion can't anchor per line
+    if sed 's/--.*$//' <<< "$sql" | grep -qiE "$_MIGRATIONS_TXN"; then
+        _migrations_fail "$(basename "$f"): holds transaction control; migrate.sh runs it in one transaction" || return 1
+    fi
+    printf '%s\n' "$sql"
+}
+
+# Each migration file's path, in version order, after checking every file in DIR.
 migrations_check_files() {
-    local f name version seen=" "
-    for f in "$MIGRATIONS_DIR"/*; do
+    local dir=${1:-$MIGRATIONS_DEFAULT_DIR} f name version seen=" "
+    for f in "$dir"/*; do
         name=$(basename "$f")
         [[ "$name" =~ ^([0-9]{3})-[a-z0-9-]+\.sql$ ]] || _migrations_fail "$name: not NNN-<name>.sql" || return 1
         version=${BASH_REMATCH[1]}
         [[ "$seen" != *" $version "* ]] || _migrations_fail "$name: version $version is used twice" || return 1
         seen+="$version "
-        if grep -qiE '^[[:space:]]*(BEGIN|COMMIT|ROLLBACK|START[[:space:]]+TRANSACTION|SAVEPOINT)[[:space:]]*;' "$f"; then
-            _migrations_fail "$name: holds its own transaction control; migrate.sh runs it in one transaction" || return 1
-        fi
+        _migrations_read "$f" > /dev/null || return 1
     done
-    printf '%s\n' "$MIGRATIONS_DIR"/*
+    printf '%s\n' "$dir"/*
 }
 
 # adopted (the ledger exists), pre-ledger (a schema without a ledger) or empty.
@@ -44,11 +59,17 @@ SELECT CASE WHEN to_regclass('public.schema_migrations') IS NOT NULL THEN 'adopt
 SQL
 }
 
-# The migration files the ledger lacks, in version order. Refuses an empty ledger and a pending
-# file older than the newest applied one: both need a person, not an apply.
+migrations_applied_count() {
+    _migrations_sql -At <<'SQL' || _migrations_fail "could not read schema_migrations"
+SELECT count(*) FROM public.schema_migrations;
+SQL
+}
+
+# The files in DIR whose version the ledger lacks, in version order. Refuses an empty ledger and a
+# pending file older than the newest applied one: both need a person, not an apply.
 migrations_pending() {
     local files applied newest f version
-    files=$(migrations_check_files) || return 1
+    files=$(migrations_check_files "${1:-$MIGRATIONS_DEFAULT_DIR}") || return 1
     applied=$(_migrations_sql -At <<'SQL'
 SELECT version FROM public.schema_migrations ORDER BY version;
 SQL
@@ -63,32 +84,51 @@ SQL
     done <<< "$files"
 }
 
-# Apply every pending migration in order, each in one transaction with its ledger row. Stops at the
-# first failure.
+# Apply every pending migration in DIR in order, each in one transaction with its ledger row.
+# The row is written only if the transaction that began the file is still the one ending it, so a
+# COMMIT the text check missed fails the apply instead of recording a half-applied migration.
 migrations_apply() {
-    local state pending f name
+    local dir=${1:-$MIGRATIONS_DEFAULT_DIR} state pending f name sql
     state=$(migrations_state) || return 1
     [ "$state" = "adopted" ] || _migrations_fail "the database is $state; run migrate.sh --adopt (pre-ledger) or initialise it first" || return 1
-    pending=$(migrations_pending) || return 1
+    pending=$(migrations_pending "$dir") || return 1
     [ -n "$pending" ] || { echo "migrate: nothing pending"; return 0; }
     while IFS= read -r f; do
         name=$(basename "$f")
+        sql=$(_migrations_read "$f") || return 1
         echo "migrate: applying $name"
-        { cat "$f"; printf '\nINSERT INTO public.schema_migrations (version, name) VALUES (:%s, :%s);\n' "'version'" "'name'"; } \
-            | _migrations_sql -1 -v version="${name:0:3}" -v name="$name" -f - \
-            || _migrations_fail "$name failed and was rolled back; later migrations were not applied" || return 1
+        _migrations_sql -1 -v version="${name:0:3}" -v name="$name" -f - <<SQL || _migrations_fail "$name failed and was rolled back; later migrations were not applied" || return 1
+SELECT txid_current() AS migration_txid \gset
+$sql
+SELECT txid_current() = :migration_txid AS migration_one_transaction \gset
+\if :migration_one_transaction
+INSERT INTO public.schema_migrations (version, name) VALUES (:'version', :'name');
+\else
+DO \$\$ BEGIN RAISE EXCEPTION 'the migration ended its own transaction; no ledger row recorded'; END \$\$;
+\endif
+SQL
     done <<< "$pending"
 }
 
-# Record the baseline on a database built before the ledger, once it has every baseline effect.
+# The baseline checks CHECK_SQL reports as failing, one per line (empty when all pass).
+migrations_baseline_failures() {
+    local out line
+    out=$(_migrations_sql -At -F '|' < "${1:-$MIGRATIONS_DEFAULT_CHECK}") \
+        || _migrations_fail "the baseline check did not run" || return 1
+    [ -n "$out" ] || _migrations_fail "the baseline check returned no rows" || return 1
+    while IFS= read -r line; do
+        [ "${line##*|}" = "t" ] || echo "${line%|*}"
+    done <<< "$out"
+}
+
+# Record the baseline (LEDGER_SQL) on a database built before the ledger, once CHECK_SQL passes.
 migrations_adopt() {
-    local state failed
+    local check=${1:-$MIGRATIONS_DEFAULT_CHECK} ledger=${2:-$MIGRATIONS_DEFAULT_LEDGER} state failed
     state=$(migrations_state) || return 1
     [ "$state" = "pre-ledger" ] || _migrations_fail "the database is $state; only a pre-ledger database is adopted" || return 1
-    failed=$(_migrations_sql -At -F '|' < "$BASELINE_CHECK_SQL" | awk -F '|' '$2 != "t" {print $1}'; exit "${PIPESTATUS[0]}") \
-        || _migrations_fail "the baseline check did not run; nothing recorded" || return 1
+    failed=$(migrations_baseline_failures "$check") || _migrations_fail "nothing recorded" || return 1
     [ -z "$failed" ] || _migrations_fail "baseline effects missing, nothing recorded:
 $failed" || return 1
-    _migrations_sql < "$LEDGER_SQL" > /dev/null || _migrations_fail "recording the baseline failed and was rolled back" || return 1
+    _migrations_sql < "$ledger" > /dev/null || _migrations_fail "recording the baseline failed and was rolled back" || return 1
     echo "migrate: baseline recorded"
 }

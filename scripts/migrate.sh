@@ -17,14 +17,18 @@ PROJECT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 DC=(docker compose -f "$PROJECT_DIR/docker-compose.yml" -f "$PROJECT_DIR/docker-compose.prod.yml")
 READY_TRIES="${MIGRATE_READY_TRIES:-30}"
 
-migrations_psql() { "${DC[@]}" exec -T db psql -X -U candles -d candle_collector "$@"; }
+# The user and database are the db container's own (POSTGRES_USER, POSTGRES_DB), which .env may change;
+# the single quotes are deliberate, so they expand inside the container.
+# shellcheck disable=SC2016
+migrations_psql() { "${DC[@]}" exec -T db sh -c 'exec psql -X -U "$POSTGRES_USER" -d "$POSTGRES_DB" "$@"' psql "$@"; }
 # shellcheck source=scripts/migrations-lib.sh
 . "$SCRIPT_DIR/migrations-lib.sh"
 
 wait_for_db() {
     local _
     for _ in $(seq "$READY_TRIES"); do
-        "${DC[@]}" exec -T db pg_isready -q -h 127.0.0.1 -U candles -d candle_collector && return 0
+        # shellcheck disable=SC2016  # expands inside the container
+        "${DC[@]}" exec -T db sh -c 'exec pg_isready -q -h 127.0.0.1 -U "$POSTGRES_USER" -d "$POSTGRES_DB"' && return 0
         sleep 2
     done
     echo "migrate: the db did not accept TCP connections within $((READY_TRIES * 2)) s" >&2
@@ -40,7 +44,8 @@ case "${1:-}" in
         echo "state: $state"
         if [ "$state" = "adopted" ]; then
             pending=$(migrations_pending)
-            echo "applied: $(migrations_psql -v ON_ERROR_STOP=1 -At <<< 'SELECT count(*) FROM public.schema_migrations;')"
+            applied=$(migrations_applied_count)
+            echo "applied: $applied"
             echo "pending: $(grep -c . <<< "$pending" || true)"
             [ -z "$pending" ] || xargs -n1 basename <<< "$pending" | sed 's/^/  /'
         elif [ "$state" = "pre-ledger" ]; then
