@@ -7,8 +7,8 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-PROJECT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
-DC=(docker compose -f docker-compose.yml -f docker-compose.prod.yml)
+# shellcheck source=scripts/ops-lib.sh
+. "$SCRIPT_DIR/../scripts/ops-lib.sh"
 
 # -- Helpers ------------------------------------------------------------------
 

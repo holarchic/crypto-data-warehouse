@@ -16,6 +16,17 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 
+# -- Ops lib --------------------------------------------------------------------
+# The prod compose command. A checkout without scripts/ops-lib.sh still runs every other check,
+# and its container check pages as a failed probe.
+
+ops_lib_loaded=0
+if [ -f "$PROJECT_DIR/scripts/ops-lib.sh" ]; then
+    # shellcheck source=scripts/ops-lib.sh
+    . "$PROJECT_DIR/scripts/ops-lib.sh"
+    ops_lib_loaded=1
+fi
+
 # -- Webhook --------------------------------------------------------------------
 # A checkout without scripts/webhook-lib.sh still runs every check below; it just can't page.
 
@@ -197,9 +208,8 @@ EXPECTED_SERVICES=(
     "db"
 )
 
-cd "$PROJECT_DIR"
-if running=$(docker compose -f docker-compose.yml -f docker-compose.prod.yml \
-        ps --status running --format '{{.Service}}' 2>/dev/null); then
+if [ "$ops_lib_loaded" -eq 1 ] \
+        && running=$("${DC[@]}" ps --status running --format '{{.Service}}' 2>/dev/null); then
     down_services=()
     for service in "${EXPECTED_SERVICES[@]}"; do
         grep -qxF "$service" <<<"$running" || down_services+=("$service")

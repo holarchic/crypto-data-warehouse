@@ -122,6 +122,17 @@ Schema migrations and TimescaleDB hypertable setup. Candles hypertable partition
 - **The CLI.** `scripts/migrate.sh` runs the lib through the prod compose override's `db` container, after waiting for TCP readiness (the initdb server is socket-only). Callers start `db`, run it, then start the consumers.
 - **Outside the ledger.** DDL that can't run in a transaction, such as `CREATE TABLESPACE` (010) or `CREATE INDEX CONCURRENTLY`, is a runbook step. `tests/integration/check_migrations.sh` runs the lib against a real TimescaleDB.
 
+### Host scripts: the prod context (scripts/ops-lib.sh)
+
+Every host script that drives the stack sources `scripts/ops-lib.sh`. It defines:
+
+- `PROJECT_DIR`;
+- `DC`, the one prod compose command (base plus prod override, absolute paths);
+- `DB_TOOL`, an array that runs a Postgres client in the db container as the container's `POSTGRES_USER` against its `POSTGRES_DB`. It is an array, so restic's `--stdin-from-command` and `env -u` can run it. psql takes the last `-d`, so `-d postgres` reaches the maintenance database;
+- `db_name`, which `restore.sh` uses to drop and recreate the database by name (`:"db"`).
+
+No other script runs `docker compose`, except `install-cron.sh`, whose crontab text can't source a lib, or names the database identity. `tests/test_ops_lib.py` enforces both. host-monitor sources the lib behind a guard: without it, the container check pages as a failed probe and the other checks still run. `tests/integration/check_ops_lib.sh` runs migrate, verify-compression and backup against a real db with a non-default user and database.
+
 ### Offsite backup (scripts/backup-offsite.sh, host cron)
 
 A nightly host-cron job at 05:30 UTC, outside compose, that does nothing until `/etc/candle-collector/restic.env` exists.

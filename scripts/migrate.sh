@@ -13,22 +13,18 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-PROJECT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
-DC=(docker compose -f "$PROJECT_DIR/docker-compose.yml" -f "$PROJECT_DIR/docker-compose.prod.yml")
+# shellcheck source=scripts/ops-lib.sh
+. "$SCRIPT_DIR/ops-lib.sh"
 READY_TRIES="${MIGRATE_READY_TRIES:-30}"
 
-# The user and database are the db container's own (POSTGRES_USER, POSTGRES_DB), which .env may change;
-# the single quotes are deliberate, so they expand inside the container.
-# shellcheck disable=SC2016
-migrations_psql() { "${DC[@]}" exec -T db sh -c 'exec psql -X -U "$POSTGRES_USER" -d "$POSTGRES_DB" "$@"' psql "$@"; }
+migrations_psql() { "${DB_TOOL[@]}" psql -X "$@"; }
 # shellcheck source=scripts/migrations-lib.sh
 . "$SCRIPT_DIR/migrations-lib.sh"
 
 wait_for_db() {
     local _
     for _ in $(seq "$READY_TRIES"); do
-        # shellcheck disable=SC2016  # expands inside the container
-        "${DC[@]}" exec -T db sh -c 'exec pg_isready -q -h 127.0.0.1 -U "$POSTGRES_USER" -d "$POSTGRES_DB"' && return 0
+        "${DB_TOOL[@]}" pg_isready -q -h 127.0.0.1 && return 0
         sleep 2
     done
     echo "migrate: the db did not accept TCP connections within $((READY_TRIES * 2)) s" >&2
