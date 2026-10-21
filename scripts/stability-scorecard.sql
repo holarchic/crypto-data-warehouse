@@ -57,7 +57,7 @@ CREATE TEMP TABLE sc_derivatives AS
 SELECT exchange, symbol, discovered_at FROM collection_status WHERE active AND timeframe = '5m';
 
 -- Funding: the slot is the pair's newest stored interval_hours in the window, else the collector's
--- assumed interval for the venue. A settlement is due two hours after it (the loop polls hourly).
+-- assumed interval for the venue. A slot is due two hours after it ends (the loop polls hourly).
 INSERT INTO sc_expect
 SELECT 'funding', d.exchange, NULL, d.symbol, NULL, h.slot_s,
        pg_temp.slot_ceil(greatest(r.window_start, coalesce(d.discovered_at, r.window_start)), h.slot_s),
