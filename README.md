@@ -163,7 +163,7 @@ The agent will ask whether you want a laptop trial or a server, check prerequisi
 | `GET /export/parquet` | HyperLiquid context, Binance open interest, HyperLiquid liquidations or Binance 1h premium index for a time window, as parquet. Longer spans: `scripts/export-feed.py` |
 | `GET /health` | Liveness |
 
-Example queries: [`deploy/README.md`](deploy/README.md#api-queries).
+Example queries: [`deploy/README.md`](deploy/README.md#api-queries). Reading the data for analysis or a backtest (row semantics, long pulls, joins without lookahead): [`docs/query-patterns.md`](docs/query-patterns.md).
 
 ## Configuration
 
