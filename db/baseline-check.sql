@@ -1,11 +1,12 @@
 -- Read-only: does this database hold every effect of the baseline migrations 001-013? One row per
 -- check, `check|ok`. `scripts/migrate.sh --adopt` records the baseline only when every row is `t`.
 --
--- `expected` is the baseline's catalog: the column types, nullability and defaults, the index
--- definitions, the hypertable chunk intervals, the compression settings and policy intervals of a
--- database built from db/init.sql. It is frozen with init.sql (tests/integration/check_migrations.sh
--- proves `expected` equals `actual` on a fresh init.sql database). A database may hold more than the
--- baseline; every expected row must be present. Tablespace placement (prod's ts_1m) is not baseline.
+-- `expected` is the baseline's catalog as `actual` projects it: column types, nullability and
+-- defaults; constraints; index definitions and validity; hypertable chunk intervals; compression
+-- settings and policy intervals. It was taken from a database built by db/init.sql and is frozen
+-- with it; tests/integration/check_migrations.sh proves `expected` and `actual` are equal on a fresh
+-- init.sql database. A database may hold more than the baseline; every expected row must be
+-- present. Tablespace placement (prod's ts_1m) is not baseline.
 WITH baseline_tables(t) AS (VALUES ('candles'), ('candles_1m'), ('funding_rates'), ('open_interest'),
     ('hl_asset_ctxs'), ('liquidations'), ('premium_index'), ('collection_status'), ('discovery_volumes')),
 actual(kind, object, detail) AS (
@@ -15,9 +16,17 @@ SELECT 'column', c.table_name || '.' || c.column_name,
 FROM information_schema.columns c JOIN baseline_tables b ON b.t = c.table_name
 WHERE c.table_schema = 'public'
 UNION ALL
-SELECT 'index', i.indexname, regexp_replace(i.indexdef, '^CREATE (UNIQUE )?INDEX \S+ ON public\.', 'CREATE \1INDEX ON ')
-FROM pg_indexes i JOIN baseline_tables b ON b.t = i.tablename
-WHERE i.schemaname = 'public' AND i.indexname NOT LIKE '%_timestamp_idx'
+SELECT 'constraint', con.conname, con.contype::text || ' ' || pg_get_constraintdef(con.oid)
+FROM pg_constraint con JOIN pg_class tc ON tc.oid = con.conrelid
+JOIN pg_namespace n ON n.oid = tc.relnamespace JOIN baseline_tables b ON b.t = tc.relname
+WHERE n.nspname = 'public'
+UNION ALL
+SELECT 'index', ic.relname,
+       regexp_replace(pg_get_indexdef(x.indexrelid), '^CREATE (UNIQUE )?INDEX \S+ ON public\.', 'CREATE \1INDEX ON ')
+           || CASE WHEN x.indisvalid AND x.indisready THEN '' ELSE ' (not valid)' END
+FROM pg_index x JOIN pg_class ic ON ic.oid = x.indexrelid JOIN pg_class tc ON tc.oid = x.indrelid
+JOIN pg_namespace n ON n.oid = tc.relnamespace JOIN baseline_tables b ON b.t = tc.relname
+WHERE n.nspname = 'public' AND ic.relname NOT LIKE '%_timestamp_idx'
 UNION ALL
 SELECT 'chunk interval', d.hypertable_name, d.time_interval::text
 FROM timescaledb_information.dimensions d WHERE d.hypertable_schema = 'public'
@@ -149,6 +158,14 @@ expected(kind, object, detail) AS (VALUES
     ('compression policy', 'liquidations', '7 days'),
     ('compression policy', 'open_interest', '7 days'),
     ('compression policy', 'premium_index', '7 days'),
+    ('constraint', 'candles_1m_pkey', 'p PRIMARY KEY (exchange, market_type, symbol, timeframe, "timestamp")'),
+    ('constraint', 'candles_pkey', 'p PRIMARY KEY (exchange, market_type, symbol, timeframe, "timestamp")'),
+    ('constraint', 'collection_status_pkey', 'p PRIMARY KEY (exchange, market_type, symbol, timeframe)'),
+    ('constraint', 'discovery_volumes_pkey', 'p PRIMARY KEY (run_date, asset_id)'),
+    ('constraint', 'funding_rates_pkey', 'p PRIMARY KEY (exchange, symbol, "timestamp")'),
+    ('constraint', 'hl_asset_ctxs_pkey', 'p PRIMARY KEY (asset_id, "timestamp")'),
+    ('constraint', 'open_interest_pkey', 'p PRIMARY KEY (exchange, symbol, "timestamp")'),
+    ('constraint', 'premium_index_pkey', 'p PRIMARY KEY (exchange, symbol, "timestamp")'),
     ('index', 'candles_1m_pkey', 'CREATE UNIQUE INDEX ON candles_1m USING btree (exchange, market_type, symbol, timeframe, "timestamp")'),
     ('index', 'candles_pkey', 'CREATE UNIQUE INDEX ON candles USING btree (exchange, market_type, symbol, timeframe, "timestamp")'),
     ('index', 'collection_status_pkey', 'CREATE UNIQUE INDEX ON collection_status USING btree (exchange, market_type, symbol, timeframe)'),

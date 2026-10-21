@@ -170,11 +170,13 @@ def test_apply_sends_each_pending_file_in_one_transaction_with_its_ledger_row(ho
     for call in applies:
         assert call.argv[-2:] == ["-f", "-"]
         assert call.var("ON_ERROR_STOP") == "1"
-        lines = call.stdin.splitlines()
-        assert lines[0] == r"SELECT txid_current() AS migration_txid \gset"
-        assert lines[1] == f"CREATE TABLE t{call.var('version')} (x INTEGER);"
-        guard = lines.index(r"\if :migration_one_transaction")
-        assert lines[guard + 1] == "INSERT INTO public.schema_migrations (version, name) VALUES (:'version', :'name');"
+        body = re.fullmatch(
+            r"DO (\$cc_[0-9a-f]{16}\$) BEGIN EXECUTE (\$cc_[0-9a-f]{16}\$)(.*)\n\2; END \1;\n"
+            r"INSERT INTO public\.schema_migrations \(version, name\) VALUES \(:'version', :'name'\);\n?",
+            call.stdin, re.S)
+        assert body, call.stdin
+        assert body[1] != body[2]
+        assert body[3] == f"CREATE TABLE t{call.var('version')} (x INTEGER);"
 
 
 @needs_bash
@@ -238,11 +240,6 @@ def test_apply_refuses_without_sending_a_migration(host, env, message):
 @pytest.mark.parametrize("bad_file, body, message", [
     ("4-short.sql", "SELECT 1;", "not NNN-<name>.sql"),
     ("002-again.sql", "SELECT 1;", "version 002 is used twice"),
-    ("004-commits.sql", "CREATE TABLE t (x INTEGER);\nCOMMIT;\n", "holds transaction control"),
-    ("004-commits.sql", "CREATE TABLE t (x INTEGER); commit work;\n", "holds transaction control"),
-    ("004-commits.sql", "BEGIN TRANSACTION;\nCREATE TABLE t (x INTEGER);\n", "holds transaction control"),
-    ("004-commits.sql", "CREATE TABLE t (x INTEGER);\nEND;\n", "holds transaction control"),
-    ("004-saves.sql", "SAVEPOINT s;\n", "holds transaction control"),
     ("004-dir.sql", None, "not a readable file"),
 ])
 def test_bad_migration_files_are_refused(host, bad_file, body, message):
@@ -258,14 +255,17 @@ def test_bad_migration_files_are_refused(host, bad_file, body, message):
 
 
 @needs_bash
-def test_comments_and_plpgsql_blocks_are_not_transaction_control(host):
-    (host / "migrations" / "004-block.sql").write_text(
-        "-- COMMIT; in a comment is fine\n"
-        "DO $$\nBEGIN\n    IF true THEN\n        PERFORM 1;\n    END IF;\nEND\n$$;\n"
-    )
+def test_a_migrations_text_reaches_the_server_untouched(host):
+    """psql commands, psql variables and dollar quotes in a migration are its own text: psql sees one
+    dollar-quoted literal (the server refuses transaction control in it; check_migrations.sh proves that)."""
+    text = "CREATE TABLE t4 (x INTEGER);\n\\q\nSELECT :'version';\nDO $$ BEGIN PERFORM 1; END $$;\nCOMMIT;"
+    (host / "migrations" / "004-odd.sql").write_text(text + "\n")
     result, calls = migrate(host)
     assert result.returncode == 0, result.stderr
-    assert [c.var("name") for c in _applies(calls)][-1] == "004-block.sql"
+    last = _applies(calls)[-1]
+    assert last.var("name") == "004-odd.sql"
+    tag = re.match(r"DO \$cc_[0-9a-f]{16}\$ BEGIN EXECUTE (\$cc_[0-9a-f]{16}\$)", last.stdin)[1]
+    assert last.stdin.split(tag)[1] == text + "\n"
 
 
 def _ledger_sent(calls):
