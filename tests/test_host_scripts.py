@@ -36,17 +36,6 @@ esac
 """
 
 
-@pytest.mark.parametrize("script", HOST_SCRIPTS, ids=lambda p: p.name)
-def test_every_compose_call_carries_the_prod_override(script):
-    for number, line in enumerate(script.read_text().splitlines(), 1):
-        if line.lstrip().startswith("#") or "docker compose" not in line:
-            continue
-        # `docker compose version` and alert or log messages name compose without running it.
-        if "docker compose version" in line or re.match(r"\s*(echo|remind|info|fail|send_alert)\b", line):
-            continue
-        assert "docker-compose.prod.yml" in line, f"{script.name}:{number}: {line.strip()}"
-
-
 @pytest.fixture
 def host(tmp_path):
     bin_dir = tmp_path / "bin"

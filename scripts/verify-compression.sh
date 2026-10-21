@@ -3,11 +3,11 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-PROJECT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
-DC=(docker compose -f "$PROJECT_DIR/docker-compose.yml" -f "$PROJECT_DIR/docker-compose.prod.yml")
+# shellcheck source=scripts/ops-lib.sh
+. "$SCRIPT_DIR/ops-lib.sh"
 
 # Statements go in on stdin, so psql variables (-v) interpolate; any SQL error fails the call.
-db_sql() { "${DC[@]}" exec -T db psql -X -v ON_ERROR_STOP=1 -U candles candle_collector "$@"; }
+db_sql() { "${DB_TOOL[@]}" psql -X -v ON_ERROR_STOP=1 "$@"; }
 
 echo "=== Compression status ==="
 db_sql <<'SQL'

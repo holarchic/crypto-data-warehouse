@@ -52,7 +52,7 @@ class Host:
     def running(self, services):
         self.ps.write_text("".join(f"{s}\n" for s in services))
 
-    def run(self, webhook_url):
+    def run(self, webhook_url, script=SCRIPT):
         env = {
             "PATH": f"{self.bin}:/usr/bin:/bin:/usr/local/bin:/opt/homebrew/bin",
             "WEBHOOK_URL": webhook_url,
@@ -64,7 +64,7 @@ class Host:
             "DISK_STATE_DIR": str(self.root / "disk"),
             "RESTIC_ENV_FILE": str(self.root / "no-restic.env"),
         }
-        result = subprocess.run(["bash", str(SCRIPT)], env=env, capture_output=True, text=True,
+        result = subprocess.run(["bash", str(script)], env=env, capture_output=True, text=True,
                                 timeout=60)
         assert result.returncode == 0, result.stdout + result.stderr
         return result
@@ -193,3 +193,20 @@ def test_an_undelivered_page_is_retried_next_run(host, webhook):
     host.run(url)
     assert pages(bodies)[0].endswith("Containers down: db")
     assert host.container_alert.exists()
+
+
+def test_without_ops_lib_the_container_check_pages_and_the_others_still_run(host, webhook, tmp_path):
+    """A checkout missing scripts/ops-lib.sh has no compose command: the container check pages as a
+    failed probe without running anything, and the memory check still runs."""
+    url, bodies = webhook
+    tree = tmp_path / "checkout"
+    (tree / "deploy").mkdir(parents=True)
+    (tree / "scripts").mkdir()
+    shutil.copy(SCRIPT, tree / "deploy" / "host-monitor.sh")
+    for lib in ("webhook-lib.sh", "offsite-lib.sh"):
+        shutil.copy(SCRIPT.parent.parent / "scripts" / lib, tree / "scripts" / lib)
+    host.memory_mb(300)
+    host.run(url, script=tree / "deploy" / "host-monitor.sh")
+    sent = pages(bodies)
+    assert any("Available memory: 300MB" in page for page in sent)
+    assert any("Container check failed" in page for page in sent)

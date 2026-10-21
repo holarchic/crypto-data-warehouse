@@ -16,6 +16,7 @@ ROOT = Path(__file__).resolve().parent.parent
 MIGRATIONS = ROOT / "db" / "migrations"
 MIGRATE = ROOT / "scripts" / "migrate.sh"
 LIB = ROOT / "scripts" / "migrations-lib.sh"
+OPS_LIB = ROOT / "scripts" / "ops-lib.sh"
 
 # A schema change goes in a new migration; init.sql changes only when the baseline moves (with
 # db/ledger.sql's list, db/baseline-check.sql's expected catalog and this hash together).
@@ -102,9 +103,13 @@ class Call(NamedTuple):
     argv: list[str]
     stdin: str
 
+    def runs(self, tool):
+        """Whether this call runs `tool` in the db container through ops-lib's DB_TOOL."""
+        return "db-tool" in self.argv and self.argv[self.argv.index("db-tool") + 1] == tool
+
     @property
     def is_psql(self):
-        return any("exec psql " in arg for arg in self.argv)
+        return self.runs("psql")
 
     @property
     def is_apply(self):
@@ -136,6 +141,7 @@ def migrate(host, *args, **env):
         scripts.mkdir()
         (scripts / "migrate.sh").write_text(MIGRATE.read_text())
         (scripts / "migrations-lib.sh").write_text(LIB.read_text())
+        (scripts / "ops-lib.sh").write_text(OPS_LIB.read_text())
         db = host / "db"
         db.mkdir()
         (db / "migrations").symlink_to(host / "migrations")
@@ -182,8 +188,10 @@ def test_apply_sends_each_pending_file_in_one_transaction_with_its_ledger_row(ho
 @needs_bash
 def test_psql_and_pg_isready_use_the_containers_user_and_database(host):
     _, calls = migrate(host)
-    commands = [arg for c in calls for arg in c.argv if arg.startswith("exec ")]
-    assert commands and all('-U "$POSTGRES_USER" -d "$POSTGRES_DB"' in cmd for cmd in commands)
+    assert any(c.runs("pg_isready") for c in calls) and any(c.runs("psql") for c in calls)
+    for call in calls:
+        script = call.argv[call.argv.index("-c") + 1]
+        assert script == 'tool=$1; shift; exec "$tool" -U "$POSTGRES_USER" -d "$POSTGRES_DB" "$@"'
     assert not any("candles" in arg for c in calls for arg in c.argv)
 
 

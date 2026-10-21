@@ -198,6 +198,7 @@ RESTIC_ENV_FILE=~/.config/candle-collector/restic.env DRILL_DIR=<base dir with ~
 The drill's fresh-target steps on a new host. Do **not** use `deploy.sh` or `scripts/restore.sh` here. `deploy.sh` starts every writer and re-pulls `latest-pg16`. `scripts/restore.sh` runs these steps for a local dump on a running local stack; on a new host, follow them by hand.
 
 ```bash
+# The scripts take these from scripts/ops-lib.sh; here they are spelled out to paste by hand.
 DC=(docker compose -f docker-compose.yml -f docker-compose.prod.yml)
 # One restic command with the restore credentials, through the backup's own restic_run.
 restic_env() { (RESTIC_ENV_FILE=/root/restore/restic.env; . scripts/offsite-lib.sh; restic_run "$@"); }
