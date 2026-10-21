@@ -1,5 +1,6 @@
 """The prod override caps the memory of every compose service, one-shot profiles included."""
 
+import re
 from pathlib import Path
 
 import yaml
@@ -22,10 +23,14 @@ def test_every_service_has_a_prod_memory_limit():
     services = _services("docker-compose.yml")
     prod = _services("docker-compose.prod.yml")
 
+    # Compose reads a zero limit as no limit, so the value must be a positive size.
     unlimited = [
         name
         for name in services
-        if not (prod.get(name) or {}).get("deploy", {}).get("resources", {}).get("limits", {}).get("memory")
+        if not re.fullmatch(
+            r"[1-9][0-9]*[kmg]?",
+            str((prod.get(name) or {}).get("deploy", {}).get("resources", {}).get("limits", {}).get("memory")),
+        )
     ]
 
     assert "hl-candles-repair" in services
