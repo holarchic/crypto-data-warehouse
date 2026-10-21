@@ -3,7 +3,7 @@
 Pure helpers (row build, insert, cursor seed) run against a fake conn; `_collect_premium_pair`
 runs against a fake exchange + real RateLimiter(0) so the forward-only-vs-diet `since`/`limit`
 selection and cursor advance are exercised without a live wire. Loop wiring (has_premium_index
-launches the thread) is covered in test_candles-style real-main loading (see test at bottom).
+adds the feed) is covered by tests/test_main_feeds.py.
 """
 
 

@@ -4,6 +4,7 @@ import threading
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
+from functools import partial
 
 from candles import candle_loop
 from config import ExchangeConfig, load_config
@@ -26,34 +27,33 @@ SUPERVISE_POLL_S = 10
 
 @dataclass(frozen=True)
 class Feed:
-    """One collector thread: its name and the loop it runs."""
+    """One collector thread: its name and the loop it runs, bound to its arguments."""
 
     name: str
-    target: Callable
-    args: tuple
+    run: Callable[[], None]
 
 
 def build_feeds(config: ExchangeConfig, exchange, dsn: str, rate_limiter: RateLimiter) -> list[Feed]:
     """Every feed the venue's config enables, in launch order."""
-    feeds = [Feed(f"{config.name}-{tf.name}", candle_loop, (exchange, config, tf, dsn, rate_limiter))
+    feeds = [Feed(f"{config.name}-{tf.name}", partial(candle_loop, exchange, config, tf, dsn, rate_limiter))
              for tf in config.timeframes]
     if config.has_funding:
-        feeds.append(Feed(f"{config.name}-funding", funding_loop, (exchange, config, dsn, rate_limiter)))
+        feeds.append(Feed(f"{config.name}-funding", partial(funding_loop, exchange, config, dsn, rate_limiter)))
     if config.has_oi:
-        feeds.append(Feed(f"{config.name}-oi", oi_loop, (exchange, config, dsn, rate_limiter)))
+        feeds.append(Feed(f"{config.name}-oi", partial(oi_loop, exchange, config, dsn, rate_limiter)))
     # The venue's liquidation spec injected into the generic WS engine. `build_liq_spec` raises on a
     # flag set for a venue with no builder (fail fast, not a silent skip).
     if config.has_liquidation_ws:
-        feeds.append(Feed(f"{config.name}-liq", ws_loop, (build_liq_spec(config.name), config, dsn)))
+        feeds.append(Feed(f"{config.name}-liq", partial(ws_loop, build_liq_spec(config.name), config, dsn)))
     if config.has_premium_index:
-        feeds.append(Feed(f"{config.name}-premium", premium_index_loop, (exchange, config, dsn, rate_limiter)))
+        feeds.append(Feed(f"{config.name}-premium", partial(premium_index_loop, exchange, config, dsn, rate_limiter)))
     # HL 1m is streamed, not polled: one WS connection for the whole HL universe, zero REST (drop gaps
     # and unclosed bars are repaired daily by hl_candles_repair; a live backfill was measured to starve
     # HL's tight limiter). 1m is deliberately NOT in supported_timeframes, so no REST 1m candle feed
     # exists to starve the unbackfillable dense OI. The spec resolves each coin's HL WS name from ccxt
     # markets, so it takes `exchange`.
     if config.has_candle_ws:
-        feeds.append(Feed(f"{config.name}-candle-ws", ws_loop, (build_hl_candle_spec(exchange), config, dsn)))
+        feeds.append(Feed(f"{config.name}-candle-ws", partial(ws_loop, build_hl_candle_spec(exchange), config, dsn)))
     return feeds
 
 
@@ -92,7 +92,7 @@ def run():
 
     threads = []
     for feed in build_feeds(config, exchange, dsn, rate_limiter):
-        thread = threading.Thread(target=feed.target, args=feed.args, name=feed.name, daemon=True)
+        thread = threading.Thread(target=feed.run, name=feed.name, daemon=True)
         thread.start()
         threads.append(thread)
         log.info("Started thread %s", thread.name)

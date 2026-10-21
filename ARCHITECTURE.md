@@ -64,7 +64,7 @@ A WS-drop gap (no history replay on reconnect), and a bar the stream left short 
 
 **Streamed, not polled:** HL 1m is deliberately absent from `supported_timeframes`, so `build_feeds` adds **no** per-symbol REST 1m `candle_loop` (which would starve the OI) and discovery writes no per-pair 1m status rows. Liveness is the `candle_ws` loop sentinel. `/candles?timeframe=1m` + `/status/gaps?timeframe=1m` are table-routed so HL 1m is queryable; the `collection_status`-driven metadata endpoints (`/candles/timeframes`, `/candles/symbols`) do not list it.
 
-**Collector concurrency invariant:** each loop (candle per-TF, funding, OI, premium, WS-candle, WS-liq) runs on its own daemon thread, supervised by the root, with its **own DB connection and direct writes** to disjoint tables — there is no single-writer queue, by design (one container per exchange, no cross-loop write contention). The WS engine conforms: it buffers events and batch-flushes on its own connection.
+**Collector concurrency invariant:** each loop (candle per-TF, funding, OI, premium, WS-candle, WS-liq) runs on its own daemon thread, supervised by the root, with its **own DB connection and direct writes** — there is no single-writer queue, by design (one container per exchange). Loops that share a table write disjoint rows: candle timeframes differ in `timeframe`, and each loop's status and heartbeat rows carry their own key. The WS engine conforms: it buffers events and batch-flushes on its own connection.
 
 ### collector/hl_candles_repair.py — HyperLiquid 1m daily repair (T-019)
 

@@ -8,6 +8,7 @@ import subprocess
 import sys
 import textwrap
 import threading
+from functools import partial
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -36,6 +37,11 @@ def _config(name="okx", **flags):
     return SimpleNamespace(name=name, timeframes=[TF_5M, TF_1H], **{f: flags.get(f, False) for f in FLAGS})
 
 
+def _bound(feed):
+    """A feed as (name, loop, args): what its thread will call."""
+    return feed.name, feed.run.func, feed.run.args
+
+
 @pytest.fixture
 def specs(monkeypatch):
     """Spec builders return sentinels recording what they were built from."""
@@ -49,9 +55,9 @@ def specs(monkeypatch):
 def test_no_flags_gives_one_candle_feed_per_timeframe(specs):
     cfg, exchange = _config(), object()
     feeds = main.build_feeds(cfg, exchange, "dsn", "limiter")
-    assert feeds == [
-        main.Feed("okx-5m", main.candle_loop, (exchange, cfg, TF_5M, "dsn", "limiter")),
-        main.Feed("okx-1h", main.candle_loop, (exchange, cfg, TF_1H, "dsn", "limiter")),
+    assert [_bound(f) for f in feeds] == [
+        ("okx-5m", main.candle_loop, (exchange, cfg, TF_5M, "dsn", "limiter")),
+        ("okx-1h", main.candle_loop, (exchange, cfg, TF_1H, "dsn", "limiter")),
     ]
 
 
@@ -70,7 +76,7 @@ def test_each_flag_adds_exactly_its_feed(specs, flag, name, target, args):
     )
     feeds = main.build_feeds(cfg, exchange, "dsn", "limiter")
     assert [f.name for f in feeds] == ["okx-5m", "okx-1h", name]
-    assert feeds[-1] == main.Feed(name, getattr(main, target), expected_args)
+    assert _bound(feeds[-1]) == (name, getattr(main, target), expected_args)
 
 
 def test_all_flags_launch_in_order(specs):
@@ -84,10 +90,10 @@ def test_hl_1m_is_one_ws_feed_and_no_rest_candle_feed(specs):
     """HL 1m streams over one WS connection for the whole universe; it adds no per-timeframe REST feed."""
     cfg, exchange = _config(name="hyperliquid", has_candle_ws=True), object()
     feeds = main.build_feeds(cfg, exchange, "dsn", "limiter")
-    candle_feeds = [f for f in feeds if f.target is main.candle_loop]
-    assert [f.args[2] for f in candle_feeds] == [TF_5M, TF_1H]
-    assert [f for f in feeds if f.target is main.ws_loop] == [
-        main.Feed("hyperliquid-candle-ws", main.ws_loop, (("hl-candle-spec", exchange), cfg, "dsn")),
+    assert [_bound(f) for f in feeds] == [
+        ("hyperliquid-5m", main.candle_loop, (exchange, cfg, TF_5M, "dsn", "limiter")),
+        ("hyperliquid-1h", main.candle_loop, (exchange, cfg, TF_1H, "dsn", "limiter")),
+        ("hyperliquid-candle-ws", main.ws_loop, (("hl-candle-spec", exchange), cfg, "dsn")),
     ]
 
 
@@ -161,7 +167,7 @@ def _returns():
 
 @pytest.mark.parametrize("target", [_raises, _returns], ids=["raises", "returns"])
 def test_run_exits_1_when_a_feed_stops(harness, caplog, target):
-    harness.set_feeds([main.Feed("test-feed", target, ())])
+    harness.set_feeds([main.Feed("test-feed", target)])
     with caplog.at_level(logging.CRITICAL), pytest.raises(_Exited) as exited:
         main.run()
     assert exited.value.code == 1
@@ -188,8 +194,8 @@ def test_run_supervises_every_feed_not_just_the_first(harness, monkeypatch, capl
 
     monkeypatch.setattr(main, "time", SimpleNamespace(sleep=_sleep))
     harness.set_feeds([
-        main.Feed("test-first", first_release.wait, (DEADLINE_S,)),
-        main.Feed("test-later", _later, ()),
+        main.Feed("test-first", partial(first_release.wait, DEADLINE_S)),
+        main.Feed("test-later", _later),
     ])
     with caplog.at_level(logging.CRITICAL), pytest.raises(_Exited) as exited:
         main.run()
@@ -219,7 +225,7 @@ _BLOCKED_WORKER_SCRIPT = textwrap.dedent("""
 
     main.load_config = lambda: types.SimpleNamespace(name="test", timeframes=[types.SimpleNamespace(name="5m")])
     main.build_rate_limiter = lambda cfg: None
-    main.build_feeds = lambda *a: [main.Feed("test-dies", die, ())]
+    main.build_feeds = lambda *a: [main.Feed("test-dies", die)]
     main.SUPERVISE_POLL_S = 0.05
     main.run()
 """)
