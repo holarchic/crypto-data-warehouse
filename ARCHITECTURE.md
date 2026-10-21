@@ -94,7 +94,7 @@ FastAPI read-only REST API. Queries PostgreSQL, serves downstream consumers.
 - **Routing:** `_candle_table` reads `config.load_candle_tables()`, defaulting to `candles`.
 - **Intervals:** `TIMEFRAME_INTERVALS` is `config.load_timeframe_intervals()` plus the API-owned `RETIRED_TIMEFRAME_INTERVALS` (1d/3d/1w: no longer collected, still served).
 - **Loop names:** `LOOP_TIMEFRAMES` is `config.LOOP_INTERVALS`' keys, and every candle-facing status query excludes those sentinel rows.
-- **Constraint:** both images import `config.py`, so it must import only the stdlib and `yaml`; an image-import check guards that.
+- **Constraint:** both images import `config.py`, so it must import only the stdlib and `yaml`; `tests/integration/check_api_metadata.sh` imports it inside the built api image. A test requires every configured interval to be a positive integer.
 - **Staleness:** `/status`'s `is_stale` is `_status_is_stale`: no success, or none within 2 × interval. The monitor's paging threshold, `interval + max(interval, 1800)`, is a separate rule. The gap query is still written in both `api/main.py` and `monitor.py` until T-032.2.
 
 **Release version.** `pyproject.toml` holds the warehouse's one release version. The api build takes the repo root as a second, named build context (`project`, compose `additional_contexts`) and copies just that file to `/pyproject.toml`. `main.py` reads `RELEASE_VERSION` from it with `tomllib` at import and passes it to `FastAPI(version=…)`, so `/openapi.json` reports the image's release. `tests/test_api_version.py` pins that wiring.

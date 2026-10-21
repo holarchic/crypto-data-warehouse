@@ -273,8 +273,8 @@ def get_liquidations(
 # collector/config.py and exchanges.yaml beside this file (api/Dockerfile), so routing, intervals and
 # loop names have one source. Read at import, never per request.
 #
-# Timeframes the collectors no longer write (dropped from exchanges.yaml in SPEC v0.23), whose stored
-# candles this API still serves and gap-checks. They live in `candles`, the default table.
+# Timeframes the collectors don't write but whose stored candles this API still serves and
+# gap-checks. They live in `candles`, the default table.
 RETIRED_TIMEFRAME_INTERVALS = {"1d": 86400, "3d": 259200, "1w": 604800}
 TIMEFRAME_INTERVALS = config.load_timeframe_intervals() | RETIRED_TIMEFRAME_INTERVALS
 _CANDLE_TABLES = config.load_candle_tables()
