@@ -74,7 +74,7 @@ CROSS JOIN LATERAL (
         (r.meta -> 'funding_interval_hours' ->> d.exchange)::int) AS slot_s
 ) h;
 
--- OI: the SPEC § Acceptance "OI collection" cadence, 60 s buckets on HyperLiquid and 300 s elsewhere.
+-- OI: the target cadence, a snapshot per minute on HyperLiquid and per 5 minutes elsewhere.
 -- A bucket is due an hour after it closes (the Binance baseline refreshes every 30 minutes).
 INSERT INTO sc_expect
 SELECT 'oi', d.exchange, NULL, d.symbol, NULL, b.slot_s,
