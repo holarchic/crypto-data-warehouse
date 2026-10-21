@@ -8,7 +8,7 @@ Fetches OHLCV candles, funding rates, and open interest from exchanges. Writes d
 
 Candle fetching lives in `main.py` (`collect_loop` → `_collect_pair` → `fetch_candles`); request-size policy is factored into `candles.py` (`poll_limit` + `CANDLE_LIMIT_*`), a pure module so the weight diet is unit-testable (see Shared-limiter coupling below). A venue that charges by bars returned (HL) sets `poll_max_bars`: `_collect_pair` passes a ccxt `until` 1 ms before the boundary `poll_max_bars` buckets after `since`'s bucket on every request (HL returns every bucket touching either end of the range), a seed starting `CANDLE_SEED_LIMIT` bars back, so a catch-up poll costs no more than a caught-up one; when a capped window behind now comes back empty, `collect_loop`'s per-pair `scan_from` moves the next poll past it, so a cursor older than the venue's history is stepped over window by window, never with an uncapped request.
 
-**Candle-table routing (T-015):** which table a timeframe's candles land in is a data-driven property — `table:` in `exchanges.yaml` (default `candles`; `1m` → `candles_1m`). `config._validate_candle_table` is the single validation seam (both `_parse_exchange` and `load_candle_tables` call it, so a bad `table:` fails once at load in the collector AND monitor processes); `TimeframeConfig.table` / `config.load_candle_tables()` is the single routing source, consumed by the collector insert (`main.INSERT_SQL`, a dict keyed by table, built at import from the closed `CANDLE_TABLES` allowlist via one template — no runtime identifier interpolation), the monitor gap-scan (`monitor.GAP_SQL_BY_TABLE`), and — mirrored, since `api/` can't import `collector/` — the API (`_candle_table`, pinned to config by an exact-equality drift test). No hardcoded `1m` branch anywhere.
+**Candle-table routing (T-015):** which table a timeframe's candles land in is a data-driven property — `table:` in `exchanges.yaml` (default `candles`; `1m` → `candles_1m`). `config._validate_candle_table` is the single validation seam (both `_parse_exchange` and `load_candle_tables` call it, so a bad `table:` fails once at load in the collector AND monitor processes); `TimeframeConfig.table` / `config.load_candle_tables()` is the single routing source, consumed by the collector insert (`main.INSERT_SQL`, a dict keyed by table, built at import from the closed `CANDLE_TABLES` allowlist via one template — no runtime identifier interpolation), the monitor gap-scan (`monitor.GAP_SQL_BY_TABLE`), and the API (`_candle_table`, over `config.load_candle_tables()`). No hardcoded `1m` branch anywhere.
 
 `collect_loop` calls `maybe_reload_markets()` (in `db.py`) at the top of each cycle. The helper is age-gated (`MARKETS_RELOAD_INTERVAL_S`, default 86400s) and lock-guarded so the per-timeframe threads sharing one ccxt `exchange` reload at most once per interval. Without this, symbols added by daily discovery stay invisible to the long-running collector container.
 
@@ -87,7 +87,15 @@ Separate always-on container (`python -m monitor`). One `collection_status` fetc
 
 ### api/
 
-FastAPI read-only REST API. Queries PostgreSQL, serves downstream consumers. Cannot import `collector/`, so any collector-shared convention is mirrored + drift-tested (`_candle_table`, `LOOP_TIMEFRAMES`).
+FastAPI read-only REST API. Queries PostgreSQL, serves downstream consumers.
+
+**Feed metadata.** The api image copies `collector/config.py` and `exchanges.yaml` beside `main.py` through the `project` named build context, and `main.py` imports `config`.
+
+- **Routing:** `_candle_table` reads `config.load_candle_tables()`, defaulting to `candles`.
+- **Intervals:** `TIMEFRAME_INTERVALS` is `config.load_timeframe_intervals()` plus the API-owned `RETIRED_TIMEFRAME_INTERVALS` (1d/3d/1w: no longer collected, still served).
+- **Loop names:** `LOOP_TIMEFRAMES` is `config.LOOP_INTERVALS`' keys, and every candle-facing status query excludes those sentinel rows.
+- **Constraint:** both images import `config.py`, so it must import only the stdlib and `yaml`; an image-import check guards that.
+- **Staleness:** `/status`'s `is_stale` is `_status_is_stale`: no success, or none within 2 × interval. The monitor's paging threshold, `interval + max(interval, 1800)`, is a separate rule. The gap query is still written in both `api/main.py` and `monitor.py` until T-032.2.
 
 **Release version.** `pyproject.toml` holds the warehouse's one release version. The api build takes the repo root as a second, named build context (`project`, compose `additional_contexts`) and copies just that file to `/pyproject.toml`. `main.py` reads `RELEASE_VERSION` from it with `tomllib` at import and passes it to `FastAPI(version=…)`, so `/openapi.json` reports the image's release. `tests/test_api_version.py` pins that wiring.
 
