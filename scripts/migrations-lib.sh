@@ -5,35 +5,36 @@
 # arguments and SQL on stdin. Each operation takes its files as arguments (defaulting to the repo's
 # db/ files) and returns non-zero, with a message on stderr, rather than continue past a failure.
 #
-# A migration is db/migrations/NNN-<name>.sql. It runs in one transaction with its ledger row, so it
-# holds no transaction control of its own, and DDL that can't run in a transaction (CREATE
-# TABLESPACE, CREATE INDEX CONCURRENTLY) is a runbook step, not a migration.
+# A migration is db/migrations/NNN-<name>.sql: plain SQL, run by the server in one transaction with
+# its ledger row. psql never interprets its text, and Postgres refuses transaction control inside it,
+# so DDL that can't run in a transaction (CREATE TABLESPACE, CREATE INDEX CONCURRENTLY) is a runbook
+# step, not a migration.
 
 _MIGRATIONS_DB="$(cd "$(dirname "${BASH_SOURCE[0]}")/../db" && pwd)"
 readonly MIGRATIONS_DEFAULT_DIR="$_MIGRATIONS_DB/migrations"
 readonly MIGRATIONS_DEFAULT_LEDGER="$_MIGRATIONS_DB/ledger.sql"
 readonly MIGRATIONS_DEFAULT_CHECK="$_MIGRATIONS_DB/baseline-check.sql"
 
-# Transaction control anywhere outside a `--` comment. Deliberately broad: a word in a string or a
-# nested PL/pgSQL `END;` is refused too, and is reworded, because a missed COMMIT would commit part
-# of a migration without its ledger row.
-_MIGRATIONS_TXN='(^|[^[:alnum:]_])(COMMIT|ROLLBACK|ABORT|SAVEPOINT|RELEASE|PREPARE[[:space:]]+TRANSACTION|(BEGIN|START|END)[[:space:]]+(TRANSACTION|WORK)|BEGIN[[:space:]]*;|END[[:space:]]*;)'
-
 _migrations_fail() { echo "migrate: $*" >&2; return 1; }
 
 # Every query stops at its first SQL error, so psql's exit status is the query's outcome.
 _migrations_sql() { migrations_psql -v ON_ERROR_STOP=1 "$@"; }
 
-# A migration's text, read once: the bytes that are checked are the bytes that run.
+# A migration's text, read once and whole.
 _migrations_read() {
-    local f=$1 sql
+    local f=$1
     [ -f "$f" ] && [ -r "$f" ] || _migrations_fail "$(basename "$f"): not a readable file" || return 1
-    sql=$(cat "$f") || _migrations_fail "$(basename "$f"): read failed" || return 1
-    # shellcheck disable=SC2001  # per-line comment strip; a parameter expansion can't anchor per line
-    if sed 's/--.*$//' <<< "$sql" | grep -qiE "$_MIGRATIONS_TXN"; then
-        _migrations_fail "$(basename "$f"): holds transaction control; migrate.sh runs it in one transaction" || return 1
-    fi
-    printf '%s\n' "$sql"
+    cat "$f" || _migrations_fail "$(basename "$f"): read failed"
+}
+
+# A dollar-quote tag that occurs nowhere in TEXT.
+_migrations_tag() {
+    local text=$1 tag
+    for _ in 1 2 3; do
+        tag="cc_$(od -An -N8 -tx1 /dev/urandom | tr -d ' \n')"
+        [[ "$text" != *"\$$tag\$"* ]] && { echo "$tag"; return 0; }
+    done
+    _migrations_fail "no free dollar-quote tag"
 }
 
 # Each migration file's path, in version order, after checking every file in DIR.
@@ -84,11 +85,12 @@ SQL
     done <<< "$files"
 }
 
-# Apply every pending migration in DIR in order, each in one transaction with its ledger row.
-# The row is written only if the transaction that began the file is still the one ending it, so a
-# COMMIT the text check missed fails the apply instead of recording a half-applied migration.
+# Apply every pending migration in DIR in order, each in one transaction with its ledger row. The
+# file's text reaches the server as a dollar-quoted literal that a DO block EXECUTEs, so psql
+# interprets none of it (a `\q` is just text) and the server refuses any COMMIT, ROLLBACK, END or
+# SAVEPOINT in it ("EXECUTE of transaction commands is not implemented"), rolling everything back.
 migrations_apply() {
-    local dir=${1:-$MIGRATIONS_DEFAULT_DIR} state pending f name sql
+    local dir=${1:-$MIGRATIONS_DEFAULT_DIR} state pending f name sql outer inner
     state=$(migrations_state) || return 1
     [ "$state" = "adopted" ] || _migrations_fail "the database is $state; run migrate.sh --adopt (pre-ledger) or initialise it first" || return 1
     pending=$(migrations_pending "$dir") || return 1
@@ -96,16 +98,12 @@ migrations_apply() {
     while IFS= read -r f; do
         name=$(basename "$f")
         sql=$(_migrations_read "$f") || return 1
+        outer=$(_migrations_tag "$sql") && inner=$(_migrations_tag "$sql") || return 1
         echo "migrate: applying $name"
         _migrations_sql -1 -v version="${name:0:3}" -v name="$name" -f - <<SQL || _migrations_fail "$name failed and was rolled back; later migrations were not applied" || return 1
-SELECT txid_current() AS migration_txid \gset
-$sql
-SELECT txid_current() = :migration_txid AS migration_one_transaction \gset
-\if :migration_one_transaction
+DO \$$outer\$ BEGIN EXECUTE \$$inner\$$sql
+\$$inner\$; END \$$outer\$;
 INSERT INTO public.schema_migrations (version, name) VALUES (:'version', :'name');
-\else
-DO \$\$ BEGIN RAISE EXCEPTION 'the migration ended its own transaction; no ledger row recorded'; END \$\$;
-\endif
 SQL
     done <<< "$pending"
 }

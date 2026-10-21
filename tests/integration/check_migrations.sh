@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # The migration ledger against a real TimescaleDB: initdb with init.sql + ledger.sql, apply with real
-# hypertable and compression DDL, rollback of a failing migration, the one-transaction guard, and
-# adoption of a database built without the ledger. Runs outside pytest, from the project root, with
+# hypertable and compression DDL, rollback of a failing migration, refusal of transaction control and
+# psql commands inside one, and adoption of a database built without the ledger. Runs outside pytest, from the project root, with
 # Docker:
 #
 #     ./tests/integration/check_migrations.sh
@@ -81,8 +81,13 @@ SQL
 hypertable_fixture check_901 > "$WORK/fixtures/901-check.sql"
 { hypertable_fixture check_902; echo "SELECT 1 / 0;"; } > "$WORK/fixtures/902-fails.sql"
 echo "CREATE TABLE check_903 (x INTEGER);" > "$WORK/fixtures/903-after.sql"
-printf 'CREATE TABLE check_904 (x INTEGER);\nCOMMIT WORK;\n' > "$WORK/fixtures/904-commits.sql"
-printf 'CREATE TABLE check_905a (x INTEGER);\nCOMMIT;\nCREATE TABLE check_905b (x INTEGER);\n' > "$WORK/fixtures/905-commits.sql"
+# Each ends its transaction or leaves SQL partway; each must leave no table and no ledger row.
+printf 'CREATE TABLE check_910 (x INTEGER);\nCOMMIT WORK;\n' > "$WORK/fixtures/910-commit-work.sql"
+printf 'CREATE TABLE check_911 (x INTEGER);\nCOMMIT;\nCREATE TABLE check_911b (x INTEGER);\n' > "$WORK/fixtures/911-commit.sql"
+printf 'CREATE TABLE check_912 (x INTEGER);\nEND AND CHAIN;\n' > "$WORK/fixtures/912-end-and-chain.sql"
+printf 'CREATE TABLE check_913 (x INTEGER);\nEND /* comment */\n;\n' > "$WORK/fixtures/913-end-comment.sql"
+printf 'CREATE TABLE check_914 (x INTEGER);\n\\q\n' > "$WORK/fixtures/914-psql-quit.sql"
+printf 'CREATE TABLE check_915 (x INTEGER);\nROLLBACK;\n' > "$WORK/fixtures/915-rollback.sql"
 cat > "$WORK/fixtures/906-do-block.sql" <<'SQL'
 DO $$
 BEGIN
@@ -136,17 +141,14 @@ if migrations_apply "$dir" > /dev/null 2>&1; then die "a failing 902 returned su
 [ "$(q -c "SELECT to_regclass('public.check_903') IS NULL;")" = "t" ] || die "903 ran after a failure"
 ok "a failing 902 exits non-zero, rolls back its hypertable, policy and row, and 903 waits"
 
-dir=$(scratch_dir commits 904-commits.sql)
-if out=$(migrations_apply "$dir" 2>&1); then die "COMMIT WORK was accepted"; fi
-[[ "$out" == *"904-commits.sql: holds transaction control"* ]] || die "COMMIT WORK refusal did not name the file: $out"
-[ "$(q -c "SELECT to_regclass('public.check_904') IS NULL;")" = "t" ] || die "a refused file ran"
-ok "a file holding COMMIT WORK is refused before anything runs"
-
-dir=$(scratch_dir guard 905-commits.sql)
-# Bypass the text check, as a form it missed would: the transaction guard alone must hold the ledger.
-if (_migrations_read() { cat "$1"; }; migrations_apply "$dir") > /dev/null 2>&1; then die "a mid-file COMMIT returned success"; fi
-[ "$(q -c "SELECT count(*) FROM schema_migrations WHERE version = '905';")" = "0" ] || die "a mid-file COMMIT recorded its ledger row"
-ok "a COMMIT past the text check fails the apply and records no ledger row"
+for fixture in 910-commit-work.sql 911-commit.sql 912-end-and-chain.sql 913-end-comment.sql 914-psql-quit.sql 915-rollback.sql; do
+    dir=$(scratch_dir "txn-${fixture%.sql}" "$fixture")
+    if migrations_apply "$dir" > /dev/null 2>&1; then die "$fixture returned success"; fi
+    table="check_${fixture:0:3}"
+    [ "$(q -v t="$table" <<< "SELECT to_regclass('public.' || :'t') IS NULL;")" = "t" ] || die "$fixture left $table behind"
+    [ "$(q -c "SELECT count(*) FROM schema_migrations WHERE version = '${fixture:0:3}';")" = "0" ] || die "$fixture recorded a ledger row"
+    ok "$fixture fails, leaving neither its table nor a ledger row"
+done
 
 dir=$(scratch_dir do-block 906-do-block.sql)
 migrations_apply "$dir" > /dev/null || die "a PL/pgSQL DO block was refused"
@@ -179,6 +181,7 @@ ok "apply after adopt runs 901"
 # --- pre-ledger, incomplete: properties gone while the objects' names remain ------------------------
 for gap in "DROP TABLE discovery_volumes|column discovery_volumes.run_date: date not null" \
            "ALTER TABLE discovery_volumes DROP CONSTRAINT discovery_volumes_pkey|index discovery_volumes_pkey" \
+           "ALTER TABLE discovery_volumes DROP CONSTRAINT discovery_volumes_pkey; CREATE UNIQUE INDEX discovery_volumes_pkey ON discovery_volumes (run_date, asset_id)|constraint discovery_volumes_pkey" \
            "SELECT remove_compression_policy('premium_index'); SELECT add_compression_policy('premium_index', INTERVAL '8 days')|compression policy premium_index: 7 days"; do
     start_db "incomplete-${#CONTAINERS[@]}" "$ROOT/db/init.sql"
     q -c "${gap%%|*}" > /dev/null

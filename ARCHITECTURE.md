@@ -105,10 +105,11 @@ Schema migrations and TimescaleDB hypertable setup. Candles hypertable partition
 
 - **The ledger.** `public.schema_migrations (version, name, applied_at)` holds one row per applied migration. `db/ledger.sql` creates it with the 001–013 baseline rows in one transaction, so a ledger is either absent or complete. initdb runs it after `init.sql`. A database built before the ledger gets it from `scripts/migrate.sh --adopt`, which first requires every row of the read-only `db/baseline-check.sql` to pass.
 - **Applying.** `scripts/migrations-lib.sh` owns the operations, against a caller-supplied `migrations_psql`, with `ON_ERROR_STOP` on every call:
-  - check the files: `NNN-<name>.sql`, unique versions, no transaction control;
+  - check the files: `NNN-<name>.sql`, unique versions, regular and readable;
   - read the state: adopted, pre-ledger or empty;
   - list pending, refusing an empty ledger or a pending file older than the newest applied one;
   - apply each pending file in order, in one transaction (`psql -1 -f -`) together with its ledger `INSERT`, stopping at the first failure;
+  - send the file's text as a randomly tagged dollar-quoted literal that a `DO` block `EXECUTE`s, so psql interprets none of it and the server refuses any transaction control in it, rolling the migration back;
   - adopt.
 - **The CLI.** `scripts/migrate.sh` runs the lib through the prod compose override's `db` container, after waiting for TCP readiness (the initdb server is socket-only). Callers start `db`, run it, then start the consumers.
 - **Outside the ledger.** DDL that can't run in a transaction, such as `CREATE TABLESPACE` (010) or `CREATE INDEX CONCURRENTLY`, is a runbook step. `tests/integration/check_migrations.sh` runs the lib against a real TimescaleDB.
