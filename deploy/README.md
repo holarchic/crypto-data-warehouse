@@ -137,6 +137,27 @@ TimescaleDB auto-tunes `max_connections` low (~25 on 8GB). Override via `command
 - **Building:** it bakes `collector/`, so rebuild it with `--profile hl-candles-repair build hl-candles-repair` after a code update.
 - **Turning it off:** remove the cron line, stop a running one (`docker ps --filter name=hl-candles-repair -q | xargs -r docker stop`), and deactivate its sentinel so it stops paging: `UPDATE collection_status SET active = FALSE WHERE exchange = 'hyperliquid' AND symbol = '*' AND timeframe = 'candle_repair'`. To turn it back on, set `active = TRUE` again and restore the cron line.
 
+## Stability scorecard
+
+`./scripts/stability-scorecard.sh [--days N]` measures the roadmap's v0.8 stability gate from the stored data. It is read-only. It exits 1 when any measured check fails and prints `SCORECARD: PASS (measured checks only)` or `SCORECARD: FAIL`.
+
+- **When.** Run it mid-interval, away from the 00/08/16 UTC settlements and the 06:30 repair. The default `--days 14` scans two weeks of candles, funding and OI, under a 15-minute statement timeout. Time a `--days 1` run before the first full one. During a full run, watch the newest stored 1m bar (`/candles?exchange=binance&asset_id=BTC&timeframe=1m&limit=1`, now minus its time). Stop the run (Ctrl-C) if that lag passes 1,200 s.
+- **Config consistency.** The intervals, threshold and venue lists come from the running monitor's config. Every running collector must carry the same `config.py`, `exchanges.yaml` and `funding.py`. A `config consistent: FAIL` names the collectors built from another commit. Rebuild them before reading the rest.
+- **Database checks.** These cover the active universe only; a pair deactivated before the run doesn't count. Each pair's window opens at its first discovery, and a slot counts once it should be stored (candles 1 h after close, funding 2 h, OI 1 h).
+  - **Candle capture** (≥ 99.9 %): stored bars against expected bars, by venue and timeframe. HL 1m is streamed and not covered. A venue whose API omits untraded bars (Coinbase) shows them as missed, so check the per-venue rows before reading a FAIL as loss.
+  - **Funding-slot occupancy** (≥ 99 %): slots at the collector's own assumed interval (1 h HL, 8 h elsewhere) that hold a settlement.
+  - **OI bucket occupancy** (≥ 95 %): 60 s buckets on HyperLiquid and 300 s elsewhere that hold a snapshot.
+  - **Primary keys** on `candles`, `candles_1m`, `funding_rates` and `open_interest`.
+  - **Discovery:** the latest run is no more than a day old, and every asset it qualified is active on some venue.
+  - A pair re-activated inside the window (a weekend volume dip) counts its inactive time as missed.
+- **API p95.** 50 requests for 500 BTC 5m rows, each of which must return all 500. Under 0.5 s passes.
+- **Not measured:**
+  - native funding events (no per-symbol schedule is stored);
+  - per-venue discovery (discovery stores each asset's cross-venue maximum);
+  - auto-recovery and gap-detection latency;
+  - HL 1m;
+  - the Bybit/OKX 30 s and Binance settlement-window OI density.
+
 ## Offsite backups
 
 `scripts/backup-offsite.sh` streams `pg_dump` from the db container into a [restic](https://restic.net) repository in a bucket every night at 05:30 UTC. That slot is clear of discovery, the HL pull and the compression jobs. On Backblaze B2, restic reaches the bucket through [rclone](https://rclone.org)'s native B2 backend; B2's S3 endpoint can cut off reads of intact files.
