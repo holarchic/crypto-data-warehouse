@@ -189,7 +189,7 @@ def _cfg():
 
 def test_run_wires_premium_thread_behind_flag():
     """The premium loop is imported and launched only when has_premium_index is set. Source-pinned
-    because run() blocks forever; a live launch test would hang (matches the api LOOP_TIMEFRAMES pin)."""
+    because run() blocks forever; a live launch test would hang."""
     src = (Path(pi.__file__).parent / "main.py").read_text()
     assert "from premium_index import premium_index_loop" in src
     assert "config.has_premium_index" in src

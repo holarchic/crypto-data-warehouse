@@ -4,7 +4,7 @@ Two layers:
 - **Pure module** (`api/export.py`) tested against REAL pyarrow — a stubbed lib can't verify a
   byte-contract (schema names/types, NULL→NaN value, epoch-ms conversion).
 - **Endpoint** (`api/main.py`) source-pinned via `ast` — the api container can't be imported under
-  the collector test harness (no fastapi), the same reason `test_api_loop_timeframes.py` parses source.
+  the collector test harness (no fastapi), the same reason `test_api_feed_metadata.py` parses source.
 """
 
 import ast
