@@ -18,15 +18,20 @@ pytestmark = pytest.mark.skipif(
 )
 
 # Logs each call's argv as one "argv:" line with the arguments joined by \x1f (none contains it),
-# then its stdin under "stdin:" when it is SQL for psql. pg_dump writes $FAKE_DUMP; pg_restore
-# exits $FAKE_RESTORE_EXIT; psql -At prints a version.
+# then its stdin under "stdin:" when it is SQL for psql. pg_dump writes $FAKE_DUMP; pg_restore saves
+# what it reads to $DOCKER_LOG.restore and exits $FAKE_RESTORE_EXIT; psql -At prints a version; a
+# psql call whose SQL contains $FAKE_PSQL_FAIL_ON fails.
 STUB_DOCKER = r"""#!/bin/bash
 (IFS=$'\x1f'; echo "argv: $*") >> "$DOCKER_LOG"
 case " $* " in
     *" pg_dump "*) printf '%s' "$FAKE_DUMP" ;;
-    *" pg_restore "*) cat > /dev/null; exit "${FAKE_RESTORE_EXIT:-0}" ;;
+    *" pg_restore "*) cat > "$DOCKER_LOG.restore"; exit "${FAKE_RESTORE_EXIT:-0}" ;;
     *" -Atc "*) echo 2.26.2 ;;
-    *" psql "*) { echo "stdin:"; cat; } >> "$DOCKER_LOG" ;;
+    *" psql "*)
+        sql=$(cat)
+        printf 'stdin:\n%s\n' "$sql" >> "$DOCKER_LOG"
+        if [ -n "$FAKE_PSQL_FAIL_ON" ] && [[ "$sql" == *"$FAKE_PSQL_FAIL_ON"* ]]; then exit 3; fi
+        ;;
 esac
 """
 
@@ -91,7 +96,11 @@ def test_backup_publishes_a_verified_dump(host):
     assert re.fullmatch(r"candle_collector-\d{8}-\d{6}-timescaledb-2\.26\.2\.dump", files[0].name)
     assert files[0].read_text() == "PGDMP-archive"
     assert not (host / "backup.lock").exists()
-    assert_prod_override(docker_calls(host))
+    calls = docker_calls(host)
+    assert_prod_override(calls)
+    (restore,) = [call for call in calls if "pg_restore" in call]
+    assert "--file=/dev/null" in restore  # a full read of the archive, not its table of contents
+    assert (host / "docker.log.restore").read_text() == "PGDMP-archive"
 
 
 def test_a_dump_that_fails_to_read_back_is_never_published(host):
@@ -240,6 +249,24 @@ def test_verify_compression_passes_each_table_as_a_psql_variable(host):
     table_vars = [call[i + 1] for call in calls for i, arg in enumerate(call) if arg == "-v"
                   and call[i + 1].startswith("tbl=")]
     assert table_vars == ["tbl=candles", "tbl=funding_rates", "tbl=open_interest"]
+    assert all(call[call.index("-v") + 1] == "ON_ERROR_STOP=1" for call in calls if "psql" in call)
     log = (host / "docker.log").read_text()
     assert log.count("hypertable_compression_stats(:'tbl')") == 3
     assert "policy_retention" in log
+
+
+def test_verify_compression_falls_back_when_job_stats_fails(host):
+    result = run_script(host, "scripts/verify-compression.sh", FAKE_PSQL_FAIL_ON="job_stats")
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "config->>'compress_after'" in (host / "docker.log").read_text()
+
+
+def test_verify_compression_reports_tables_without_stats(host):
+    result = run_script(host, "scripts/verify-compression.sh", FAKE_PSQL_FAIL_ON="hypertable_compression_stats")
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert result.stdout.count("no compression stats yet") == 3
+
+
+def test_verify_compression_fails_on_an_unguarded_sql_error(host):
+    result = run_script(host, "scripts/verify-compression.sh", FAKE_PSQL_FAIL_ON="policy_retention")
+    assert result.returncode != 0
