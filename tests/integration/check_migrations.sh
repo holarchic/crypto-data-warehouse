@@ -153,6 +153,7 @@ done
 dir=$(scratch_dir do-block 906-do-block.sql)
 migrations_apply "$dir" > /dev/null || die "a PL/pgSQL DO block was refused"
 [ "$(q -c "SELECT count(*) FROM schema_migrations WHERE version = '906';")" = "1" ] || die "906 not recorded"
+[ "$(q -c "SELECT to_regclass('public.check_906') IS NOT NULL;")" = "t" ] || die "906's DO block did not run"
 ok "a PL/pgSQL DO block applies"
 
 # --- pre-ledger: init.sql only ----------------------------------------------------------------------
