@@ -1,7 +1,8 @@
 """api/main.py reads its feed metadata from collector/config.py (copied into the api image beside
 it) instead of mirroring it, and names /status's staleness rule. Read with `ast`: the test harness
 stubs `main` and the db modules (tests/conftest.py), and api/main.py can't be imported beside
-collector/main.py. tests/integration checks the built image itself."""
+collector/main.py. tests/integration/check_api_metadata.sh runs the same assertions inside the built
+image."""
 
 import ast
 from pathlib import Path
@@ -46,7 +47,7 @@ def test_intervals_and_loop_names_come_from_config():
 def test_retired_timeframes_are_not_collected():
     """A timeframe back in exchanges.yaml must leave the retired list, or its interval has two owners."""
     retired = ast.literal_eval(_assignment("RETIRED_TIMEFRAME_INTERVALS"))
-    assert set(retired) == {"1d", "3d", "1w"}
+    assert retired == {"1d": 86400, "3d": 259200, "1w": 604800}
     assert not set(retired) & set(config.load_timeframe_intervals())
 
 
@@ -66,3 +67,22 @@ def test_status_sets_is_stale_through_the_named_rule():
     assert len(assigns) == 1
     call = assigns[0].value
     assert isinstance(call, ast.Call) and ast.unparse(call.func) == "_status_is_stale"
+
+
+def test_every_configured_interval_is_a_positive_whole_number_of_seconds():
+    """The api and the monitor take these from exchanges.yaml as they are; a quoted, null or zero
+    interval would break /status, the gap check and the monitor's staleness alike."""
+    intervals = config.load_timeframe_intervals()
+    assert intervals
+    for timeframe, seconds in intervals.items():
+        assert type(seconds) is int and seconds > 0, (timeframe, seconds)
+
+
+def test_candle_table_routes_through_config():
+    candle_table = _function("_candle_table")
+    routes = config.load_candle_tables()
+    candle_table.__globals__["_CANDLE_TABLES"] = routes
+    for timeframe, table in routes.items():
+        assert candle_table(timeframe) == table
+    assert candle_table("1m") == "candles_1m"
+    assert candle_table("1d") == "candles"            # retired: stored in the default table
