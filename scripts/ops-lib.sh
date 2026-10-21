@@ -19,6 +19,8 @@ DC=(docker compose -f "$PROJECT_DIR/docker-compose.yml" -f "$PROJECT_DIR/docker-
 # The single quotes are deliberate: the variables expand inside the container.
 # shellcheck disable=SC2016
 DB_TOOL=("${DC[@]}" exec -T db sh -c 'tool=$1; shift; exec "$tool" -U "$POSTGRES_USER" -d "$POSTGRES_DB" "$@"' db-tool)
+# Fixed once sourced, so DB_TOOL can never disagree with DC.
+readonly PROJECT_DIR DC DB_TOOL
 
 # The application database's name, for statements that name it (restore's DROP and CREATE).
 db_name() {
