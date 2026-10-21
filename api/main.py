@@ -1,7 +1,10 @@
 import os
+import tomllib
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
+from pathlib import Path
 
+import config
 import export
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Query
@@ -10,6 +13,11 @@ from psycopg.rows import dict_row
 from psycopg_pool import ConnectionPool
 
 load_dotenv()
+
+# pyproject.toml holds the one release version. It sits one directory above this file both in the
+# repo and in the image (/app/main.py, /pyproject.toml). A missing file stops the import, so the API
+# never reports a wrong version.
+RELEASE_VERSION = tomllib.loads((Path(__file__).resolve().parents[1] / "pyproject.toml").read_text())["project"]["version"]
 
 
 def build_dsn():
@@ -36,7 +44,7 @@ async def lifespan(app: FastAPI):
     pool.close()
 
 
-app = FastAPI(title="candle-collector", version="0.7.0", lifespan=lifespan)
+app = FastAPI(title="candle-collector", version=RELEASE_VERSION, lifespan=lifespan)
 
 
 @app.get("/health")
@@ -261,33 +269,38 @@ def get_liquidations(
 # Status / health monitoring endpoints
 # ---------------------------------------------------------------------------
 
-TIMEFRAME_INTERVALS = {
-    "1m": 60, "5m": 300, "15m": 900, "30m": 1800, "1h": 3600, "2h": 7200,
-    "4h": 14400, "12h": 43200, "1d": 86400, "3d": 259200, "1w": 604800,
-}
-
-# Candle-table routing, MIRRORED from collector/exchanges.yaml (config.load_candle_tables); the api/
-# container can't import collector/, same as TIMEFRAME_INTERVALS above and LOOP_TIMEFRAMES below.
-# Only the NON-default routes live here (default is `candles`); a drift test pins this against config
-# so the two mirrors can't diverge. `1m` → candles_1m (a separate hypertable on the ts_1m volume,
-# T-015). `/candles` and `/status/gaps` route their FROM clause through _candle_table so a query for
-# `1m` reads candles_1m — else the API advertises 1m (from collection_status) while serving 0 rows.
-CANDLE_TABLE_BY_TIMEFRAME = {"1m": "candles_1m"}
+# Feed metadata comes from the collector's own config module: the api image copies
+# collector/config.py and exchanges.yaml beside this file (api/Dockerfile), so routing, intervals and
+# loop names have one source. Read at import, never per request.
+#
+# Timeframes the collectors don't write but whose stored candles this API still serves and
+# gap-checks. They live in `candles`, the default table.
+RETIRED_TIMEFRAME_INTERVALS = {"1d": 86400, "3d": 259200, "1w": 604800}
+TIMEFRAME_INTERVALS = config.load_timeframe_intervals() | RETIRED_TIMEFRAME_INTERVALS
+_CANDLE_TABLES = config.load_candle_tables()
 
 
 def _candle_table(timeframe: str) -> str:
-    """The candle storage table for a timeframe (default `candles`). Value is a fixed literal from a
-    closed map, safe to inline into a query identifier (psycopg can't bind an identifier as a value)."""
-    return CANDLE_TABLE_BY_TIMEFRAME.get(timeframe, "candles")
+    """The candle storage table for a timeframe (default `candles`). config validates every value
+    against its CANDLE_TABLES allowlist, so it is safe to inline as a query identifier (psycopg can't
+    bind an identifier as a value). `/candles` and `/status/gaps` route through it, so `1m` reads
+    candles_1m."""
+    return _CANDLE_TABLES.get(timeframe, "candles")
 
-# Per-loop heartbeat pseudo-timeframes — funding, OI, the liquidation-WS, the premium-poll, and the
-# HL candle-WS and HL 1m repair sentinels (the keys of collector/config.py LOOP_INTERVALS). The API is
-# a separate container and cannot import collector/, so the
-# names are mirrored here (as TIMEFRAME_INTERVALS above is). Only the NAMES are needed —
-# the staleness intervals are the monitor's concern. CONTRACT: every candle-facing
-# collection_status query in this module excludes these sentinel rows; loop liveness is
-# surfaced by the monitor, not this API.
-LOOP_TIMEFRAMES = ("funding", "oi", "liq_ws", "premium", "candle_ws", "candle_repair")
+
+# The per-loop heartbeat pseudo-timeframes (funding, OI, the WS feeds, premium, the HL 1m repair).
+# CONTRACT: every candle-facing collection_status query in this module excludes these sentinel rows;
+# loop liveness is the monitor's surface, not this API's.
+LOOP_TIMEFRAMES = tuple(config.LOOP_INTERVALS)
+
+
+def _status_is_stale(seconds_since_success: float | None, interval_s: int | None) -> bool:
+    """/status's per-pair freshness: no success yet, or none within two intervals (120 s at 1m). An
+    unknown timeframe is never stale here. This is not the monitor's paging threshold, which waits
+    `interval + max(interval, 1800)` (collector/monitor.py compute_staleness)."""
+    if interval_s is None:
+        return False
+    return seconds_since_success is None or seconds_since_success > 2 * interval_s
 
 
 @app.get("/status")
@@ -315,7 +328,7 @@ def get_status(exchange: str | None = None, timeframe: str | None = None):
     compression_sql = """
         SELECT ht.hypertable_name,
                s.total_chunks,
-               s.compressed_chunks
+               s.number_compressed_chunks AS compressed_chunks
         FROM timescaledb_information.hypertables ht
         CROSS JOIN LATERAL hypertable_compression_stats(ht.hypertable_name) s
         WHERE ht.hypertable_schema = 'public'
@@ -332,9 +345,7 @@ def get_status(exchange: str | None = None, timeframe: str | None = None):
 
     # Compute is_stale flag (candle TFs only — loop rows are excluded above).
     for row in rows:
-        interval_s = TIMEFRAME_INTERVALS.get(row["timeframe"])
-        since = row.get("seconds_since_success")
-        row["is_stale"] = interval_s is not None and (since is None or since > 2 * interval_s)
+        row["is_stale"] = _status_is_stale(row.get("seconds_since_success"), TIMEFRAME_INTERVALS.get(row["timeframe"]))
         if row.get("last_success") and hasattr(row["last_success"], "isoformat"):
             row["last_success"] = row["last_success"].isoformat()
 

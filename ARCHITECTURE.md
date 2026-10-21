@@ -10,7 +10,7 @@ Fetches OHLCV candles, funding rates, and open interest from exchanges. Writes d
 
 The REST candle feed is `candles.py` (`candle_loop` → `_collect_pair` → `fetch_candles`, with the request sizing `poll_limit` + `CANDLE_LIMIT_*`; see Shared-limiter coupling below). A venue that charges by bars returned (HL) sets `poll_max_bars`: `_collect_pair` passes a ccxt `until` 1 ms before the boundary `poll_max_bars` buckets after `since`'s bucket on every request (HL returns every bucket touching either end of the range), a seed starting `CANDLE_SEED_LIMIT` bars back, so a catch-up poll costs no more than a caught-up one; when a capped window behind now comes back empty, `candle_loop`'s per-pair `scan_from` moves the next poll past it, so a cursor older than the venue's history is stepped over window by window, never with an uncapped request.
 
-**Candle-table routing (T-015):** which table a timeframe's candles land in is a data-driven property — `table:` in `exchanges.yaml` (default `candles`; `1m` → `candles_1m`). `config._validate_candle_table` is the single validation seam (both `_parse_exchange` and `load_candle_tables` call it, so a bad `table:` fails once at load in the collector AND monitor processes); `TimeframeConfig.table` / `config.load_candle_tables()` is the single routing source, consumed by the collector insert (`candles.INSERT_SQL`, a dict keyed by table, built at import from the closed `CANDLE_TABLES` allowlist via one template — no runtime identifier interpolation), the monitor gap-scan (`monitor.GAP_SQL_BY_TABLE`), and — mirrored, since `api/` can't import `collector/` — the API (`_candle_table`, pinned to config by an exact-equality drift test). No hardcoded `1m` branch anywhere.
+**Candle-table routing (T-015):** which table a timeframe's candles land in is a data-driven property — `table:` in `exchanges.yaml` (default `candles`; `1m` → `candles_1m`). `config._validate_candle_table` is the single validation seam (both `_parse_exchange` and `load_candle_tables` call it, so a bad `table:` fails once at load in the collector AND monitor processes); `TimeframeConfig.table` / `config.load_candle_tables()` is the single routing source, consumed by the collector insert (`candles.INSERT_SQL`, a dict keyed by table, built at import from the closed `CANDLE_TABLES` allowlist via one template — no runtime identifier interpolation), the monitor gap-scan (`monitor.GAP_SQL_BY_TABLE`), and the API (`_candle_table`, over `config.load_candle_tables()`). No hardcoded `1m` branch anywhere.
 
 `candle_loop` calls `maybe_reload_markets()` (in `db.py`) at the top of each cycle. The helper is age-gated (`MARKETS_RELOAD_INTERVAL_S`, default 86400s) and lock-guarded so the per-timeframe threads sharing one ccxt `exchange` reload at most once per interval. Without this, symbols added by daily discovery stay invisible to the long-running collector container.
 
@@ -91,7 +91,17 @@ Separate always-on container (`python -m monitor`). One `collection_status` fetc
 
 ### api/
 
-FastAPI read-only REST API. Queries PostgreSQL, serves downstream consumers. Cannot import `collector/`, so any collector-shared convention is mirrored + drift-tested (`_candle_table`, `LOOP_TIMEFRAMES`).
+FastAPI read-only REST API. Queries PostgreSQL, serves downstream consumers.
+
+**Feed metadata.** The api image copies `collector/config.py` and `exchanges.yaml` beside `main.py` through the `project` named build context, and `main.py` imports `config`.
+
+- **Routing:** `_candle_table` reads `config.load_candle_tables()`, defaulting to `candles`.
+- **Intervals:** `TIMEFRAME_INTERVALS` is `config.load_timeframe_intervals()` plus the API-owned `RETIRED_TIMEFRAME_INTERVALS` (1d/3d/1w: no longer collected, still served).
+- **Loop names:** `LOOP_TIMEFRAMES` is `config.LOOP_INTERVALS`' keys, and every candle-facing status query excludes those sentinel rows.
+- **Constraint:** both images import `config.py`, so it must import only the stdlib and `yaml`; `tests/integration/check_api_metadata.sh` imports it inside the built api image. A test requires every configured interval to be a positive integer.
+- **Staleness:** `/status`'s `is_stale` is `_status_is_stale`: no success, or none within 2 × interval. The monitor's paging threshold, `interval + max(interval, 1800)`, is a separate rule. The gap query is still written in both `api/main.py` and `monitor.py` until T-032.2.
+
+**Release version.** `pyproject.toml` holds the warehouse's one release version. The api build takes the repo root as a second, named build context (`project`, compose `additional_contexts`) and copies just that file to `/pyproject.toml`. `main.py` reads `RELEASE_VERSION` from it with `tomllib` at import and passes it to `FastAPI(version=…)`, so `/openapi.json` reports the image's release. `tests/test_api_version.py` pins that wiring.
 
 **Parquet export (`GET /export/parquet`, T-011)** — streams a feed's window as parquet for the backtester's forward-ingest, which reads the raw file and validates each feed by a structural hash (`feed_provenance.rs`: name-sorted schema + commutative per-row digest sum, so column/row order don't affect it — but names/types and per-cell content, including the null-mask, do). The byte-contract lives in one pure module, `api/export.py` (pyarrow only — no fastapi/psycopg, so it unit-tests against real pyarrow): `FEED_SPECS[table]` maps each seed column (a `Column`) to its cc source, a transform `kind`, and an `on_null` policy. `_KINDS` is the single registry of each kind → a `KindSpec(arrow, default_on_null)` (`string`/`epoch_ms`/`float`/`native_symbol`/`int`); the kind is explicit per column, never inferred from the arrow type (int64 is shared by `int` and `epoch_ms`, which datetime-converts). **Missing-value parity is per-column, not universal** — each seed's convention differs, so `on_null` is a fill value, `RAISE`, or the kind default (`float`→NaN value; every other kind→`RAISE`). A NULL in a seed-required column fails closed rather than mint a NaN/parquet-null the extractor never emitted. `_seed_value` is the single null-policy-then-transform source; `feed_schema`/`rows_to_parquet` build the seed-schema parquet (cc `timestamp`→floor-to-ms epoch int64). `feed_query(table, start, end, asset_id)` builds every feed's SQL (half-open `[start,end)`, venue/universe/asset filters, `LIMIT EXPORT_MAX_ROWS+1`); identifiers and bucket widths come from the spec literal, values are parameters. A feed with a `Resample(bucket_s, source_s)` is aggregated in SQL: each `Column.agg` is a group key, `first`/`last`/`max`/`min` (each NULL unless every source value in the bucket is non-NULL, so a NULL reaches the column's `RAISE` instead of being skipped by `max`/`min`), or `bucket_open`/`bucket_close`; only buckets with all `bucket_s/source_s` source rows are emitted (`HAVING count(*)`), and source rows are read over `[ceil(start), ceil(end))` on bucket boundaries, so a bucket is in a window iff its open time is. The `main.py` endpoint is a thin wrapper — `FEED_SPECS` table whitelist, tz-aware bounds normalized to UTC, `feed_query`, 400 (unknown table / naive / reversed), 204 on empty (the hash rejects an empty feed), 413 above `EXPORT_MAX_ROWS` (reject, not truncate; cap sized by an in-image peak-RSS smoke). Four feeds registered: `hl_asset_ctxs` (HL context passthrough), `binance_oi` (`open_interest` filtered to binance USDT-perps, coin = ccxt `symbol`→Binance-native via the `native_symbol` kind, `symbol_like` restricting to the seed universe), and `hl_liquidations` (`liquidations WHERE venue='hyperliquid'`, the Grade-A tape — `oid`/`tid` the `int` kind, `dir`/`method`→`""` and `closed_pnl`→`0.0` per the seed defaults, the required `side`/`px`/`sz`/`mark_px` fail-closed), and `binance_premium_index` (`premium_index` binance USDT 5m resampled to complete 1h bars, coin = `native_symbol`, `close_time_ms` = open + 3,599,999 as in the seed, NULL prices raise). `tests/integration/check_export_queries.py` runs every feed's query against a real TimescaleDB through the serializer.
 
@@ -102,6 +112,30 @@ FastAPI read-only REST API. Queries PostgreSQL, serves downstream consumers. Can
 ### db/
 
 Schema migrations and TimescaleDB hypertable setup. Candles hypertable partitioned on timestamp, 1-week chunks; `candles_1m` (1m only) on the `ts_1m` volume tablespace, 1-day chunks (migration 010, operator-applied). Compression (>7d) on every hypertable, and no retention: all history is kept (migration 013 removed the old policies, and no file in `db/` adds one). `discovery_volumes` (migration 012) is a plain table with no policies.
+
+**One schema authority.** `db/init.sql` is the baseline: the schema after migrations 001–013, without tablespace placement, frozen (a test pins its hash). Every later change is a new `db/migrations/NNN-<name>.sql`.
+
+- **The ledger.** `public.schema_migrations (version, name, applied_at)` holds one row per applied migration. `db/ledger.sql` creates it with the 001–013 baseline rows in one transaction, so a ledger is either absent or complete. initdb runs it after `init.sql`. A database built before the ledger gets it from `scripts/migrate.sh --adopt`, which first requires every row of the read-only `db/baseline-check.sql` to pass.
+- **Applying.** `scripts/migrations-lib.sh` owns the operations, against a caller-supplied `migrations_psql`, with `ON_ERROR_STOP` on every call:
+  - check the files: `NNN-<name>.sql`, unique versions, regular and readable;
+  - read the state: adopted, pre-ledger or empty;
+  - list pending, refusing an empty ledger or a pending file older than the newest applied one;
+  - apply each pending file in order, in one transaction (`psql -1 -f -`) together with its ledger `INSERT`, stopping at the first failure;
+  - send the file's text as a randomly tagged dollar-quoted literal that a `DO` block `EXECUTE`s, so psql interprets none of it and the server refuses any transaction control in it, rolling the migration back;
+  - adopt.
+- **The CLI.** `scripts/migrate.sh` runs the lib through the prod compose override's `db` container, after waiting for TCP readiness (the initdb server is socket-only). Callers start `db`, run it, then start the consumers.
+- **Outside the ledger.** DDL that can't run in a transaction, such as `CREATE TABLESPACE` (010) or `CREATE INDEX CONCURRENTLY`, is a runbook step. `tests/integration/check_migrations.sh` runs the lib against a real TimescaleDB.
+
+### Host scripts: the prod context (scripts/ops-lib.sh)
+
+Every host script that drives the stack sources `scripts/ops-lib.sh`. It defines:
+
+- `PROJECT_DIR`;
+- `DC`, the one prod compose command (base plus prod override, absolute paths);
+- `DB_TOOL`, an array that runs a Postgres client in the db container as the container's `POSTGRES_USER` against its `POSTGRES_DB`. It is an array, so restic's `--stdin-from-command` and `env -u` can run it. psql takes the last `-d`, so `-d postgres` reaches the maintenance database;
+- `db_name`, which `restore.sh` uses to drop and recreate the database by name (`:"db"`).
+
+No other script runs `docker compose`, except `install-cron.sh`, whose crontab text can't source a lib, or names the database identity. `tests/test_ops_lib.py` enforces both. host-monitor sources the lib behind a guard: without it, the container check pages as a failed probe and the other checks still run. `tests/integration/check_ops_lib.sh` runs migrate, verify-compression and backup against a real db with a non-default user and database.
 
 ### Offsite backup (scripts/backup-offsite.sh, host cron)
 

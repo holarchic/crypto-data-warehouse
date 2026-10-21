@@ -2,13 +2,16 @@
 
 The unit tests check the SQL text; only a real database runs TimescaleDB's first()/last()/time_bucket and
 returns the row shapes rows_to_parquet consumes. Runs outside pytest, inside the api image, against a
-throwaway database created from db/init.sql:
+throwaway database at the current schema (db/init.sql, the ledger, then any newer migration):
 
     docker network create cc-check
     docker run -d --name cc-check-db --network cc-check -e POSTGRES_USER=candles \
         -e POSTGRES_PASSWORD=x -e POSTGRES_DB=candle_collector timescale/timescaledb:2.26.2-pg16
     docker exec -i cc-check-db psql -U candles -d candle_collector < db/init.sql
-    docker build -t cc-api-check api
+    docker exec -i cc-check-db psql -U candles -d candle_collector < db/ledger.sql
+    bash -c 'migrations_psql() { docker exec -i cc-check-db psql -X -U candles -d candle_collector "$@"; }
+             . scripts/migrations-lib.sh && migrations_apply'
+    docker build -t cc-api-check --build-context project=. api
     docker run --rm --network cc-check -v "$PWD/tests/integration:/checks:ro" -e PYTHONPATH=/app \
         -e CC_PG_TEST_DSN=postgresql://candles:x@cc-check-db:5432/candle_collector \
         cc-api-check python /checks/check_export_queries.py

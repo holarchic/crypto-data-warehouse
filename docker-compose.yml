@@ -24,6 +24,7 @@ services:
     volumes:
       - pgdata:/var/lib/postgresql/data
       - ./db/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+      - ./db/ledger.sql:/docker-entrypoint-initdb.d/ledger.sql:ro
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-candles} -d ${POSTGRES_DB:-candle_collector}"]
       interval: 5s
@@ -113,7 +114,11 @@ services:
     restart: "no"
 
   api:
-    build: ./api
+    build:
+      context: ./api
+      # The image copies pyproject.toml from here: it holds the release version the API reports.
+      additional_contexts:
+        project: .
     depends_on:
       db:
         condition: service_healthy

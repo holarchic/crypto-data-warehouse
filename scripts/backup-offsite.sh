@@ -13,12 +13,12 @@ set -euo pipefail
 export PATH="/usr/local/bin:/usr/bin:/bin:$PATH"
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-PROJECT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
+# shellcheck source=scripts/ops-lib.sh
+. "$SCRIPT_DIR/ops-lib.sh"
 # shellcheck source=scripts/offsite-lib.sh
 . "$SCRIPT_DIR/offsite-lib.sh"
 LOCK_FILE="/run/lock/candle-collector-backup.lock"
 LOG_HINT="check /var/log/candle-collector-backup.log"
-DC=(docker compose -f docker-compose.yml -f docker-compose.prod.yml)
 
 log() { echo "==> $(date -u +%Y-%m-%dT%H:%M:%SZ) $*"; }
 
@@ -64,11 +64,11 @@ log "Offsite backup starting"
 # Only stale locks: one left by an interrupted run clears, a live drill elsewhere keeps its own.
 restic_run unlock || fail "restic unlock failed (exit $?); ${LOG_HINT}"
 
-TSDB_VERSION=$("${DC[@]}" exec -T db psql -X -U candles -d candle_collector -Atc \
+TSDB_VERSION=$("${DB_TOOL[@]}" psql -X -Atc \
     "SELECT extversion FROM pg_extension WHERE extname = 'timescaledb'")
-PG_MAJOR=$("${DC[@]}" exec -T db psql -X -U candles -d candle_collector -Atc \
+PG_MAJOR=$("${DB_TOOL[@]}" psql -X -Atc \
     "SELECT current_setting('server_version_num')::int / 10000")
-[ -n "$TSDB_VERSION" ] || fail "TimescaleDB extension not found in candle_collector"
+[ -n "$TSDB_VERSION" ] || fail "TimescaleDB extension not found in the database"
 log "TimescaleDB ${TSDB_VERSION}, PostgreSQL ${PG_MAJOR}"
 
 # -- Backup -------------------------------------------------------------------
@@ -81,12 +81,12 @@ log "TimescaleDB ${TSDB_VERSION}, PostgreSQL ${PG_MAJOR}"
 STRIP=$(restic_strip_env_args)
 read -r -a STRIP_ENV <<< "$STRIP"
 
-log "Dumping candle_collector into the repository"
+log "Dumping the database into the repository"
 restic_run backup --host "$SNAPSHOT_HOST" \
     --tag "${SNAPSHOT_TAG_TIMESCALEDB}${TSDB_VERSION}" --tag "${SNAPSHOT_TAG_PG}${PG_MAJOR}" \
     --stdin-filename "$SNAPSHOT_FILE" --stdin-from-command -- \
     env "${STRIP_ENV[@]}" \
-    "${DC[@]}" exec -T db pg_dump -U candles --format=custom --compress=0 candle_collector \
+    "${DB_TOOL[@]}" pg_dump --format=custom --compress=0 \
     || fail "restic backup failed (exit $?), no snapshot made; ${LOG_HINT}"
 
 log "Applying retention"

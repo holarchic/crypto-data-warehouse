@@ -1,9 +1,11 @@
-# Production overrides — use with:
+# Production overrides — every server compose command takes both files. Start: the db, then
+# ./scripts/migrate.sh, then the rest (deploy/README.md):
+#   docker compose -f docker-compose.yml -f docker-compose.prod.yml up -d db && ./scripts/migrate.sh &&
 #   docker compose -f docker-compose.yml -f docker-compose.prod.yml up -d
 #
 # Changes from dev:
 #   - DB port 5432 NOT exposed to host
-#   - Memory limits on all containers
+#   - A memory limit on every service, the profile one-shots included (tests/test_compose_prod.py)
 #   - API bound to loopback only (access via SSH tunnel)
 
 # Collector logs: ~2 weeks at the busiest collector's rate (bybit ~4 MB/h raw). Rotated files are
@@ -87,6 +89,14 @@ services:
       resources:
         limits:
           memory: 512m
+
+  # Peaks near 80 MB over its daily run (it holds one coin's slice at a time); 256m is ~3× that.
+  # No logging override: it runs with --rm, so its container log goes with it; cron keeps the output.
+  hl-candles-repair:
+    deploy:
+      resources:
+        limits:
+          memory: 256m
 
   api:
     ports: !override

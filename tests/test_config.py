@@ -58,7 +58,7 @@ def test_has_candle_ws_flag():
 
 def test_candle_ws_loop_sentinel_registered():
     # T-015.1: the WS-only feed's sentinel must be in LOOP_INTERVALS so the monitor staleness-checks it
-    # (and the api LOOP_TIMEFRAMES mirror derives from this — see test_api_loop_timeframes).
+    # (and the api's LOOP_TIMEFRAMES is LOOP_INTERVALS' keys, through the copied config module).
     assert CANDLE_WS == "candle_ws"
     assert CANDLE_WS in LOOP_INTERVALS
 

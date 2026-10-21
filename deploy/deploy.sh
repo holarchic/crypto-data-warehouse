@@ -7,8 +7,8 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-PROJECT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
-DC=(docker compose -f docker-compose.yml -f docker-compose.prod.yml)
+# shellcheck source=scripts/ops-lib.sh
+. "$SCRIPT_DIR/../scripts/ops-lib.sh"
 
 # -- Helpers ------------------------------------------------------------------
 
@@ -51,6 +51,12 @@ info "Building application images"
 # Include profile-gated services (discovery, liquidations-hl, hl-candles-repair) so they don't run
 # stale code after a git pull — `compose build` alone skips anything behind a profile flag.
 "${DC[@]}" --profile discovery --profile liquidations-hl --profile hl-candles-repair build
+
+info "Starting the db and applying migrations"
+# Consumers start only once the schema is current: migrate.sh waits for the db over TCP and
+# stops the script (set -e) on a failed migration.
+"${DC[@]}" up -d db
+"$PROJECT_DIR/scripts/migrate.sh"
 
 info "Starting services"
 "${DC[@]}" up -d

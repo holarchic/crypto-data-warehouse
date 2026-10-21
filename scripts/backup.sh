@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Backup candle_collector DB via pg_dump in the db container.
+# Backup the application database via pg_dump in the db container.
 # Creates timestamped custom-format dump in backups/ directory.
 # Sends webhook alert on failure. Cleans up dumps older than 7 days.
 # A dump is written under a .partial name and takes its .dump name only after it reads back
@@ -7,9 +7,9 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-PROJECT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
+# shellcheck source=scripts/ops-lib.sh
+. "$SCRIPT_DIR/ops-lib.sh"
 BACKUP_DIR="${BACKUP_DIR:-${PROJECT_DIR}/backups}"
-DC=(docker compose -f "$PROJECT_DIR/docker-compose.yml" -f "$PROJECT_DIR/docker-compose.prod.yml")
 # mkdir is atomic on every platform the script runs on, unlike flock (absent on macOS).
 LOCK_DIR="${BACKUP_LOCK_DIR:-/tmp/candle-collector-backup.lock}"
 mkdir -p "$BACKUP_DIR"
@@ -53,18 +53,14 @@ trap 'rm -f "$PARTIAL"; rmdir "$LOCK_DIR" 2>/dev/null || true' EXIT
 
 # The name carries the TimescaleDB version, which a restore must match and the dump itself
 # does not record (scripts/restore.sh reads it from here).
-TSDB_VERSION=$("${DC[@]}" exec -T db psql -X -U candles -d candle_collector -Atc \
+TSDB_VERSION=$("${DB_TOOL[@]}" psql -X -Atc \
     "SELECT extversion FROM pg_extension WHERE extname = 'timescaledb'")
 FILENAME="candle_collector-${TIMESTAMP}-timescaledb-${TSDB_VERSION}.dump"
 FILEPATH="${BACKUP_DIR}/${FILENAME}"
 
-echo "==> Backing up candle_collector to ${FILEPATH}"
+echo "==> Backing up the database to ${FILEPATH}"
 
-"${DC[@]}" exec -T db pg_dump \
-    -U candles \
-    --format=custom \
-    --compress=6 \
-    candle_collector > "$PARTIAL"
+"${DB_TOOL[@]}" pg_dump --format=custom --compress=6 > "$PARTIAL"
 
 # Read the whole archive, not just its table of contents, before older dumps are pruned.
 echo "==> Verifying backup..."

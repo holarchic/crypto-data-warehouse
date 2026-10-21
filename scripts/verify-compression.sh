@@ -3,11 +3,11 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-PROJECT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
-DC=(docker compose -f "$PROJECT_DIR/docker-compose.yml" -f "$PROJECT_DIR/docker-compose.prod.yml")
+# shellcheck source=scripts/ops-lib.sh
+. "$SCRIPT_DIR/ops-lib.sh"
 
 # Statements go in on stdin, so psql variables (-v) interpolate; any SQL error fails the call.
-db_sql() { "${DC[@]}" exec -T db psql -X -v ON_ERROR_STOP=1 -U candles candle_collector "$@"; }
+db_sql() { "${DB_TOOL[@]}" psql -X -v ON_ERROR_STOP=1 "$@"; }
 
 echo "=== Compression status ==="
 db_sql <<'SQL'
@@ -20,9 +20,9 @@ SQL
 echo "=== Compression stats (per hypertable) ==="
 for TABLE in candles funding_rates open_interest; do
     echo "--- ${TABLE} ---"
-    db_sql -v tbl="$TABLE" 2>/dev/null <<'SQL' \
-        || echo "  (no compression stats yet — chunks may not be old enough)"
-SELECT total_chunks, compressed_chunks,
+    # A hypertable with no compressed chunk yet reports 0 here; an error is a real failure.
+    db_sql -v tbl="$TABLE" <<'SQL'
+SELECT total_chunks, number_compressed_chunks,
        pg_size_pretty(before_compression_total_bytes) AS before_size,
        pg_size_pretty(after_compression_total_bytes) AS after_size
 FROM hypertable_compression_stats(:'tbl');

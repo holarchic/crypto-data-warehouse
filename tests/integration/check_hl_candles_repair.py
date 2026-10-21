@@ -1,12 +1,15 @@
 """hl_candles_repair's SQL and DB functions against a real TimescaleDB, with real psycopg.
 
 The unit tests run with psycopg and db stubbed (tests/conftest.py), so this runs outside
-pytest, inside the collector image, against a throwaway database created from db/init.sql:
+pytest, inside the collector image, against a throwaway database at the current schema (db/init.sql, the ledger, then any newer migration):
 
     docker network create cc-check
     docker run -d --name cc-check-db --network cc-check -e POSTGRES_USER=candles \
         -e POSTGRES_PASSWORD=x -e POSTGRES_DB=candle_collector timescale/timescaledb:2.26.2-pg16
     docker exec -i cc-check-db psql -U candles -d candle_collector < db/init.sql
+    docker exec -i cc-check-db psql -U candles -d candle_collector < db/ledger.sql
+    bash -c 'migrations_psql() { docker exec -i cc-check-db psql -X -U candles -d candle_collector "$@"; }
+             . scripts/migrations-lib.sh && migrations_apply'
     docker build -t cc-collector-check collector
     docker run --rm --network cc-check -v "$PWD/tests/integration:/checks:ro" -e PYTHONPATH=/app \
         -e CC_PG_TEST_DSN=postgresql://candles:x@cc-check-db:5432/candle_collector \

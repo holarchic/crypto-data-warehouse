@@ -36,17 +36,6 @@ esac
 """
 
 
-@pytest.mark.parametrize("script", HOST_SCRIPTS, ids=lambda p: p.name)
-def test_every_compose_call_carries_the_prod_override(script):
-    for number, line in enumerate(script.read_text().splitlines(), 1):
-        if line.lstrip().startswith("#") or "docker compose" not in line:
-            continue
-        # `docker compose version` and alert or log messages name compose without running it.
-        if "docker compose version" in line or re.match(r"\s*(echo|remind|info|fail|send_alert)\b", line):
-            continue
-        assert "docker-compose.prod.yml" in line, f"{script.name}:{number}: {line.strip()}"
-
-
 @pytest.fixture
 def host(tmp_path):
     bin_dir = tmp_path / "bin"
@@ -261,10 +250,22 @@ def test_verify_compression_falls_back_when_job_stats_fails(host):
     assert "config->>'compress_after'" in (host / "docker.log").read_text()
 
 
-def test_verify_compression_reports_tables_without_stats(host):
+def test_verify_compression_fails_when_the_stats_query_fails(host):
+    """hypertable_compression_stats reports 0 compressed chunks for a young table, so an error is a
+    real failure, never "no stats yet" (that mask hid a renamed column)."""
     result = run_script(host, "scripts/verify-compression.sh", FAKE_PSQL_FAIL_ON="hypertable_compression_stats")
-    assert result.returncode == 0, result.stdout + result.stderr
-    assert result.stdout.count("no compression stats yet") == 3
+    assert result.returncode != 0
+    assert "no compression stats yet" not in result.stdout
+
+
+def test_compression_stats_use_timescaledbs_column_names():
+    """TimescaleDB 2.x names the column number_compressed_chunks; the api keeps compressed_chunks as
+    its response key."""
+    script = (ROOT / "scripts" / "verify-compression.sh").read_text()
+    api = (ROOT / "api" / "main.py").read_text()
+    assert "SELECT total_chunks, number_compressed_chunks," in script
+    assert "s.number_compressed_chunks AS compressed_chunks" in api
+    assert not re.search(r"\bs\.compressed_chunks\b", api)
 
 
 def test_verify_compression_fails_on_an_unguarded_sql_error(host):
