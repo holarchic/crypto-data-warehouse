@@ -52,6 +52,12 @@ info "Building application images"
 # stale code after a git pull — `compose build` alone skips anything behind a profile flag.
 "${DC[@]}" --profile discovery --profile liquidations-hl --profile hl-candles-repair build
 
+info "Starting the db and applying migrations"
+# Consumers start only once the schema is current: migrate.sh waits for the db over TCP and
+# stops the script (set -e) on a failed migration.
+"${DC[@]}" up -d db
+"$PROJECT_DIR/scripts/migrate.sh"
+
 info "Starting services"
 "${DC[@]}" up -d
 

@@ -128,7 +128,7 @@ On a laptop:
 git clone https://github.com/holarchic/crypto-data-warehouse
 cd crypto-data-warehouse
 cp .env.example .env     # set POSTGRES_PASSWORD
-docker compose up -d
+docker compose up -d db && ./scripts/migrate.sh && docker compose up -d
 ```
 
 `curl localhost:8000/health` returns `{"status":"ok"}`. The first 5m candles land within about five minutes; query them with the `curl` at the top of this page. To collect beyond BTC, run discovery: `docker compose --profile discovery run --rm discovery`.

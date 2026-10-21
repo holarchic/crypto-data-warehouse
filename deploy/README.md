@@ -25,7 +25,7 @@
 
 | Action | Command |
 |--------|---------|
-| Start all | `docker compose up -d` |
+| Start all | `docker compose up -d db && ./scripts/migrate.sh && docker compose up -d` (the `&&` keeps the services down if a migration fails) |
 | Stop all | `docker compose down` |
 | Run discovery | `docker compose --profile discovery run --rm discovery` |
 | Logs (one exchange) | `docker compose logs -f collector-hyperliquid` |
@@ -33,9 +33,9 @@
 | Logs (API) | `docker compose logs -f api` |
 | Logs (monitor) | `docker compose logs -f monitor` |
 | DB shell | `docker compose exec db psql -U candles candle_collector` |
-| Apply migration | `docker compose exec db psql -U candles candle_collector < db/migrations/004-compression-retention.sql` |
+| Migrations | `./scripts/migrate.sh --status` shows what is applied and pending; `./scripts/migrate.sh` applies the pending ones in order, each in one transaction with its `schema_migrations` row. A new schema change is a new `db/migrations/NNN-<name>.sql`; `db/init.sql` is frozen at the 001–013 baseline |
 | Backup DB (local dump) | `./scripts/backup.sh` |
-| Restore DB (local dump) | Stop the collectors, api and monitor, then `./scripts/restore.sh backups/<file>.dump`. It recreates `candle_collector` from the dump with the Disaster recovery steps: a fresh database, a strict restore, and migration 013 before the scheduler restarts |
+| Restore DB (local dump) | Stop the collectors, api and monitor, then `./scripts/restore.sh backups/<file>.dump`. It recreates `candle_collector` from the dump with the Disaster recovery steps: a fresh database, a strict restore, and migration 013 before the scheduler restarts. Then `./scripts/migrate.sh --status` (`--adopt` first for a dump taken before the ledger) and `./scripts/migrate.sh`, before starting the services again |
 | Verify compression | `./scripts/verify-compression.sh` |
 
 ## API Queries
@@ -70,7 +70,7 @@
 ## Integration smoke test
 
 ```bash
-docker compose up -d && sleep 320 && curl -s "http://localhost:8000/candles?exchange=hyperliquid&asset_id=BTC&timeframe=5m&limit=5" | python3 -m json.tool
+docker compose up -d db && ./scripts/migrate.sh && docker compose up -d && sleep 320 && curl -s "http://localhost:8000/candles?exchange=hyperliquid&asset_id=BTC&timeframe=5m&limit=5" | python3 -m json.tool
 ```
 
 Pass: returns ≥1 candle with all OHLCV fields populated, correct exchange/symbol/timeframe.
@@ -98,7 +98,7 @@ Pass: returns ≥1 candle with all OHLCV fields populated, correct exchange/symb
 
 ### Code updates
 
-- Code updates never touch the db container. `git pull`, then `build` only the services whose code or config changed, including the profile one-shots `discovery` and `liquidations-hl` (they bake in `collector/` and `exchanges.yaml`), then `up -d --no-deps <svc…>`.
+- Code updates never touch the db container. `git pull`, then `./scripts/migrate.sh --status`: apply a pending migration (`./scripts/migrate.sh`) at the point its ROLLOUT note says, before or after the rebuild. Then `build` only the services whose code or config changed, including the profile one-shots `discovery` and `liquidations-hl` (they bake in `collector/` and `exchanges.yaml`), then `up -d --no-deps <svc…>`.
 - **Releases.** `pyproject.toml` holds the release version, and the api reports it on `/openapi.json`. A deploy that rebuilds images bumps it (minor for a feature, patch for a fix) and tags the deployed commit `vX.Y.Z`. Every release rebuilds and recreates `api` too, collector-only ones included, since the api image carries the version. After the deploy, `curl -s localhost:8000/openapi.json | jq -r .info.version` on the server prints the tag's version.
 - Deploy mid-interval (e.g. xx:20 – xx:40), away from the 00/08/16 UTC funding settlements.
 - Restart the HyperLiquid collector only outside a repair run: not while `hl-candles-repair` is running (`docker ps`), not within 1 min of its exit, and not from 06:15 until the 06:30 cron run exits. Its startup funding seed (one 100 h `fundingHistory` call per pair, ~25 weight each, ~10 min for ~170 pairs) shares HL's per-IP weight budget with the repair.
@@ -233,6 +233,7 @@ db_sql() { "${DC[@]}" exec -T db psql -X -v ON_ERROR_STOP=1 -U candles "$@"; }
    - `"${DC[@]}" exec -T db pg_restore -U candles -d candle_collector --exit-on-error /mnt/pgvol/restore/candle_collector.dump`
    - `db_sql -d candle_collector < db/migrations/013-keep-all-history.sql`, then check that `SELECT count(*) FROM timescaledb_information.jobs WHERE proc_name = 'policy_retention'` returns 0. A snapshot taken before 013 brings its retention jobs back, and `post_restore` restarts the scheduler that runs them.
    - `db_sql -d candle_collector -c 'SELECT timescaledb_post_restore()'`
+   - `./scripts/migrate.sh --status`. A snapshot taken before the ledger reports `pre-ledger`: run `./scripts/migrate.sh --adopt`, which records 001–013 only if `db/baseline-check.sql` passes, and stop to reconcile any check it names. Then `./scripts/migrate.sh` applies anything newer, before any consumer starts.
 7. **Bring it back.**
    - Build and start the rest with `"${DC[@]}" build` and `up -d --no-deps <services>`.
    - Run `deploy/install-cron.sh`.

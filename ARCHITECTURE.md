@@ -101,6 +101,18 @@ FastAPI read-only REST API. Queries PostgreSQL, serves downstream consumers. Can
 
 Schema migrations and TimescaleDB hypertable setup. Candles hypertable partitioned on timestamp, 1-week chunks; `candles_1m` (1m only) on the `ts_1m` volume tablespace, 1-day chunks (migration 010, operator-applied). Compression (>7d) on every hypertable, and no retention: all history is kept (migration 013 removed the old policies, and no file in `db/` adds one). `discovery_volumes` (migration 012) is a plain table with no policies.
 
+**One schema authority.** `db/init.sql` is the baseline: the schema after migrations 001–013, without tablespace placement, frozen (a test pins its hash). Every later change is a new `db/migrations/NNN-<name>.sql`.
+
+- **The ledger.** `public.schema_migrations (version, name, applied_at)` holds one row per applied migration. `db/ledger.sql` creates it with the 001–013 baseline rows in one transaction, so a ledger is either absent or complete. initdb runs it after `init.sql`. A database built before the ledger gets it from `scripts/migrate.sh --adopt`, which first requires every row of the read-only `db/baseline-check.sql` to pass.
+- **Applying.** `scripts/migrations-lib.sh` owns the operations, against a caller-supplied `migrations_psql`, with `ON_ERROR_STOP` on every call:
+  - check the files: `NNN-<name>.sql`, unique versions, no transaction control;
+  - read the state: adopted, pre-ledger or empty;
+  - list pending, refusing an empty ledger or a pending file older than the newest applied one;
+  - apply each pending file in order, in one transaction (`psql -1 -f -`) together with its ledger `INSERT`, stopping at the first failure;
+  - adopt.
+- **The CLI.** `scripts/migrate.sh` runs the lib through the prod compose override's `db` container, after waiting for TCP readiness (the initdb server is socket-only). Callers start `db`, run it, then start the consumers.
+- **Outside the ledger.** DDL that can't run in a transaction, such as `CREATE TABLESPACE` (010) or `CREATE INDEX CONCURRENTLY`, is a runbook step. `tests/integration/check_migrations.sh` runs the lib against a real TimescaleDB.
+
 ### Offsite backup (scripts/backup-offsite.sh, host cron)
 
 A nightly host-cron job at 05:30 UTC, outside compose, that does nothing until `/etc/candle-collector/restic.env` exists.
