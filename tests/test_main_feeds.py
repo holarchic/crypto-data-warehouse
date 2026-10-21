@@ -155,6 +155,7 @@ def harness(monkeypatch):
         event.set()
     for t in threads:
         t.join(DEADLINE_S)
+        assert not t.is_alive(), f"test thread {t.name} outlived its test"
 
 
 def _raises():
