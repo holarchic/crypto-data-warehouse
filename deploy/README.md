@@ -91,14 +91,14 @@ Pass: returns ≥1 candle with all OHLCV fields populated, correct exchange/symb
 | Code update | `git pull` → `./scripts/migrate.sh --status` (apply where the migration's ROLLOUT says) → `build <changed svcs>` → `up -d --no-deps <svcs>` (see Code updates below) |
 | Fresh install / full redeploy | `./deploy/deploy.sh` — pulls `latest-pg16` + stack-wide `up -d`; can recreate the db |
 | Server setup | `./deploy/setup.sh [CLIENT_IP...]` |
-| Run discovery (prod) | `docker compose -f docker-compose.yml -f docker-compose.prod.yml --profile discovery run --rm discovery` |
+| Run discovery (prod) | `docker compose -f docker-compose.yml -f docker-compose.prod.yml --profile discovery run --rm --no-deps discovery` |
 | Offsite backup now | `./scripts/backup-offsite.sh` (see Offsite backups) |
 | List offsite snapshots | `(. scripts/offsite-lib.sh; restic_run snapshots)` |
 | HL 1m repair, manual window | `docker compose -f docker-compose.yml -f docker-compose.prod.yml --profile hl-candles-repair run --rm --no-deps hl-candles-repair python -m hl_candles_repair --hours N` (1–72; moves the cursor only when it covers the required range) |
 
 ### Code updates
 
-- Code updates never touch the db container. `git pull`, then `./scripts/migrate.sh --status`: apply a pending migration (`./scripts/migrate.sh`) at the point its ROLLOUT note says, before or after the rebuild. Then `build` only the services whose code or config changed, including the profile one-shots `discovery` and `liquidations-hl` (they bake in `collector/` and `exchanges.yaml`), then `up -d --no-deps <svc…>`.
+- Code updates never touch the db container. `git pull`, then `./scripts/migrate.sh --status`: apply a pending migration (`./scripts/migrate.sh`) at the point its ROLLOUT note says, before or after the rebuild. Then `build` only the services whose code or config changed, including the profile one-shots `discovery` and `liquidations-hl` (they bake in `collector/` and `exchanges.yaml`), then `up -d --no-deps <svc…>`. A one-shot `run` on the server takes `--no-deps` too: without it, `run` recreates the db when its service definition changed since the db started.
 - **Releases.** `pyproject.toml` holds the release version, and the api reports it on `/openapi.json`. A deploy that rebuilds images bumps it (minor for a feature, patch for a fix) and tags the deployed commit `vX.Y.Z`. Every release rebuilds and recreates `api` too, collector-only ones included, since the api image carries the version. After the deploy, `curl -s localhost:8000/openapi.json | jq -r .info.version` on the server prints the tag's version.
 - Deploy mid-interval (e.g. xx:20 – xx:40), away from the 00/08/16 UTC funding settlements.
 - Restart the HyperLiquid collector only outside a repair run: not while `hl-candles-repair` is running (`docker ps`), not within 1 min of its exit, and not from 06:15 until the 06:30 cron run exits. Its startup funding seed (one 100 h `fundingHistory` call per pair, ~25 weight each, ~10 min for ~170 pairs) shares HL's per-IP weight budget with the repair.

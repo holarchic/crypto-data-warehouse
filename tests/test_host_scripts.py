@@ -173,6 +173,7 @@ def test_install_cron_into_an_empty_crontab(cron_host):
     compose_jobs = [job for job in jobs(lines) if "docker compose" in job]
     assert len(compose_jobs) == 3
     assert all("-f docker-compose.yml -f docker-compose.prod.yml" in job for job in compose_jobs)
+    assert all(" run --rm --no-deps " in job for job in compose_jobs)
 
 
 def test_install_cron_replaces_legacy_entries_and_keeps_foreign_ones(cron_host):
