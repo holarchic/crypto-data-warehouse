@@ -53,7 +53,7 @@ CROSS JOIN LATERAL (SELECT key AS timeframe, value::int AS interval_s FROM jsonb
 JOIN collection_status cs ON cs.timeframe = tf.timeframe AND cs.active;
 
 -- The derivatives universe: the active 5m rows, as the funding and OI loops read it
--- (query_active_pairs(conn, exchange, "5m")).
+-- (status.active_instruments, at UNIVERSE_TIMEFRAME).
 CREATE TEMP TABLE sc_derivatives AS
 SELECT exchange, symbol, discovered_at FROM collection_status WHERE active AND timeframe = '5m';
 
