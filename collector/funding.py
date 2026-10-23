@@ -154,6 +154,17 @@ def _parse(venue: Venue, record: dict) -> tuple[int, float]:
     return raw_ts, rate
 
 
+def _records(venue: Venue, response) -> list:
+    """The response's record list, or MalformedRecord when the response isn't shaped as expected."""
+    try:
+        records = venue.records(response)
+    except (KeyError, TypeError) as exc:
+        raise MalformedRecord(f"unexpected response {response!r:.200}: {exc!r}") from exc
+    if not isinstance(records, list):
+        raise MalformedRecord(f"unexpected response {response!r:.200}")
+    return records
+
+
 def _truncate(raw_ts: int) -> int:
     return raw_ts // 1000 * 1000
 
@@ -171,8 +182,8 @@ def fetch_symbol_history(exchange, venue_name: str, market: dict, since_ms: int,
     start = since_ms
     while start <= until_ms:
         end = min(start + window_ms - 1, until_ms)
-        page = [_parse(venue, r) for r in venue.records(call(getattr(exchange, venue.method),
-                                                              {**market, **venue.window_params(start, end)}))]
+        response = call(getattr(exchange, venue.method), {**market, **venue.window_params(start, end)})
+        page = [_parse(venue, r) for r in _records(venue, response)]
         reaches_start = not venue.lower_bounded and page and min(ts for ts, _ in page) <= start
         if len(page) >= venue.page_cap and not reaches_start:
             raise FullPage(f"{venue_name} {market}: {len(page)} records in {start}..{end}")
@@ -196,7 +207,7 @@ def fetch_binance_all(exchange, since_ms: int, call: Callable) -> dict[str, list
     while True:
         response = call(exchange.fapiPublicGetFundingRate, {"startTime": start, "limit": venue.page_cap})
         page = []
-        for record in response:
+        for record in _records(venue, response):
             symbol = record.get("symbol")
             if not symbol:
                 raise MalformedRecord(f"{record!r}: no symbol")
