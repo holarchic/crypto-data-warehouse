@@ -73,8 +73,8 @@ Funding, OI and liquidations have no fixed row count per window. A response of e
 
 ## Funding
 
-- **`timestamp`** is the settlement time. **`rate`** is the rate paid at that settlement, as a fraction (`0.0001` = 0.01 %). **`predicted_rate`** is the venue's estimate for the next one, where it gives one.
-- **`interval_hours`** is the interval the collector assumes for the venue: 1 for HyperLiquid, 8 elsewhere. It is not a per-symbol schedule. Before annualising, or before treating a symbol's rows as one per settlement, check the venue's schedule for that symbol: some venues settle some symbols more often.
+- **One row per settlement,** read from the venue's own funding history. **`timestamp`** is the settlement time, truncated to the second. **`rate`** is the rate the venue settled at that time, as a fraction (`0.0001` = 0.01 %). **`predicted_rate`** is always null.
+- **`interval_hours`** is the hours since the symbol's previous settlement, so it is the period the rate covers. Symbols on one venue settle at different intervals (Binance has 8 h, 4 h and 1 h symbols), and a symbol's interval can change. Annualise each row by its own `interval_hours`. It is null when no earlier settlement is known.
 - **In a backtest,** a funding payment is known at its settlement time. Apply it to positions open across that instant, never earlier.
 
 ## Open interest

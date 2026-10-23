@@ -14,11 +14,13 @@ The REST candle feed is `candles.py` (`candle_loop` → `_collect_pair` → `fet
 
 `candle_loop` calls `maybe_reload_markets()` (in `db.py`) at the top of each cycle. The helper is age-gated (`MARKETS_RELOAD_INTERVAL_S`, default 86400s) and lock-guarded so the per-timeframe threads sharing one ccxt `exchange` reload at most once per interval. Without this, symbols added by daily discovery stay invisible to the long-running collector container.
 
-**DB-restart resilience:** every loop owns one long-lived connection and reconnects at the top of each cycle on `if conn.closed:` (`closed` == `pgconn.status == BAD`; psycopg detects a server-dropped socket only when the conn is next exercised). The hazard is the error handler itself: a `conn.rollback()` or a status/insert write on a just-dropped connection re-raises `OperationalError`, and unhandled that kills the loop thread (root cause of two total outages). So every error-path rollback goes through `db.safe_rollback` (swallows), and the only DB *writes* reachable on a restart raise — `funding._poll_bulk`'s bulk insert and the candle per-pair status write (`candles._record_pair_error`) — are individually wrapped; a live-conn pre-check is not protection because the write itself can raise. With no exception able to escape a loop body, the next cycle's `if conn.closed:` reconnects and collection self-heals within ~1 cycle. `ws.py` already had this shape (`_ensure_conn` + a swallowing `_guarded_rollback`).
+**DB-restart resilience:** every loop owns one long-lived connection and reconnects at the top of each cycle on `if conn.closed:` (`closed` == `pgconn.status == BAD`; psycopg detects a server-dropped socket only when the conn is next exercised). The hazard is the error handler itself: a `conn.rollback()` or a status/insert write on a just-dropped connection re-raises `OperationalError`, and unhandled that kills the loop thread (root cause of two total outages). So every error-path rollback goes through `db.safe_rollback` (swallows), and the only DB *writes* reachable on a restart raise — the funding poll's insert and the candle per-pair status write (`candles._record_pair_error`) — are individually wrapped; a live-conn pre-check is not protection because the write itself can raise. With no exception able to escape a loop body, the next cycle's `if conn.closed:` reconnects and collection self-heals within ~1 cycle. `ws.py` already had this shape (`_ensure_conn` + a swallowing `_guarded_rollback`).
 
 The funding, OI, premium, liquidation-WS, and HL candle-WS threads upsert a per-loop **liveness heartbeat** (`status.upsert_loop_heartbeat`): a sentinel `collection_status` row with `symbol = "*"` and a pseudo-timeframe from `config.LOOP_INTERVALS` (`funding` / `oi` / `liq_ws` / `premium` / `candle_ws`; the daily HL 1m repair's `candle_repair` row is written on success through `status.upsert_status_success`, which also carries its cursor). The poll loops fire it each cycle; the WS loops fire it on a ~60 s connection timer while the socket is up (a quiet feed is healthy). These threads write no per-pair candle status, so without the heartbeat a silently-dead loop produces no staleness footprint; the monitor flags the sentinel row when it goes stale.
 
 **Status contract (`status.py`):** every `collection_status` helper runs inside the caller's transaction and never commits or rolls back. The candle loop commits a pair's bars and its cursor (`upsert_status_success`) as one transaction, so the cursor never runs ahead of or behind its bars; the error record, each loop's heartbeat wrapper and the repair's cursor advance commit beside their call. A venue's instrument universe has one reader, `active_instruments(conn, exchange)`, which returns frozen `Instrument` records (symbol, asset_id, native_symbol, market_type) from the venue's active rows at `UNIVERSE_TIMEFRAME` (5m, the one timeframe every venue polls). Funding, OI, premium, the WS feeds and the HL 1m repair collect that universe; `query_active_pairs` is the candle loop's per-timeframe read, which also carries each pair's cursor.
+
+**Funding (`funding.py`).** Each hour every venue's funding loop stores settled history: the venue's funding-history endpoint, read from each active symbol's newest stored settlement (`stored_cursors`, the last 7 days; a symbol with none starts 100 h back). Binance answers all symbols in one request, so it walks pages from the oldest cursor (`fetch_binance_all`, paging on the raw millisecond time); Bybit, OKX, HyperLiquid and dYdX are read per symbol in windows sized under each venue's page cap (`fetch_symbol_history`; HL's 18 h windows keep a call at 21 weight). `VENUES` holds each endpoint's ccxt raw method, request bounds and fields, keyed by exchange name: records are parsed from the raw response, because ccxt's parsed history drops a record with no timestamp. A malformed record, an unexpected response or a full page fails that symbol for the cycle (`FundingFetchError`); nothing is written and its cursor stays. A row's time is the venue's settlement time truncated to the second, its rate the settled rate (OKX `realizedRate`), and `interval_hours` the gap to the symbol's previous settlement (`funding_rows`). The insert does nothing on conflict; `predicted_rate` is always NULL.
 
 The OI loop (`oi.py`) dispatches each `has_oi` exchange to one of **three strategies** (`oi_loop`; an unrecognized OI venue raises rather than defaulting), all cadences from `ExchangeConfig` (`oi_poll_interval_s` / `oi_settlement_window_s` / `oi_baseline_interval_s`):
 
@@ -76,6 +78,15 @@ A one-shot (`python -m hl_candles_repair`, the profile-gated `hl-candles-repair`
 - **Completeness.** REST answers every listed minute, so each slice's raw answer must run without a hole to its end (a leading gap is the coin's listing; an empty older slice resolves when a later one shows the listing), and every stored minute must have a REST traded bar. A malformed bar writes nothing for its slice.
 - **Write.** Traded bars only (`n > 0`, matching the WS), through an upsert whose `IS DISTINCT FROM` guard skips unchanged rows and whose `RETURNING (xmax = 0)` counts inserts (drops) apart from updates (unclosed bars); every result set is read.
 - **Outcome.** The cursor advances (`status.upsert_status_success`, GREATEST) only when every coin and slice is complete. A cap that cuts into unrepaired history alerts through `monitor.send_webhook`, and only a delivered alert lets the cursor rebase past it. A Postgres advisory lock keeps one run at a time and is re-taken after any reconnect. The monitor pages on the sentinel 36 h after the last success.
+
+### collector/funding_repair.py — funding rebuild from venue history (T-035)
+
+A one-shot run by hand per venue (`python -m funding_repair --exchange X --until T [--apply] [--after S]`, the profile-gated `funding-repair` compose service) that compares every stored symbol's funding with the venue's settled history and, with `--apply`, replaces it.
+
+- **Fetch.** `funding.fetch_symbol_history` from 24 h before the symbol's first stored row (so that row's interval has a predecessor) through `until + 999 ms`, HL in 400 h windows; `funding.funding_rows` derives the rows, kept from the first stored second through second `until`.
+- **Report.** Per symbol and venue total: `equal`, `differ` (rate, interval or a non-canonical stored time), `missing`, `unmatched`, `pre_depth` (older than the venue's history), `interval_unverified` (the oldest returned settlement has no fetched predecessor), and `tail_unmatched` (stored rows after `until` against the venue, never written). `unfetchable` (no ccxt market or no history) and `failed` (any fetch error) leave the symbol alone; a failure makes the run exit 1.
+- **Apply.** One transaction per symbol: delete its rows below `until + 1 s`, then an upsert (`ON CONFLICT … DO UPDATE`) that wins any interleaving with the collector's `DO NOTHING` insert. A database error aborts the run; `--after` resumes it.
+- **Pacing.** `Pacer` sleeps `REPAIR_SPACING_S` after each request (Binance 0.75 s, under its 500 per 5 min; HL 60 s). On HL, `HlGate` holds every call, the markets load included, while the HL candle repair holds its advisory lock or during 06:10–06:35 UTC, and for 60 s after either clears or the run starts. Its own advisory lock keeps one run at a time.
 
 ### collector/discovery.py — daily universe selection
 
@@ -148,8 +159,8 @@ No other script runs `docker compose`, except `install-cron.sh`, whose crontab t
 ### Stability scorecard (scripts/stability-scorecard.sh)
 
 An operator report for the v0.8 gate; read-only.
-- **The shell part** reads the deployed config's metadata from the monitor container (`compose exec monitor python`), compares `config.py`, `exchanges.yaml` and `funding.py` hashes across the monitor and every running collector, and times 50 full 500-row `/candles` requests.
-- **The database part** is `scripts/stability-scorecard.sql`, run through `DB_TOOL` with `days`, `meta` and `as_of` as psql variables. It builds one temp row per (section, pair) with the slot length and expected slot range, then counts the stored slots in each range: candle rows, and the distinct funding and OI slots. It aggregates per venue with a cap at expected, and ends in one `SCORECARD-DB` marker line.
+- **The shell part** reads the deployed config's metadata from the monitor container (`compose exec monitor python`), compares `config.py` and `exchanges.yaml` hashes across the monitor and every running collector, and times 50 full 500-row `/candles` requests.
+- **The database part** is `scripts/stability-scorecard.sql`, run through `DB_TOOL` with `days`, `meta` and `as_of` as psql variables. It builds one temp row per (section, pair) with the slot length and expected slot range, then counts the stored slots in each range: candle rows, and the distinct funding and OI slots. A funding pair's slot is its stored `interval_hours`; a pair whose interval changed inside the window is reported as not measured. It aggregates per venue with a cap at expected, and ends in one `SCORECARD-DB` marker line.
 - **Tests:** `tests/integration/check_scorecard.py` plants single faults on TimescaleDB; `tests/test_scorecard_script.py` drives the shell with stub docker and curl.
 
 ### Offsite backup (scripts/backup-offsite.sh, host cron)
@@ -238,10 +249,10 @@ PK: `(exchange, symbol, timestamp)` — 1-month chunks.
 | exchange | TEXT NOT NULL | |
 | asset_id | TEXT NOT NULL | Canonical: `BTC` |
 | symbol | TEXT NOT NULL | ccxt-normalized |
-| timestamp | TIMESTAMPTZ NOT NULL | Funding settlement time |
-| rate | DOUBLE PRECISION | Funding rate |
-| predicted_rate | DOUBLE PRECISION | Next predicted rate (nullable) |
-| interval_hours | INTEGER | 1 (HL), 8 (others) |
+| timestamp | TIMESTAMPTZ NOT NULL | Settlement time as the venue records it, truncated to the second |
+| rate | DOUBLE PRECISION | The settled rate |
+| predicted_rate | DOUBLE PRECISION | Always NULL |
+| interval_hours | INTEGER | Hours since the symbol's previous settlement; NULL when no predecessor is known |
 
 ### `open_interest` hypertable
 

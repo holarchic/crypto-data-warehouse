@@ -68,6 +68,7 @@ Which assets:
 - **Bars are stored once closed** and never change. HyperLiquid 1m is the exception: it arrives over WebSocket, so the latest bar updates until it closes. A daily job then replaces each bar with HyperLiquid's own closed value, since the stream can stop short of a minute's last trades or drop minutes.
 - **Gaps:** short outages backfill on the next poll. `GET /status/gaps` lists any stretch where bars are missing, with the count.
 - **HyperLiquid 1m** history only reaches back about 5,000 bars (about 3.5 days), so the daily repair has to run inside that window. A gap older than that can't be filled.
+- **Funding** is one row per settlement from each exchange's own funding history: the settled rate, at the settlement time. `interval_hours` is the gap to the symbol's previous settlement, since symbols on one exchange settle every 1, 4 or 8 hours.
 - **Liquidations:** Binance and Bybit come from live streams, which start when you start collecting and have no history. HyperLiquid's come from its S3 archive, pulled once a day.
 - **`quote_volume` and `trades`** are `null` where the exchange doesn't provide them.
 - **Symbols** use ccxt format (`BTC/USDT:USDT`); `asset_id` (`BTC`) joins them across exchanges.
