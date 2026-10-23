@@ -167,8 +167,8 @@ def check_locks(dsn, conn):
         with candle.cursor() as cur:
             cur.execute("SELECT pg_try_advisory_lock(%s)", (hl_candles_repair.LOCK_KEY,))
         gate = fr.HlGate(conn, clock=lambda: 1_792_756_800.0)  # 2026-10-23 12:00 UTC, outside the window
-        check("HL gate sees the candle repair's lock", gate._blocked())
-    check("and sees it released", not gate._blocked())
+        check("HL gate sees the candle repair's lock", gate.blocked())
+    check("and sees it released", not gate.blocked())
 
 
 def check_csv_rollback(conn):
@@ -181,10 +181,10 @@ def check_csv_rollback(conn):
                                                  "timestamp": (until + 8 * H) / 1000, "rate": 9e-5, "interval_hours": 4})
     conn.commit()
     export = ("COPY (SELECT * FROM funding_rates WHERE exchange = 'binance' AND timestamp < to_timestamp(%s) "
-              "ORDER BY symbol, timestamp) TO STDOUT WITH CSV" % ((until + 1000) / 1000))
+              "ORDER BY symbol, timestamp) TO STDOUT WITH CSV")
 
     def dump():
-        with conn.cursor() as cur, cur.copy(export) as copy:
+        with conn.cursor() as cur, cur.copy(export, ((until + 1000) / 1000,)) as copy:
             data = b"".join(bytes(chunk) for chunk in copy)
         conn.commit()
         return data

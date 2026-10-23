@@ -308,14 +308,27 @@ def test_per_symbol_poll_starts_one_second_after_the_cursor(monkeypatch):
 
 def test_a_failing_symbol_writes_nothing_and_the_next_still_polls(monkeypatch):
     now = T0 + 3 * HOUR_MS
-    fake = FakeVenue("hyperliquid", hourly(3))
-    markets = {"BTC/USDT:USDT": {"baseName": "BAD"}, "ETH/USDT:USDT": {"baseName": "ETH"}}
-    original = fake._hyperliquid
-    fake._hyperliquid = lambda p: [{"coin": "BAD", "time": T0}] if p["coin"] == "BAD" else original(p)
+    fake = FakeVenue("hyperliquid", hourly(3), override={0: [{"coin": "BTC", "time": T0}]})  # BTC first, no rate
+    markets = {"BTC/USDT:USDT": {"baseName": "BTC"}, "ETH/USDT:USDT": {"baseName": "ETH"}}
     inserted, conn = poll(monkeypatch, "hyperliquid", fake, [BTC, ETH], {}, now, markets)
     assert {r["symbol"] for r in conn.inserted()} == {"ETH/USDT:USDT"}
     assert inserted == 3
     assert "rollback" in conn.kinds()
+
+
+def test_instruments_without_an_asset_id_are_skipped(monkeypatch):
+    fake = FakeVenue("hyperliquid", hourly(2))
+    markets = {"BTC/USDT:USDT": {"baseName": "BTC"}, "XRP/USDT:USDT": {"baseName": "XRP"}}
+    _, conn = poll(monkeypatch, "hyperliquid", fake, [BTC, instrument("XRP/USDT:USDT", None)], {}, T0 + 2 * HOUR_MS, markets)
+    assert {r["symbol"] for r in conn.inserted()} == {"BTC/USDT:USDT"}
+    assert all(r["coin"] == "BTC" for r in fake.requests)
+
+
+def test_each_request_asks_for_the_page_size_the_full_page_check_uses(monkeypatch):
+    okx = dataclasses.replace(funding.VENUES["okx"], page_cap=40, window_h=30)
+    monkeypatch.setattr(funding, "VENUES", MappingProxyType({**funding.VENUES, "okx": okx}))
+    _, fake = fetch("okx", hourly(30), T0, T0 + 29 * HOUR_MS)
+    assert fake.requests[0]["limit"] == "40"
 
 
 def test_no_path_reads_the_current_funding_endpoint():

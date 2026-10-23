@@ -173,7 +173,8 @@ class HlGate:
         self.conn, self.clock, self.sleep = conn, clock, sleep
         self.cooldown_until = clock() + HL_COOLDOWN_S
 
-    def _blocked(self) -> bool:
+    def blocked(self) -> bool:
+        """True while an HL call could share a minute with the candle repair's."""
         now = datetime.fromtimestamp(self.clock(), UTC)
         if HL_QUIET_START <= (now.hour, now.minute) < HL_QUIET_END:
             return True
@@ -185,7 +186,7 @@ class HlGate:
 
     def wait(self) -> None:
         while True:
-            if self._blocked():
+            if self.blocked():
                 self.cooldown_until = float("inf")
                 self.sleep(HL_BLOCKED_POLL_S)
                 continue

@@ -115,7 +115,7 @@ class Venue:
     method: str  # ccxt's raw method for the endpoint
     page_cap: int
     window_h: int
-    window_params: Callable[[int, int], dict]  # (start_ms, end_ms), both inclusive
+    window_params: Callable[[int, int, int], dict]  # (start_ms, end_ms, page_cap); both bounds inclusive
     records: Callable[[object], list]
     time_field: str
     rate_field: str
@@ -127,33 +127,33 @@ class Venue:
 VENUES = MappingProxyType({
     "binance": Venue(
         method="fapiPublicGetFundingRate", page_cap=1000, window_h=900,
-        window_params=lambda start, end: {"startTime": start, "endTime": end, "limit": 1000},
+        window_params=lambda start, end, cap: {"startTime": start, "endTime": end, "limit": cap},
         records=lambda resp: resp, time_field="fundingTime", rate_field="fundingRate",
     ),
     "bybit": Venue(
         method="publicGetV5MarketFundingHistory", page_cap=200, window_h=150,
-        window_params=lambda start, end: {"startTime": start, "endTime": end, "limit": 200},
+        window_params=lambda start, end, cap: {"startTime": start, "endTime": end, "limit": cap},
         records=lambda resp: resp["result"]["list"], time_field="fundingRateTimestamp", rate_field="fundingRate",
     ),
     # OKX's `before`/`after` bounds are exclusive. `realizedRate` is the settled rate; the record's
     # `fundingRate` is the prediction and is never read.
     "okx": Venue(
         method="publicGetPublicFundingRateHistory", page_cap=100, window_h=80,
-        window_params=lambda start, end: {"before": start - 1, "after": end + 1, "limit": 100},
+        window_params=lambda start, end, cap: {"before": start - 1, "after": end + 1, "limit": cap},
         records=lambda resp: resp["data"], time_field="fundingTime", rate_field="realizedRate",
     ),
     # HL has no page parameter: the window bounds the response and so its weight (20, plus 1 per 20
     # items: an 18 h window weighs 21). 500 items is HL's cap on a time-range response.
     "hyperliquid": Venue(
         method="publicPostInfo", page_cap=500, window_h=18,
-        window_params=lambda start, end: {"type": "fundingHistory", "startTime": start, "endTime": end},
+        window_params=lambda start, end, cap: {"type": "fundingHistory", "startTime": start, "endTime": end},
         records=lambda resp: resp, time_field="time", rate_field="fundingRate",
     ),
     # dYdX takes only an upper bound and answers the newest `limit` rows at or before it, so a full
     # page is complete once it reaches back to the window's start.
     "dydx": Venue(
         method="indexerGetHistoricalFundingMarket", page_cap=100, window_h=80,
-        window_params=lambda start, end: {"effectiveBeforeOrAt": _ms_to_iso(end), "limit": 100},
+        window_params=lambda start, end, cap: {"effectiveBeforeOrAt": _ms_to_iso(end), "limit": cap},
         records=lambda resp: resp["historicalFunding"], time_field="effectiveAt", rate_field="rate",
         parse_time=_iso_to_ms, lower_bounded=False,
     ),
@@ -216,7 +216,7 @@ def fetch_symbol_history(exchange, venue_name: str, market: dict, since_ms: int,
     start = since_ms
     while start <= until_ms:
         end = min(start + window_ms - 1, until_ms)
-        response = call(getattr(exchange, venue.method), {**market, **venue.window_params(start, end)})
+        response = call(getattr(exchange, venue.method), {**market, **venue.window_params(start, end, venue.page_cap)})
         page = [_parse(venue, r) for r in _records(venue, response)]
         reaches_start = not venue.lower_bounded and page and min(r.raw_ts for r in page) <= start
         if len(page) >= venue.page_cap and not reaches_start:
@@ -249,7 +249,7 @@ def fetch_binance_all(exchange, since_ms: int, call: Callable) -> dict[str, list
     seen: dict[str, dict[int, Settlement]] = {}
     start = since_ms
     while True:
-        response = call(exchange.fapiPublicGetFundingRate, {"startTime": start, "limit": venue.page_cap})
+        response = call(getattr(exchange, venue.method), {"startTime": start, "limit": venue.page_cap})
         page = [_parse(venue, record)._replace(symbol=_binance_symbol(record)) for record in _records(venue, response)]
         for r in page:
             second = truncate_to_second(r.raw_ts)
@@ -355,11 +355,14 @@ def poll_settled(exchange, config: ExchangeConfig, conn, instruments: list[Instr
     def call(fn, params):
         return paced_call(rate_limiter, exchange, BINANCE_FUNDING_HISTORY_WEIGHT, fn, params)
 
+    named = [i for i in instruments if i.asset_id]  # asset_id is NOT NULL in funding_rates
+    if len(named) < len(instruments):
+        log.warning("[%s/funding] Skipping %d instrument(s) with no asset_id", config.name, len(instruments) - len(named))
     cursors = stored_cursors(conn, config.name)
     conn.commit()  # no read transaction stays open across the network walk
     now_ms = int(time.time() * 1000)
     poll = _poll_binance if config.name == "binance" else _poll_per_symbol
-    return poll(exchange, config, conn, instruments, cursors, now_ms, call)
+    return poll(exchange, config, conn, named, cursors, now_ms, call)
 
 
 def _sleep_until_next_hour():
