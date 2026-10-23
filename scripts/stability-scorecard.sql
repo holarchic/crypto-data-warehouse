@@ -5,11 +5,12 @@
 --
 --   days   the window, in days back from the reference time
 --   meta   JSON from the deployed config: intervals, volume_threshold_usd, funding_exchanges,
---          oi_exchanges, funding_interval_hours
+--          oi_exchanges
 --   as_of  the reference time (ISO-8601); empty means now(). One clock for the whole run.
 --
 -- A pair's window opens at the later of the window start and its discovered_at, rounded up to a
--- slot. A slot t is expected once it should be stored: t + slot + lag <= the reference time.
+-- slot. A candle or OI slot t is expected once it should be stored: t + slot + lag <= the reference
+-- time; a funding slot is a settlement, so it is expected once t + lag <= the reference time.
 
 \set ON_ERROR_STOP on
 \set QUIET on
@@ -56,23 +57,29 @@ JOIN collection_status cs ON cs.timeframe = tf.timeframe AND cs.active;
 CREATE TEMP TABLE sc_derivatives AS
 SELECT exchange, symbol, discovered_at FROM collection_status WHERE active AND timeframe = '5m';
 
--- Funding: the slot is the pair's newest stored interval_hours in the window, else the collector's
--- assumed interval for the venue. A slot is due two hours after it ends (the loop polls hourly).
-INSERT INTO sc_expect
-SELECT 'funding', d.exchange, NULL, d.symbol, NULL, h.slot_s,
-       pg_temp.slot_ceil(greatest(r.window_start, coalesce(d.discovered_at, r.window_start)), h.slot_s),
-       pg_temp.slot_floor(r.t0 - make_interval(secs => h.slot_s) - interval '2 hours', h.slot_s)
-           + make_interval(secs => h.slot_s)
+-- Funding: the slot is the pair's stored interval_hours (the gap to its previous settlement). A
+-- pair whose interval changed inside the window has no single slot, so it is not measured (counted
+-- apart). A pair with no row in the window has captured nothing: its slots are taken at 8 h, and any
+-- interval gives 0 %. A settlement is due two hours after it happens (the loop polls hourly).
+CREATE TEMP TABLE sc_funding_pairs AS
+SELECT d.exchange, d.symbol, d.discovered_at, i.intervals, i.newest
 FROM sc_run r
 JOIN sc_derivatives d ON r.meta -> 'funding_exchanges' ? d.exchange
 CROSS JOIN LATERAL (
-    SELECT 3600 * coalesce(
-        (SELECT f.interval_hours FROM funding_rates f
-         WHERE f.exchange = d.exchange AND f.symbol = d.symbol
-           AND f.timestamp >= :'window_start'::timestamptz AND f.timestamp < :'t0'::timestamptz
-         ORDER BY f.timestamp DESC LIMIT 1),
-        (r.meta -> 'funding_interval_hours' ->> d.exchange)::int) AS slot_s
-) h;
+    SELECT count(DISTINCT f.interval_hours) AS intervals,
+           (array_agg(f.interval_hours ORDER BY f.timestamp DESC) FILTER (WHERE f.interval_hours IS NOT NULL))[1] AS newest
+    FROM funding_rates f
+    WHERE f.exchange = d.exchange AND f.symbol = d.symbol
+      AND f.timestamp >= :'window_start'::timestamptz AND f.timestamp < :'t0'::timestamptz
+) i;
+
+INSERT INTO sc_expect
+SELECT 'funding', p.exchange, NULL, p.symbol, NULL, h.slot_s,
+       pg_temp.slot_ceil(greatest(r.window_start, coalesce(p.discovered_at, r.window_start)), h.slot_s),
+       pg_temp.slot_floor(r.t0 - interval '2 hours', h.slot_s) + make_interval(secs => h.slot_s)
+FROM sc_run r
+JOIN sc_funding_pairs p ON p.intervals <= 1
+CROSS JOIN LATERAL (SELECT 3600 * coalesce(p.newest, 8) AS slot_s) h;
 
 -- OI: the target cadence, a snapshot per minute on HyperLiquid and per 5 minutes elsewhere.
 -- A bucket is due an hour after it closes (the Binance baseline refreshes every 30 minutes).
@@ -146,16 +153,19 @@ INSERT INTO sc_checks
 SELECT t.ord, t.check_name,
        CASE WHEN coalesce(sum(v.expected), 0) = 0 THEN 'no expected slots'
             ELSE round(100.0 * sum(v.captured) / sum(v.expected), 3) || ' % of ' || sum(v.expected) || ' slots'
-                 || coalesce(', no slots on ' || string_agg(v.exchange, ', ') FILTER (WHERE v.expected = 0), '') END,
+                 || coalesce(', no slots on ' || string_agg(v.exchange, ', ') FILTER (WHERE v.expected = 0), '') END
+       || CASE WHEN t.section = 'funding' AND u.pairs > 0
+               THEN ', ' || u.pairs || ' pair(s) not measured (interval changed)' ELSE '' END,
        '>= ' || t.target_pct || ' %',
        coalesce(sum(v.expected) > 0 AND bool_and(v.expected > 0)
                 AND sum(v.captured) * 1000 >= sum(v.expected) * t.target_permille, false)
 FROM (VALUES (1, 'candles', 'candle capture', '99.9', 999),
-             (2, 'funding', 'funding-slot occupancy (collector-assumed interval)', '99', 990),
+             (2, 'funding', 'funding-slot occupancy (stored interval)', '99', 990),
              (3, 'oi', 'OI bucket occupancy (60 s HL, 300 s elsewhere)', '95', 950)) t(ord, section, check_name, target_pct, target_permille)
 LEFT JOIN (SELECT section, exchange, sum(expected) AS expected, sum(captured) AS captured
            FROM sc_venue GROUP BY 1, 2) v ON v.section = t.section
-GROUP BY t.ord, t.check_name, t.target_pct, t.target_permille;
+CROSS JOIN (SELECT count(*) AS pairs FROM sc_funding_pairs WHERE intervals > 1) u
+GROUP BY t.ord, t.section, t.check_name, t.target_pct, t.target_permille, u.pairs;
 
 INSERT INTO sc_checks
 SELECT 4, 'primary keys', string_agg(tbl || CASE WHEN has_pk THEN '' ELSE ' (missing)' END, ', '),
