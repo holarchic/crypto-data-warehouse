@@ -1,67 +1,248 @@
-"""Funding rate collection — one thread per exchange, polls every hour."""
+"""Funding rate collection: one thread per exchange, polls every hour.
+
+Every row is a settlement as the venue's funding-history endpoint records it: the settlement time
+truncated to the whole second, the settled rate, and `interval_hours`, the gap to the symbol's
+previous settlement. Nothing is read from a venue's "current funding" endpoint: its rate is a
+prediction (Bybit, OKX, HL) or belongs to a later settlement than its timestamp implies (Binance
+4h/1h symbols), so storing it put estimates and future rates into the history (T-035).
+
+Records are read from the venue's raw response, not ccxt's parsed history: ccxt drops a record
+with no timestamp, and a fetch must fail closed on a malformed record rather than lose it.
+"""
 
 import logging
+import math
 import time
+from collections.abc import Callable
+from dataclasses import dataclass
+from datetime import UTC, datetime
 
 from backoff import RETRIABLE_EXCEPTIONS
 from config import FUNDING_LOOP, ExchangeConfig
-from rate_limiter import (
-    BINANCE_FUNDING_BULK_WEIGHT,
-    BINANCE_FUNDING_HISTORY_WEIGHT,
-    RateLimiter,
-    paced_call,
-)
-from status import active_instruments, upsert_loop_heartbeat
+from rate_limiter import BINANCE_FUNDING_HISTORY_WEIGHT, RateLimiter, paced_call
+from status import Instrument, active_instruments, upsert_loop_heartbeat
 
 from db import connect_db, safe_rollback
 
 log = logging.getLogger(__name__)
 
+HOUR_MS = 3_600_000
+SEED_LOOKBACK_MS = 100 * HOUR_MS  # a symbol with no recent stored settlement starts this far back
+CURSOR_WINDOW_MS = 7 * 24 * HOUR_MS  # stored settlements older than this are not cursors
+
 INSERT_FUNDING_SQL = """
     INSERT INTO funding_rates (exchange, asset_id, symbol, timestamp, rate, predicted_rate, interval_hours)
     VALUES (%(exchange)s, %(asset_id)s, %(symbol)s, to_timestamp(%(timestamp)s),
-            %(rate)s, %(predicted_rate)s, %(interval_hours)s)
+            %(rate)s, NULL, %(interval_hours)s)
     ON CONFLICT DO NOTHING
 """
 
-FUNDING_INTERVAL_HOURS = {
-    "hyperliquid": 1,
-}
-DEFAULT_FUNDING_INTERVAL = 8
+STORED_CURSORS_SQL = """
+    SELECT symbol, (extract(epoch FROM max(timestamp)) * 1000)::bigint
+    FROM funding_rates
+    WHERE exchange = %(exchange)s AND timestamp > now() - %(window_ms)s * interval '1 millisecond'
+    GROUP BY symbol
+"""
 
 
-def _parse_funding_record(record, exchange_name, pair, from_bulk=False):
-    """Parse a ccxt funding rate record into an insert dict.
+class FundingFetchError(Exception):
+    """A symbol's history could not be read completely, so none of it may be written."""
 
-    Bulk endpoint: fundingTimestamp = NEXT settlement (future).
-      → last settlement = fundingTimestamp - interval_hours * 3600s
-    History endpoint: timestamp = actual settlement time, fundingTimestamp = None.
+
+class FullPage(FundingFetchError):
+    """A request returned as many records as the venue's page holds, so some may be cut off."""
+
+
+class MalformedRecord(FundingFetchError):
+    """A record has no usable settlement time, or a missing or non-finite rate."""
+
+
+@dataclass(frozen=True)
+class Settlement:
+    ts_ms: int  # settlement time truncated to the whole second
+    rate: float
+
+
+def _iso_to_ms(value: str) -> int:
+    return int(datetime.fromisoformat(value.replace("Z", "+00:00")).timestamp() * 1000)
+
+
+def _ms_to_iso(ms: int) -> str:
+    return datetime.fromtimestamp(ms / 1000, UTC).isoformat(timespec="milliseconds").replace("+00:00", "Z")
+
+
+@dataclass(frozen=True)
+class Venue:
+    """How one venue's funding-history endpoint is asked and read.
+
+    `window_h` is sized so a window `[start, start + window_h − 1 ms]` holds at most `window_h + 1`
+    settlements (the 1 h minimum interval plus millisecond jitter), under `page_cap`.
     """
-    interval_hours = FUNDING_INTERVAL_HOURS.get(exchange_name, DEFAULT_FUNDING_INTERVAL)
 
-    if from_bulk:
-        fts = record.get("fundingTimestamp")
-        if fts is None:
-            return None
-        ts_ms = fts - interval_hours * 3600 * 1000
-    else:
-        ts_ms = record.get("timestamp")
-        if ts_ms is None:
-            return None
-
-    return {
-        "exchange": exchange_name,
-        "asset_id": pair.asset_id,
-        "symbol": pair.symbol,
-        "timestamp": ts_ms / 1000,
-        "rate": record.get("fundingRate"),
-        "predicted_rate": record.get("nextFundingRate"),
-        "interval_hours": interval_hours,
-    }
+    method: str  # ccxt's raw method for the endpoint
+    page_cap: int
+    window_h: int
+    window_params: Callable[[int, int], dict]  # (start_ms, end_ms), both inclusive
+    records: Callable[[object], list]
+    time_field: str
+    rate_field: str
+    parse_time: Callable[[object], int] = int
+    lower_bounded: bool = True  # False: the endpoint also returns rows older than the window
 
 
-def _insert_funding(conn, rows):
-    """Insert funding rate rows. Returns count of inserted rows."""
+# Keyed by exchange name (exchanges.yaml), not ccxt class: Binance runs as `binanceusdm`.
+VENUES = {
+    "binance": Venue(
+        method="fapiPublicGetFundingRate", page_cap=1000, window_h=900,
+        window_params=lambda start, end: {"startTime": start, "endTime": end, "limit": 1000},
+        records=lambda resp: resp, time_field="fundingTime", rate_field="fundingRate",
+    ),
+    "bybit": Venue(
+        method="publicGetV5MarketFundingHistory", page_cap=200, window_h=150,
+        window_params=lambda start, end: {"startTime": start, "endTime": end, "limit": 200},
+        records=lambda resp: resp["result"]["list"], time_field="fundingRateTimestamp", rate_field="fundingRate",
+    ),
+    # OKX's `before`/`after` bounds are exclusive. `realizedRate` is the settled rate; the record's
+    # `fundingRate` is the prediction and is never read.
+    "okx": Venue(
+        method="publicGetPublicFundingRateHistory", page_cap=100, window_h=80,
+        window_params=lambda start, end: {"before": start - 1, "after": end + 1, "limit": 100},
+        records=lambda resp: resp["data"], time_field="fundingTime", rate_field="realizedRate",
+    ),
+    # HL has no page parameter: the window bounds the response and so its weight (20, plus 1 per 20
+    # items: an 18 h window weighs 21). 500 items is HL's cap on a time-range response.
+    "hyperliquid": Venue(
+        method="publicPostInfo", page_cap=500, window_h=18,
+        window_params=lambda start, end: {"type": "fundingHistory", "startTime": start, "endTime": end},
+        records=lambda resp: resp, time_field="time", rate_field="fundingRate",
+    ),
+    # dYdX takes only an upper bound and answers the newest `limit` rows at or before it, so a full
+    # page is complete once it reaches back to the window's start.
+    "dydx": Venue(
+        method="indexerGetHistoricalFundingMarket", page_cap=100, window_h=80,
+        window_params=lambda start, end: {"effectiveBeforeOrAt": _ms_to_iso(end), "limit": 100},
+        records=lambda resp: resp["historicalFunding"], time_field="effectiveAt", rate_field="rate",
+        parse_time=_iso_to_ms, lower_bounded=False,
+    ),
+}
+
+
+def market_params(exchange, venue_name: str, symbol: str) -> dict:
+    """The request parameters naming `symbol`'s market on the venue. Raises ccxt's BadSymbol for a
+    symbol the exchange's markets don't list."""
+    market = exchange.market(symbol)
+    if venue_name == "bybit":
+        return {"category": "linear" if market["linear"] else "inverse", "symbol": market["id"]}
+    if venue_name == "okx":
+        return {"instId": market["id"]}
+    if venue_name == "hyperliquid":
+        return {"coin": market["baseName"]}
+    if venue_name == "dydx":
+        return {"market": market["id"]}
+    return {"symbol": market["id"]}
+
+
+def _parse(venue: Venue, record: dict) -> tuple[int, float]:
+    """(raw settlement time in ms, rate) of one record, or MalformedRecord."""
+    try:
+        raw_ts = venue.parse_time(record[venue.time_field])
+        rate = float(record[venue.rate_field])
+    except (KeyError, TypeError, ValueError) as exc:
+        raise MalformedRecord(f"{record!r}: {exc!r}") from exc
+    if not math.isfinite(rate):
+        raise MalformedRecord(f"{record!r}: rate {rate}")
+    return raw_ts, rate
+
+
+def _truncate(raw_ts: int) -> int:
+    return raw_ts // 1000 * 1000
+
+
+def fetch_symbol_history(exchange, venue_name: str, market: dict, since_ms: int, until_ms: int,
+                         call: Callable, window_h: int | None = None) -> list[Settlement]:
+    """Every settlement of one market with raw time in `[since_ms, until_ms]`, oldest first.
+
+    Walks windows of `window_h` hours (default the venue's own); `call(fn, params)` makes each
+    request, so the caller owns pacing. Raises FundingFetchError rather than return a partial list.
+    """
+    venue = VENUES[venue_name]
+    window_ms = (window_h or venue.window_h) * HOUR_MS
+    by_second: dict[int, Settlement] = {}
+    start = since_ms
+    while start <= until_ms:
+        end = min(start + window_ms - 1, until_ms)
+        page = [_parse(venue, r) for r in venue.records(call(getattr(exchange, venue.method),
+                                                              {**market, **venue.window_params(start, end)}))]
+        reaches_start = not venue.lower_bounded and page and min(ts for ts, _ in page) <= start
+        if len(page) >= venue.page_cap and not reaches_start:
+            raise FullPage(f"{venue_name} {market}: {len(page)} records in {start}..{end}")
+        for raw_ts, rate in page:
+            if start <= raw_ts <= end:
+                by_second.setdefault(_truncate(raw_ts), Settlement(_truncate(raw_ts), rate))
+        start = end + 1
+    return [by_second[ts] for ts in sorted(by_second)]
+
+
+def fetch_binance_all(exchange, since_ms: int, call: Callable) -> dict[str, list[Settlement]]:
+    """Every Binance USDⓈ-M settlement from `since_ms` to now, keyed by Binance's symbol, oldest first.
+
+    Pages on the raw millisecond time: the next page starts at the last row's raw time, inclusive,
+    so a page cut inside one settlement re-fetches rows rather than skipping any. Dedup is per
+    (symbol, second), so symbols settling in the same second all stay.
+    """
+    venue = VENUES["binance"]
+    seen: dict[str, dict[int, Settlement]] = {}
+    start, advanced_once = since_ms, False
+    while True:
+        response = call(exchange.fapiPublicGetFundingRate, {"startTime": start, "limit": venue.page_cap})
+        page = []
+        for record in response:
+            symbol = record.get("symbol")
+            if not symbol:
+                raise MalformedRecord(f"{record!r}: no symbol")
+            page.append((symbol, *_parse(venue, record)))
+        for symbol, raw_ts, rate in page:
+            seen.setdefault(symbol, {}).setdefault(_truncate(raw_ts), Settlement(_truncate(raw_ts), rate))
+        if len(page) < venue.page_cap:
+            break
+        last = max(ts for _, ts, _ in page)
+        if last > start:
+            start, advanced_once = last, False
+        elif advanced_once:
+            raise FullPage(f"binance all-symbols: {len(page)} records at {start} without progress")
+        else:
+            start, advanced_once = start + 1, True
+    return {symbol: [by_second[ts] for ts in sorted(by_second)] for symbol, by_second in seen.items()}
+
+
+def funding_rows(instrument: Instrument, exchange_name: str, prev_ts_ms: int | None,
+                 settlements: list[Settlement]) -> list[dict]:
+    """Insert rows for one symbol's settlements (oldest first). `interval_hours` is the gap to the
+    previous settlement, the first one's to `prev_ts_ms`; None when no predecessor is known."""
+    rows = []
+    prev = prev_ts_ms
+    for s in settlements:
+        rows.append({
+            "exchange": exchange_name,
+            "asset_id": instrument.asset_id,
+            "symbol": instrument.symbol,
+            "timestamp": s.ts_ms / 1000,
+            "rate": s.rate,
+            "interval_hours": None if prev is None else round((s.ts_ms - prev) / HOUR_MS),
+        })
+        prev = s.ts_ms
+    return rows
+
+
+def stored_cursors(conn, exchange_name: str) -> dict[str, int]:
+    """Each symbol's newest stored settlement (ms) within the last CURSOR_WINDOW_MS."""
+    with conn.cursor() as cur:
+        cur.execute(STORED_CURSORS_SQL, {"exchange": exchange_name, "window_ms": CURSOR_WINDOW_MS})
+        return {symbol: ts for symbol, ts in cur.fetchall()}
+
+
+def _insert_funding(conn, rows) -> int:
+    """Insert funding rows and commit. Returns the count inserted."""
     if not rows:
         return 0
     inserted = 0
@@ -73,107 +254,70 @@ def _insert_funding(conn, rows):
     return inserted
 
 
-def _seed_funding(exchange, config, conn, pairs, rate_limiter):
-    """Seed historical funding rates — fetch_funding_rate_history(limit=100) per pair."""
-    if config.ccxt_class == "dydx":
-        log.info("[%s/funding] Skipping seed for dYdX (expensive for limited value)", config.name)
-        return
-
-    total_inserted = 0
-
-    for pair in pairs:
-        try:
-            history = paced_call(
-                rate_limiter, exchange, BINANCE_FUNDING_HISTORY_WEIGHT,
-                exchange.fetch_funding_rate_history, pair.symbol, limit=100,
-            )
-            rows = []
-            for record in history:
-                row = _parse_funding_record(record, config.name, pair)
-                if row:
-                    rows.append(row)
-            inserted = _insert_funding(conn, rows)
-            total_inserted += inserted
-        except RETRIABLE_EXCEPTIONS as exc:
-            log.warning("[%s/funding] Seed retriable error on %s: %s", config.name, pair.symbol, exc)
-            if conn.closed:
-                return
-            safe_rollback(conn)
-        except Exception as exc:
-            log.warning("[%s/funding] Seed error on %s: %s", config.name, pair.symbol, exc)
-            if not conn.closed:
-                safe_rollback(conn)
-
-    log.info("[%s/funding] Seed complete: %d rows inserted across %d pairs", config.name, total_inserted, len(pairs))
-
-
-def _poll_bulk(exchange, config, conn, pairs, rate_limiter):
-    """Bulk fetch_funding_rates() — 1 API call per exchange."""
+def _poll_binance(exchange, config, conn, instruments, cursors, now_ms, call) -> int:
+    """One all-symbols walk from the oldest active cursor, then each active symbol's new rows."""
+    since = min(cursors[i.symbol] + 1000 if i.symbol in cursors else now_ms - SEED_LOOKBACK_MS for i in instruments)
     try:
-        all_rates = paced_call(
-            rate_limiter, exchange, BINANCE_FUNDING_BULK_WEIGHT,
-            exchange.fetch_funding_rates,
-        )
-    except RETRIABLE_EXCEPTIONS as exc:
-        log.warning("[%s/funding] Bulk fetch retriable error: %s", config.name, exc)
-        if not conn.closed:
-            safe_rollback(conn)
-        return 0
+        by_symbol = fetch_binance_all(exchange, max(since, now_ms - CURSOR_WINDOW_MS), call)
     except Exception as exc:
-        log.warning("[%s/funding] Bulk fetch error: %s", config.name, exc)
-        if not conn.closed:
-            safe_rollback(conn)
+        log.warning("[%s/funding] History fetch error: %s", config.name, exc)
         return 0
 
-    # Build symbol lookup from active pairs
-    active_symbols = {p.symbol: p for p in pairs}
     rows = []
-    for symbol, record in all_rates.items():
-        if symbol not in active_symbols:
+    for instrument in instruments:
+        try:
+            venue_symbol = market_params(exchange, "binance", instrument.symbol)["symbol"]
+        except Exception as exc:
+            log.warning("[%s/funding] No market for %s: %s", config.name, instrument.symbol, exc)
             continue
-        pair = active_symbols[symbol]
-        row = _parse_funding_record(record, config.name, pair, from_bulk=True)
-        if row:
-            rows.append(row)
+        cursor = cursors.get(instrument.symbol)
+        fresh = [s for s in by_symbol.get(venue_symbol, []) if cursor is None or s.ts_ms > cursor]
+        rows += funding_rows(instrument, config.name, cursor, fresh)
 
-    # Guard the bulk insert like the fetch above and like _poll_dydx's per-pair insert: a db
-    # restart here would otherwise raise OperationalError straight out of funding_loop (this insert
-    # sits outside the fetch handler) and kill the thread (T-014).
+    # A db restart here would otherwise raise out of funding_loop and kill the thread (T-014).
     try:
         return _insert_funding(conn, rows)
     except Exception as exc:
-        log.warning("[%s/funding] Bulk insert error: %s", config.name, exc)
+        log.warning("[%s/funding] Insert error: %s", config.name, exc)
         safe_rollback(conn)
         return 0
 
 
-def _poll_dydx(exchange, config, conn, pairs, rate_limiter):
-    """dYdX fallback: per-symbol fetch_funding_rate_history(limit=1)."""
-    total_inserted = 0
-
-    for pair in pairs:
+def _poll_per_symbol(exchange, config, conn, instruments, cursors, now_ms, call) -> int:
+    """Each active symbol from its newest stored settlement. A failed symbol writes nothing and
+    keeps its cursor, so the next hour retries the same range."""
+    inserted = 0
+    for instrument in instruments:
+        cursor = cursors.get(instrument.symbol)
+        since = cursor + 1000 if cursor is not None else now_ms - SEED_LOOKBACK_MS
         try:
-            history = paced_call(
-                rate_limiter, exchange, BINANCE_FUNDING_HISTORY_WEIGHT,
-                exchange.fetch_funding_rate_history, pair.symbol, limit=1,
-            )
-            rows = []
-            for record in history:
-                row = _parse_funding_record(record, config.name, pair)
-                if row:
-                    rows.append(row)
-            total_inserted += _insert_funding(conn, rows)
+            market = market_params(exchange, config.name, instrument.symbol)
+            settlements = fetch_symbol_history(exchange, config.name, market, since, now_ms, call)
+            inserted += _insert_funding(conn, funding_rows(instrument, config.name, cursor, settlements))
         except RETRIABLE_EXCEPTIONS as exc:
-            log.warning("[%s/funding] dYdX retriable error on %s: %s", config.name, pair.symbol, exc)
+            log.warning("[%s/funding] Retriable error on %s: %s", config.name, instrument.symbol, exc)
             if conn.closed:
-                return total_inserted
+                return inserted
             safe_rollback(conn)
         except Exception as exc:
-            log.warning("[%s/funding] dYdX error on %s: %s", config.name, pair.symbol, exc)
+            log.warning("[%s/funding] Error on %s: %s", config.name, instrument.symbol, exc)
             if not conn.closed:
                 safe_rollback(conn)
+    return inserted
 
-    return total_inserted
+
+def poll_settled(exchange, config: ExchangeConfig, conn, instruments: list[Instrument],
+                 rate_limiter: RateLimiter) -> int:
+    """Store every settlement each active symbol has had since its newest stored one. Returns the
+    count inserted."""
+    def call(fn, params):
+        return paced_call(rate_limiter, exchange, BINANCE_FUNDING_HISTORY_WEIGHT, fn, params)
+
+    cursors = stored_cursors(conn, config.name)
+    conn.commit()  # no read transaction stays open across the network walk
+    now_ms = int(time.time() * 1000)
+    poll = _poll_binance if config.name == "binance" else _poll_per_symbol
+    return poll(exchange, config, conn, instruments, cursors, now_ms, call)
 
 
 def _sleep_until_next_hour():
@@ -206,7 +350,6 @@ def funding_loop(exchange, config: ExchangeConfig, dsn: str, rate_limiter: RateL
     """Funding rate collection loop. Own DB connection. Runs as daemon thread."""
     thread_name = f"{config.name}/funding"
     conn = connect_db(dsn)
-    seeded = False
 
     while True:
         # Reconnect if needed
@@ -228,18 +371,12 @@ def funding_loop(exchange, config: ExchangeConfig, dsn: str, rate_limiter: RateL
             continue
 
         if pairs:
-            # Seed on first cycle
-            if not seeded:
-                log.info("[%s] Seeding funding history for %d pairs", thread_name, len(pairs))
-                _seed_funding(exchange, config, conn, pairs, rate_limiter)
-                seeded = True
-
-            # Poll
-            if config.ccxt_class == "dydx":
-                inserted = _poll_dydx(exchange, config, conn, pairs, rate_limiter)
-            else:
-                inserted = _poll_bulk(exchange, config, conn, pairs, rate_limiter)
-
+            try:
+                inserted = poll_settled(exchange, config, conn, pairs, rate_limiter)
+            except Exception:
+                log.exception("[%s] Poll failed", thread_name)
+                safe_rollback(conn)
+                inserted = 0
             log.info("[%s] Poll: %d funding rates inserted (%d pairs)", thread_name, inserted, len(pairs))
         else:
             log.info("[%s] No active pairs, sleeping", thread_name)
