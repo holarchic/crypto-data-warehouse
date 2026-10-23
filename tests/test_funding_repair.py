@@ -285,7 +285,23 @@ def test_hl_gate_waits_out_the_candle_lock_then_60s_more():
     release = noon(5)
     gate, clock = hl_gate(noon(2), lambda now: now < release)
     gate.wait()
-    assert release + fr.HL_COOLDOWN_S <= clock.now < release + fr.HL_COOLDOWN_S + fr.HL_BLOCKED_POLL_S
+    assert release + fr.HL_COOLDOWN_S <= clock.now <= release + fr.HL_COOLDOWN_S + 2 * fr.HL_POLL_S
+
+
+def test_hl_gate_sees_a_candle_run_inside_its_startup_wait():
+    start = noon()
+    gate, clock = hl_gate(start, lambda now: start + 10 <= now < start + 40)
+    gate.wait()
+    assert clock.now >= start + 40 + fr.HL_COOLDOWN_S
+
+
+def test_hl_gate_sees_a_candle_run_inside_the_spacing_after_a_call():
+    start = noon()
+    gate, clock = hl_gate(start, lambda now: start + 70 <= now < start + 90)
+    gate.wait()  # +60
+    gate.sent()
+    gate.wait()
+    assert clock.now >= start + 90 + fr.HL_COOLDOWN_S
 
 
 def test_hl_gate_holds_through_the_pre_repair_window():
@@ -293,7 +309,7 @@ def test_hl_gate_holds_through_the_pre_repair_window():
     gate, clock = hl_gate(start, lambda now: False)
     gate.wait()
     end = datetime(2026, 10, 23, 6, 35, tzinfo=UTC).timestamp()
-    assert end + fr.HL_COOLDOWN_S <= clock.now < end + fr.HL_COOLDOWN_S + fr.HL_BLOCKED_POLL_S
+    assert end + fr.HL_COOLDOWN_S <= clock.now <= end + fr.HL_COOLDOWN_S + 2 * fr.HL_POLL_S
 
 
 def test_hl_markets_load_and_every_request_wait_on_the_gate():

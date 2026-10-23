@@ -25,7 +25,10 @@ collector's `DO NOTHING` insert. A database error aborts the run; resume with `-
 
 **HL budget.** One ≤41-weight call a minute, never while the HL candle repair holds its lock or in
 06:10–06:35 UTC (before its 06:30 cron run), and not for 60 s after either clears or after start:
-the candle repair releases its lock with its last call still inside HL's minute.
+the candle repair releases its lock with its last call still inside HL's minute. The gate checks
+the lock every second through every wait, its own spacing included, so a candle repair is missed
+only if it starts and ends within one second; the runbook rules out manual HL candle repairs
+while this runs.
 """
 
 import argparse
@@ -42,6 +45,7 @@ import psycopg
 from config import load_config
 from funding import (
     HOUR_MS,
+    VENUES,
     FundingFetchError,
     FundingRow,
     fetch_symbol_history,
@@ -58,11 +62,11 @@ log = logging.getLogger(__name__)
 
 LOCK_KEY = 0x46554E44  # "FUND": one funding repair at a time
 PREDECESSOR_MS = 24 * HOUR_MS  # read this far before the first stored row, for its interval
-REPAIR_SPACING_S = MappingProxyType({"binance": 0.75, "bybit": 0.5, "okx": 0.5, "dydx": 0.5, "hyperliquid": 60.0})
+REPAIR_SPACING_S = MappingProxyType({"binance": 0.75, "bybit": 0.5, "okx": 0.5, "dydx": 0.5})  # HL: HlGate
 REPAIR_WINDOW_H = MappingProxyType({"hyperliquid": 400})  # ≤401 items: 41 weight; the rest use the collector's
 HL_QUIET_START, HL_QUIET_END = (6, 10), (6, 35)  # UTC (hour, minute), before the 06:30 HL repair
-HL_COOLDOWN_S = 60
-HL_BLOCKED_POLL_S = 30
+HL_COOLDOWN_S = 60  # between HL calls, and after the candle repair or the quiet window clears
+HL_POLL_S = 1.0
 
 LOCK_SQL = "SELECT pg_try_advisory_lock(%(key)s)"
 LOCK_HELD_SQL = """
@@ -167,11 +171,12 @@ def compare_tail(stored: list[StoredRow], venue_rows: list[FundingRow]) -> int:
 
 
 class HlGate:
-    """Holds HL calls out of the candle repair's minutes (see the module docstring)."""
+    """Spaces HL calls a minute apart and holds them out of the candle repair's minutes (see the
+    module docstring)."""
 
     def __init__(self, conn, clock: Callable[[], float] = time.time, sleep: Callable[[float], None] = time.sleep):
         self.conn, self.clock, self.sleep = conn, clock, sleep
-        self.cooldown_until = clock() + HL_COOLDOWN_S
+        self.next_call = clock() + HL_COOLDOWN_S
 
     def blocked(self) -> bool:
         """True while an HL call could share a minute with the candle repair's."""
@@ -185,22 +190,22 @@ class HlGate:
         return held
 
     def wait(self) -> None:
+        """Return once HL_COOLDOWN_S have passed since the last call and since the gate last saw it
+        blocked, checking every HL_POLL_S."""
         while True:
-            if self.blocked():
-                self.cooldown_until = float("inf")
-                self.sleep(HL_BLOCKED_POLL_S)
-                continue
-            if self.cooldown_until == float("inf"):
-                self.cooldown_until = self.clock() + HL_COOLDOWN_S
-            if self.clock() < self.cooldown_until:
-                self.sleep(self.cooldown_until - self.clock())
-                continue
-            return
+            if self.blocked():  # it may clear just after this check, so count the poll gap too
+                self.next_call = self.clock() + HL_COOLDOWN_S + HL_POLL_S
+            elif self.clock() >= self.next_call:
+                return
+            self.sleep(min(HL_POLL_S, max(self.next_call - self.clock(), 0) or HL_POLL_S))
+
+    def sent(self) -> None:
+        self.next_call = max(self.next_call, self.clock() + HL_COOLDOWN_S)
 
 
 @dataclass
 class Pacer:
-    """Spaces the run's venue requests; on HL, each waits on the gate first."""
+    """Spaces the run's venue requests: REPAIR_SPACING_S after each, or on HL the gate."""
 
     venue: str
     gate: HlGate | None = None
@@ -214,7 +219,10 @@ class Pacer:
             return fn(params)
         finally:
             self.requests += 1
-            self.sleep(REPAIR_SPACING_S[self.venue])
+            if self.gate is not None:
+                self.gate.sent()
+            else:
+                self.sleep(REPAIR_SPACING_S[self.venue])
 
 
 def _rows(conn, sql: str, params: dict) -> list:
@@ -322,7 +330,7 @@ def parse_until(value: str) -> int:
 def main() -> int:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
     ap = argparse.ArgumentParser(description="Rebuild stored funding from the venue's settled history")
-    ap.add_argument("--exchange", required=True, choices=sorted(REPAIR_SPACING_S))
+    ap.add_argument("--exchange", required=True, choices=sorted(VENUES))
     ap.add_argument("--until", required=True, type=parse_until, help="inclusive whole second, e.g. 2026-10-27T13:00:00Z")
     ap.add_argument("--apply", action="store_true", help="replace each differing symbol's rows")
     ap.add_argument("--after", help="resume past this symbol (the symbols run in sorted order)")

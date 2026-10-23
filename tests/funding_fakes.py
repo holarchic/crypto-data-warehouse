@@ -6,7 +6,6 @@ import urllib.parse
 from datetime import UTC, datetime
 
 import ccxt
-import funding
 from funding import HOUR_MS
 
 T0 = 1_792_713_600_000  # 2026-10-21 00:00 UTC
@@ -68,7 +67,7 @@ class FakeVenue:
         return [{"coin": p["coin"], "time": t, "fundingRate": str(r)} for t, r in self._between(p["startTime"], p["endTime"])] + self.extra
 
     def _dydx(self, p):
-        until = funding._iso_to_ms(p["effectiveBeforeOrAt"])
+        until = int(datetime.fromisoformat(p["effectiveBeforeOrAt"].replace("Z", "+00:00")).timestamp() * 1000)
         rows = self._between(0, until, newest_first=True, limit=int(p["limit"]))
         return {"historicalFunding": [{"effectiveAt": _iso(t), "rate": str(r)} for t, r in rows] + self.extra}
 

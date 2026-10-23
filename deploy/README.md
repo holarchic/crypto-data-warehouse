@@ -157,7 +157,7 @@ TimescaleDB auto-tunes `max_connections` low (~25 on 8GB). Override via `command
    "${DB_TOOL[@]}" psql -X -c "COPY (SELECT * FROM funding_rates WHERE exchange = 'binance' AND timestamp < '<until>'::timestamptz + interval '1 second' ORDER BY symbol, timestamp) TO STDOUT WITH CSV" > backups/funding-pre-repair-binance-<until>.csv
    cd backups && sha256sum funding-pre-repair-binance-<until>.csv > funding-pre-repair-binance-<until>.csv.sha256; wc -l funding-pre-repair-binance-<until>.csv; cd ..
    ```
-4. **Apply:** step 2's command with `--apply`. It exits 1 if any symbol's fetch failed; those symbols are untouched. A database error stops it; rerun with `--after <last symbol logged>`. HyperLiquid makes one call a minute and waits out the HL 1m repair, so start it in the background (`nohup … &`) and expect it to run across two or three nights.
+4. **Apply:** step 2's command with `--apply`. It exits 1 if any symbol's fetch failed; those symbols are untouched. A database error stops it; rerun with `--after <last symbol logged>`. HyperLiquid makes one call a minute and waits out the HL 1m repair, so start it in the background (`nohup … &`) and expect it to run across two or three nights. Don't start a manual HL 1m repair while it runs.
 5. **Verify:** step 2's command again. `differ`, `missing`, `unmatched` and `tail_unmatched` are 0 and no symbol is `failed`. On OKX, rows that aged out of its history since the apply show as `pre_depth` and `interval_unverified`.
 6. **Back up:** `./scripts/backup.sh`, then `./scripts/backup-offsite.sh`, and check the new snapshot (Offsite backups).
 
