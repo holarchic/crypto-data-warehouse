@@ -12,6 +12,7 @@ import pytest
 from funding import (
     HOUR_MS,
     FullPage,
+    FundingRow,
     MalformedRecord,
     Settlement,
     fetch_binance_all,
@@ -207,14 +208,15 @@ def test_interval_is_the_gap_to_the_previous_settlement():
     pair = instrument("IOST/USDT:USDT", "IOST")
     times = [T0, T0 + 4 * HOUR_MS, T0 + 8 * HOUR_MS, T0 + 9 * HOUR_MS, T0 + 10 * HOUR_MS]
     rows = funding_rows(pair, "binance", T0 - 4 * HOUR_MS, [Settlement(t, 1e-5) for t in times])
-    assert [r["interval_hours"] for r in rows] == [4, 4, 4, 1, 1]
-    assert rows[0] == {"exchange": "binance", "asset_id": "IOST", "symbol": "IOST/USDT:USDT",
-                       "timestamp": T0 / 1000, "rate": 1e-5, "interval_hours": 4}
-    assert funding_rows(pair, "binance", None, [Settlement(T0, 1e-5)])[0]["interval_hours"] is None
+    assert [r.interval_hours for r in rows] == [4, 4, 4, 1, 1]
+    assert rows[0] == FundingRow("binance", "IOST", "IOST/USDT:USDT", T0, 1e-5, 4)
+    assert rows[0].params() == {"exchange": "binance", "asset_id": "IOST", "symbol": "IOST/USDT:USDT",
+                                "timestamp": T0 / 1000, "rate": 1e-5, "interval_hours": 4}
+    assert funding_rows(pair, "binance", None, [Settlement(T0, 1e-5)])[0].interval_hours is None
 
 
 def test_rows_never_carry_a_predicted_rate():
-    assert "predicted_rate" not in funding_rows(instrument(), "okx", None, [Settlement(T0, 1e-5)])[0]
+    assert "predicted_rate" not in funding_rows(instrument(), "okx", None, [Settlement(T0, 1e-5)])[0].params()
     assert "NULL, %(interval_hours)s" in funding.INSERT_FUNDING_SQL
 
 

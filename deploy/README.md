@@ -155,7 +155,7 @@ TimescaleDB auto-tunes `max_connections` low (~25 on 8GB). Override via `command
 3. **Save the venue's rows** on the host, with their count and checksum:
    ```bash
    "${DB_TOOL[@]}" psql -X -c "COPY (SELECT * FROM funding_rates WHERE exchange = 'binance' AND timestamp < '<until>'::timestamptz + interval '1 second' ORDER BY symbol, timestamp) TO STDOUT WITH CSV" > backups/funding-pre-repair-binance-<until>.csv
-   wc -l backups/funding-pre-repair-binance-<until>.csv; sha256sum backups/funding-pre-repair-binance-<until>.csv
+   cd backups && sha256sum funding-pre-repair-binance-<until>.csv > funding-pre-repair-binance-<until>.csv.sha256; wc -l funding-pre-repair-binance-<until>.csv; cd ..
    ```
 4. **Apply:** step 2's command with `--apply`. It exits 1 if any symbol's fetch failed; those symbols are untouched. A database error stops it; rerun with `--after <last symbol logged>`. HyperLiquid makes one call a minute and waits out the HL 1m repair, so start it in the background (`nohup … &`) and expect it to run across two or three nights.
 5. **Verify:** step 2's command again. `differ`, `missing`, `unmatched` and `tail_unmatched` are 0 and no symbol is `failed`. On OKX, rows that aged out of its history since the apply show as `pre_depth` and `interval_unverified`.
@@ -164,12 +164,16 @@ TimescaleDB auto-tunes `max_connections` low (~25 on 8GB). Override via `command
 **Rolling one venue back** restores step 3's file and leaves newer rows, other venues and other tables alone:
 
 ```bash
+saved=backups/funding-pre-repair-binance-<until>.csv
+(cd backups && sha256sum -c "${saved##*/}.sha256") &&
 { echo "BEGIN; DELETE FROM funding_rates WHERE exchange = 'binance' AND timestamp < '<until>'::timestamptz + interval '1 second';"
-  echo "COPY funding_rates FROM STDIN WITH CSV;"; cat backups/funding-pre-repair-binance-<until>.csv; echo '\.'; echo "COMMIT;"
+  echo "COPY funding_rates FROM STDIN WITH CSV;"
+  cat "$saved" || exit 1          # a failed read never reaches COMMIT: psql rolls the delete back
+  echo '\.'; echo "COMMIT;"
 } | "${DB_TOOL[@]}" psql -X -v ON_ERROR_STOP=1
 ```
 
-Then export the same range as in step 3 and compare its count and checksum with the saved file.
+The checksum check runs first, so a missing or changed file stops before anything is deleted. Then export the same range as in step 3 and compare it with the saved file (`sha256sum`).
 
 ## Stability scorecard
 

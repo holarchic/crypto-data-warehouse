@@ -43,6 +43,7 @@ from config import load_config
 from funding import (
     HOUR_MS,
     FundingFetchError,
+    FundingRow,
     fetch_symbol_history,
     funding_rows,
     market_params,
@@ -130,9 +131,9 @@ class Report:
         return f"{self.symbol} {self.status} {counts}{' applied' if self.applied else ''}"
 
 
-def compare(stored: list[StoredRow], venue_rows: list[dict], report: Report) -> None:
+def compare(stored: list[StoredRow], venue_rows: list[FundingRow], report: Report) -> None:
     """Count `stored` (the range up to `until`) against the venue's rows for the same range."""
-    venue = {round(r["timestamp"] * 1000): r for r in venue_rows}
+    venue = {r.ts_ms: r for r in venue_rows}
     venue_first = min(venue)
     by_second: dict[int, list[StoredRow]] = {}
     for row in stored:
@@ -147,20 +148,20 @@ def compare(stored: list[StoredRow], venue_rows: list[dict], report: Report) -> 
         report.unmatched += len(rows) - 1
         want = venue[second]
         row = next((r for r in rows if r.ts_ms == second), rows[0])
-        if row.ts_ms != second or row.rate != want["rate"]:
+        if row.ts_ms != second or row.rate != want.rate:
             report.differ += 1
-        elif row.interval_hours == want["interval_hours"]:
+        elif row.interval_hours == want.interval_hours:
             report.equal += 1
-        elif want["interval_hours"] is None and second == venue_first:
+        elif want.interval_hours is None and second == venue_first:
             report.interval_unverified += 1
         else:
             report.differ += 1
     report.missing += len(set(venue) - set(by_second))
 
 
-def compare_tail(stored: list[StoredRow], venue_rows: list[dict]) -> int:
+def compare_tail(stored: list[StoredRow], venue_rows: list[FundingRow]) -> int:
     """Stored rows after `until` with no venue settlement at their second, or a different rate."""
-    venue = {round(r["timestamp"] * 1000): r["rate"] for r in venue_rows}
+    venue = {r.ts_ms: r.rate for r in venue_rows}
     return sum(1 for row in stored
                if truncate_to_second(row.ts_ms) not in venue or venue[truncate_to_second(row.ts_ms)] != row.rate)
 
@@ -233,12 +234,12 @@ def stored_rows(conn, exchange_name: str, symbol: str, lo_ms: int, hi_ms: int) -
     return [StoredRow(*row) for row in _rows(conn, STORED_SQL, params)]
 
 
-def replace_rows(conn, exchange_name: str, symbol: str, until_ms: int, rows: list[dict]) -> None:
+def replace_rows(conn, exchange_name: str, symbol: str, until_ms: int, rows: list[FundingRow]) -> None:
     """One transaction: delete the symbol's rows below `until + 1 s`, upsert the venue's."""
     try:
         with conn.cursor() as cur:
             cur.execute(DELETE_SQL, {"exchange": exchange_name, "symbol": symbol, "hi_s": (until_ms + 1000) / 1000})
-            cur.executemany(UPSERT_SQL, rows)
+            cur.executemany(UPSERT_SQL, [row.params() for row in rows])
         conn.commit()
     except Exception:
         conn.rollback()
@@ -266,7 +267,7 @@ def repair_symbol(conn, exchange, exchange_name: str, stored: StoredSymbol, unti
         log.warning("%s: fetch failed: %s", stored.symbol, exc)
         report.status = "failed"
         return report
-    rows = [r for r in funding_rows(pair, exchange_name, None, history) if r["timestamp"] * 1000 >= first]
+    rows = [r for r in funding_rows(pair, exchange_name, None, history) if r.ts_ms >= first]
     if not rows:
         report.status = "unfetchable"
         return report

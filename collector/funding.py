@@ -17,6 +17,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from types import MappingProxyType
+from typing import NamedTuple
 
 import ccxt
 from backoff import RETRIABLE_EXCEPTIONS
@@ -63,6 +64,30 @@ class MalformedRecord(FundingFetchError):
 class Settlement:
     ts_ms: int  # settlement time truncated to the whole second
     rate: float
+
+
+@dataclass(frozen=True)
+class FundingRow:
+    """One funding_rates row."""
+
+    exchange: str
+    asset_id: str
+    symbol: str
+    ts_ms: int
+    rate: float
+    interval_hours: int | None
+
+    def params(self) -> dict:
+        return {"exchange": self.exchange, "asset_id": self.asset_id, "symbol": self.symbol,
+                "timestamp": self.ts_ms / 1000, "rate": self.rate, "interval_hours": self.interval_hours}
+
+
+class _Raw(NamedTuple):
+    """One parsed venue record, before truncation."""
+
+    raw_ts: int
+    rate: float
+    symbol: str | None = None
 
 
 def _iso_to_ms(value: str) -> int:
@@ -150,8 +175,8 @@ def market_params(exchange, venue_name: str, symbol: str) -> dict:
     return {"symbol": market["id"]}
 
 
-def _parse(venue: Venue, record: dict) -> tuple[int, float]:
-    """(raw settlement time in ms, rate) of one record, or MalformedRecord."""
+def _parse(venue: Venue, record: dict) -> _Raw:
+    """One record's raw settlement time and rate, or MalformedRecord."""
     try:
         raw_ts = venue.parse_time(record[venue.time_field])
         rate = float(record[venue.rate_field])
@@ -159,7 +184,7 @@ def _parse(venue: Venue, record: dict) -> tuple[int, float]:
         raise MalformedRecord(f"{record!r}: {exc!r}") from exc
     if not math.isfinite(rate):
         raise MalformedRecord(f"{record!r}: rate {rate}")
-    return raw_ts, rate
+    return _Raw(raw_ts, rate)
 
 
 def _records(venue: Venue, response) -> list:
@@ -193,12 +218,13 @@ def fetch_symbol_history(exchange, venue_name: str, market: dict, since_ms: int,
         end = min(start + window_ms - 1, until_ms)
         response = call(getattr(exchange, venue.method), {**market, **venue.window_params(start, end)})
         page = [_parse(venue, r) for r in _records(venue, response)]
-        reaches_start = not venue.lower_bounded and page and min(ts for ts, _ in page) <= start
+        reaches_start = not venue.lower_bounded and page and min(r.raw_ts for r in page) <= start
         if len(page) >= venue.page_cap and not reaches_start:
             raise FullPage(f"{venue_name} {market}: {len(page)} records in {start}..{end}")
-        for raw_ts, rate in page:
-            if start <= raw_ts <= end:
-                by_second.setdefault(truncate_to_second(raw_ts), Settlement(truncate_to_second(raw_ts), rate))
+        for r in page:
+            if start <= r.raw_ts <= end:
+                second = truncate_to_second(r.raw_ts)
+                by_second.setdefault(second, Settlement(second, r.rate))
         start = end + 1
     return [by_second[ts] for ts in sorted(by_second)]
 
@@ -224,13 +250,13 @@ def fetch_binance_all(exchange, since_ms: int, call: Callable) -> dict[str, list
     start = since_ms
     while True:
         response = call(exchange.fapiPublicGetFundingRate, {"startTime": start, "limit": venue.page_cap})
-        page = [(_binance_symbol(record), *_parse(venue, record)) for record in _records(venue, response)]
-        for symbol, raw_ts, rate in page:
-            second = truncate_to_second(raw_ts)
-            seen.setdefault(symbol, {}).setdefault(second, Settlement(second, rate))
+        page = [_parse(venue, record)._replace(symbol=_binance_symbol(record)) for record in _records(venue, response)]
+        for r in page:
+            second = truncate_to_second(r.raw_ts)
+            seen.setdefault(r.symbol, {}).setdefault(second, Settlement(second, r.rate))
         if len(page) < venue.page_cap:
             break
-        last = max(ts for _, ts, _ in page)
+        last = max(r.raw_ts for r in page)
         if last <= start:
             raise FullPage(f"binance all-symbols: {len(page)} records at {start} without progress")
         start = last
@@ -238,20 +264,14 @@ def fetch_binance_all(exchange, since_ms: int, call: Callable) -> dict[str, list
 
 
 def funding_rows(instrument: Instrument, exchange_name: str, prev_ts_ms: int | None,
-                 settlements: list[Settlement]) -> list[dict]:
-    """Insert rows for one symbol's settlements (oldest first). `interval_hours` is the gap to the
-    previous settlement, the first one's to `prev_ts_ms`; None when no predecessor is known."""
+                 settlements: list[Settlement]) -> list[FundingRow]:
+    """Rows for one symbol's settlements (oldest first). `interval_hours` is the gap to the previous
+    settlement, the first one's to `prev_ts_ms`; None when no predecessor is known."""
     rows = []
     prev = prev_ts_ms
     for s in settlements:
-        rows.append({
-            "exchange": exchange_name,
-            "asset_id": instrument.asset_id,
-            "symbol": instrument.symbol,
-            "timestamp": s.ts_ms / 1000,
-            "rate": s.rate,
-            "interval_hours": None if prev is None else round((s.ts_ms - prev) / HOUR_MS),
-        })
+        interval = None if prev is None else round((s.ts_ms - prev) / HOUR_MS)
+        rows.append(FundingRow(exchange_name, instrument.asset_id, instrument.symbol, s.ts_ms, s.rate, interval))
         prev = s.ts_ms
     return rows
 
@@ -263,14 +283,14 @@ def stored_cursors(conn, exchange_name: str) -> dict[str, int]:
         return {symbol: ts for symbol, ts in cur.fetchall()}
 
 
-def _insert_funding(conn, rows) -> int:
+def _insert_funding(conn, rows: list[FundingRow]) -> int:
     """Insert funding rows and commit. Returns the count inserted."""
     if not rows:
         return 0
     inserted = 0
     with conn.cursor() as cur:
         for row in rows:
-            cur.execute(INSERT_FUNDING_SQL, row)
+            cur.execute(INSERT_FUNDING_SQL, row.params())
             inserted += cur.rowcount
     conn.commit()
     return inserted

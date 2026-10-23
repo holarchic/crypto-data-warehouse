@@ -11,6 +11,7 @@ outside pytest, inside the collector image, against a throwaway database at the 
 Prints one line per check and exits non-zero on the first failure.
 """
 
+import dataclasses
 import os
 import sys
 import threading
@@ -33,8 +34,8 @@ def check(name, ok, detail=""):
 
 
 def venue_rows(n, start=T0, step_h=4, rate=lambda i: (i + 1) * 1e-5):
-    return [{"exchange": "binance", "asset_id": "TRB", "symbol": SYMBOL, "timestamp": (start + i * step_h * H) / 1000,
-             "rate": rate(i), "interval_hours": step_h if i else None} for i in range(n)]
+    return [funding.FundingRow("binance", "TRB", SYMBOL, start + i * step_h * H, rate(i), step_h if i else None)
+            for i in range(n)]
 
 
 def table(conn, symbol=SYMBOL, exchange="binance"):
@@ -47,7 +48,7 @@ def table(conn, symbol=SYMBOL, exchange="binance"):
 
 
 def expected(rows):
-    return [(round(r["timestamp"] * 1000), r["rate"], r["interval_hours"], None) for r in rows]
+    return [(r.ts_ms, r.rate, r.interval_hours, None) for r in rows]
 
 
 def seed_legacy(conn):
@@ -77,10 +78,9 @@ def check_replace(conn):
     compressed = seed_legacy(conn)
     check("legacy rows sit in a compressed chunk", compressed >= 1, f"{compressed} chunk(s)")
     until = T0 + 40 * H
-    later = {"exchange": "binance", "asset_id": "TRB", "symbol": SYMBOL, "timestamp": (until + 4 * H) / 1000,
-             "rate": 9e-5, "interval_hours": 4}
+    later = funding.FundingRow("binance", "TRB", SYMBOL, until + 4 * H, 9e-5, 4)
     with conn.cursor() as cur:
-        cur.execute(funding.INSERT_FUNDING_SQL, later)
+        cur.execute(funding.INSERT_FUNDING_SQL, later.params())
     conn.commit()
 
     rows = venue_rows(11)
@@ -99,7 +99,7 @@ def check_replace(conn):
     check("a second report is all-equal", report.equal == 11 and not report.needs_apply(), report.line())
 
     before = table(conn)
-    bad = rows[:5] + [{**rows[5], "asset_id": None}]  # NOT NULL violation after the delete ran
+    bad = rows[:5] + [dataclasses.replace(rows[5], asset_id=None)]  # NOT NULL violation after the delete ran
     try:
         fr.replace_rows(conn, "binance", SYMBOL, until, bad)
         failed = False
@@ -113,7 +113,7 @@ def check_race(dsn, conn):
     until = T0 + 40 * H
     rows = venue_rows(11)
     key_row = rows[10]
-    collector_row = {**key_row, "interval_hours": 8, "rate": 1e-4}
+    collector_row = dataclasses.replace(key_row, interval_hours=8, rate=1e-4).params()
 
     # The collector commits first: the repair's delete removes it, its upsert writes its own values.
     with conn.cursor() as cur:

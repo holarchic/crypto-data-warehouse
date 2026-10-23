@@ -7,7 +7,7 @@ from datetime import UTC, datetime
 import ccxt
 import funding_repair as fr
 import pytest
-from funding import HOUR_MS
+from funding import HOUR_MS, FundingRow
 from funding_repair import Report, StoredRow, compare, compare_tail
 
 from tests.funding_fakes import T0, FakeVenue, exchange_for, hourly
@@ -119,8 +119,7 @@ def canonical(history, first_interval=None):
 
 def test_report_counts_each_defect():
     rates = [1e-5, 2e-5, 3e-5, 4e-5, 5e-5, 6e-5]
-    venue = [{"timestamp": (T0 + i * 4 * HOUR_MS) / 1000, "rate": rates[i],
-              "interval_hours": 4 if i else None} for i in range(6)]
+    venue = [FundingRow("binance", "BTC", SYMBOL, T0 + i * 4 * HOUR_MS, rates[i], 4 if i else None) for i in range(6)]
     stored = [
         StoredRow(T0 - 8 * HOUR_MS, 1e-5, 8),  # older than the venue's history
         StoredRow(T0, 1e-5, 4),  # the first settlement: no fetched predecessor
@@ -139,7 +138,7 @@ def test_report_counts_each_defect():
 
 
 def test_tail_counts_wrong_rates_and_accepts_jitter():
-    venue = [{"timestamp": (T0 + 12 * HOUR_MS) / 1000, "rate": 1e-5, "interval_hours": 1}]
+    venue = [FundingRow("binance", "BTC", SYMBOL, T0 + 12 * HOUR_MS, 1e-5, 1)]
     assert compare_tail([StoredRow(T0 + 12 * HOUR_MS, 1e-5, 1)], venue) == 0
     assert compare_tail([StoredRow(T0 + 12 * HOUR_MS, 1e-4, 1)], venue) == 1
     assert compare_tail([StoredRow(T0 + 13 * HOUR_MS, 1e-5, 1)], venue) == 1
