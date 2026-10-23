@@ -107,6 +107,7 @@ class Report(NamedTuple):
     verdicts: dict      # check name -> Verdict
     venues: dict        # Venue -> Capture
     markers: list       # the SCORECARD-DB lines
+    unmeasured: list    # (exchange, symbol) funding pairs left out for a changed interval
 
 
 def check(name, ok, detail=""):
@@ -126,9 +127,12 @@ def scorecard(as_of=AS_OF, days=DAYS, meta=META):
     out = subprocess.run([*PSQL, "-A", "-v", f"days={days}", "-v", f"meta={json.dumps(meta)}", "-v", f"as_of={as_of}"],
                          input=(ROOT / "scripts/stability-scorecard.sql").read_text(),
                          capture_output=True, text=True, check=True).stdout
-    verdicts, venues = {}, {}
+    verdicts, venues, unmeasured = {}, {}, []
     for line in out.splitlines():
         cells = line.split("|")
+        if len(cells) == 3 and cells[0] == "unmeasured":
+            unmeasured.append((cells[1], cells[2]))
+            continue
         if len(cells) == 4 and cells[0] in CHECKS:
             name, measured, _target, verdict = cells
             check(f"{name} reported once", name not in verdicts)
@@ -137,7 +141,7 @@ def scorecard(as_of=AS_OF, days=DAYS, meta=META):
             section, exchange, timeframe, _pairs, expected, captured, _pct, _measured_to = cells
             venues[Venue(section, exchange, timeframe)] = Capture(int(expected), int(captured))
     markers = [line for line in out.splitlines() if line.startswith("SCORECARD-DB:")]
-    return Report(verdicts, venues, markers)
+    return Report(verdicts, venues, markers, unmeasured)
 
 
 def section_total(report, section):
@@ -255,9 +259,10 @@ def main():
         # so it leaves the denominator and is named as not measured.
         report = run_case("funding interval changed in the window", CHANGE_ETH_INTERVAL,
                           expect={"funding": Capture(6 + 47, 6 + 47)})
-        check("funding interval changed: the pair is named not measured",
-              "1 pair(s) not measured (interval changed)" in report.verdicts[FUNDING_CHECK].measured,
-              report.verdicts[FUNDING_CHECK].measured)
+        check("funding interval changed: the pair is counted and named as not measured",
+              "1 pair(s) not measured (interval changed)" in report.verdicts[FUNDING_CHECK].measured
+              and report.unmeasured == [("binance", "ETH/USDT:USDT")],
+              f"{report.verdicts[FUNDING_CHECK].measured} {report.unmeasured}")
         # Lag edge: a settlement exactly 2 h before the reference time is due; a second earlier it isn't.
         run_case("funding settlement exactly at the lag edge", as_of="2026-10-20 10:00:00+00",
                  expect={Venue("funding", "binance", ""): Capture(10, 10), Venue("funding", "hyperliquid", ""): Capture(47, 47)})

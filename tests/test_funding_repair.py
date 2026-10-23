@@ -143,6 +143,7 @@ def test_tail_counts_wrong_rates_and_accepts_jitter():
     assert compare_tail([StoredRow(T0 + 12 * HOUR_MS, 1e-5, 1)], venue) == 0
     assert compare_tail([StoredRow(T0 + 12 * HOUR_MS, 1e-4, 1)], venue) == 1
     assert compare_tail([StoredRow(T0 + 13 * HOUR_MS, 1e-5, 1)], venue) == 1
+    assert compare_tail([StoredRow(T0 + 13 * HOUR_MS, None, 1)], venue) == 1  # NULL on no settlement
 
 
 def test_the_repair_upsert_replaces_a_conflicting_row():
@@ -219,6 +220,24 @@ def test_a_failed_fetch_leaves_the_symbol_untouched_and_the_run_fails():
     code, _ = run(conn, fake, T0 + 449 * HOUR_MS, apply=True, venue="hyperliquid")
     assert code == 1 and len(fake.requests) == 2
     assert conn.deletes == [] and conn.table == rows
+
+
+def test_a_malformed_symbol_fails_alone_and_the_next_is_repaired():
+    eth = "ETH/USDT:USDT"
+    rows = {(SYMBOL, T0): (1e-4, 8), (eth, T0): (1e-4, 8)}
+    conn = TableConn(rows)
+    good = FakeVenue("binance", four_hourly(3))
+
+    def venue(url, method="GET", headers=None, body=None):
+        if "symbol=BTCUSDT" in url:
+            return [{"symbol": "BTCUSDT", "fundingTime": float("inf"), "fundingRate": "1e-5"}]
+        return good(url, method, headers, body)
+
+    market = {SYMBOL: {"id": "BTCUSDT"}, eth: {"id": "ETHUSDT"}}
+    code, _ = run(conn, venue, T0 + 8 * HOUR_MS, apply=True, market=market.__getitem__)
+    assert code == 1
+    assert conn.table[(SYMBOL, T0)] == (1e-4, 8)  # untouched
+    assert conn.table[(eth, T0)] == (four_hourly(3)[0][1], None)  # rebuilt
 
 
 def test_an_unfetchable_symbol_is_left_alone():

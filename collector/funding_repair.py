@@ -35,6 +35,7 @@ from collections import Counter
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
+from types import MappingProxyType
 
 import ccxt
 import psycopg
@@ -45,6 +46,7 @@ from funding import (
     fetch_symbol_history,
     funding_rows,
     market_params,
+    truncate_to_second,
 )
 from hl_candles_repair import LOCK_KEY as HL_CANDLE_REPAIR_LOCK_KEY
 from status import Instrument
@@ -55,8 +57,8 @@ log = logging.getLogger(__name__)
 
 LOCK_KEY = 0x46554E44  # "FUND": one funding repair at a time
 PREDECESSOR_MS = 24 * HOUR_MS  # read this far before the first stored row, for its interval
-REPAIR_SPACING_S = {"binance": 0.75, "bybit": 0.5, "okx": 0.5, "dydx": 0.5, "hyperliquid": 60.0}
-REPAIR_WINDOW_H = {"hyperliquid": 400}  # ≤401 items: 41 weight; the rest use the collector's
+REPAIR_SPACING_S = MappingProxyType({"binance": 0.75, "bybit": 0.5, "okx": 0.5, "dydx": 0.5, "hyperliquid": 60.0})
+REPAIR_WINDOW_H = MappingProxyType({"hyperliquid": 400})  # ≤401 items: 41 weight; the rest use the collector's
 HL_QUIET_START, HL_QUIET_END = (6, 10), (6, 35)  # UTC (hour, minute), before the 06:30 HL repair
 HL_COOLDOWN_S = 60
 HL_BLOCKED_POLL_S = 30
@@ -93,7 +95,7 @@ UPSERT_SQL = """
 @dataclass(frozen=True)
 class StoredRow:
     ts_ms: int  # as stored, possibly with milliseconds
-    rate: float
+    rate: float | None  # the column is nullable
     interval_hours: int | None
 
 
@@ -128,17 +130,13 @@ class Report:
         return f"{self.symbol} {self.status} {counts}{' applied' if self.applied else ''}"
 
 
-def _second(ms: int) -> int:
-    return ms // 1000 * 1000
-
-
 def compare(stored: list[StoredRow], venue_rows: list[dict], report: Report) -> None:
     """Count `stored` (the range up to `until`) against the venue's rows for the same range."""
     venue = {round(r["timestamp"] * 1000): r for r in venue_rows}
     venue_first = min(venue)
     by_second: dict[int, list[StoredRow]] = {}
     for row in stored:
-        by_second.setdefault(_second(row.ts_ms), []).append(row)
+        by_second.setdefault(truncate_to_second(row.ts_ms), []).append(row)
     for second, rows in by_second.items():
         if second not in venue:
             if second < venue_first:
@@ -163,7 +161,8 @@ def compare(stored: list[StoredRow], venue_rows: list[dict], report: Report) -> 
 def compare_tail(stored: list[StoredRow], venue_rows: list[dict]) -> int:
     """Stored rows after `until` with no venue settlement at their second, or a different rate."""
     venue = {round(r["timestamp"] * 1000): r["rate"] for r in venue_rows}
-    return sum(1 for row in stored if venue.get(_second(row.ts_ms)) != row.rate)
+    return sum(1 for row in stored
+               if truncate_to_second(row.ts_ms) not in venue or venue[truncate_to_second(row.ts_ms)] != row.rate)
 
 
 class HlGate:
@@ -256,11 +255,11 @@ def repair_symbol(conn, exchange, exchange_name: str, stored: StoredSymbol, unti
     except ccxt.BadSymbol:
         report.status = "unfetchable"
         return report
-    first = _second(stored.first_ms)
+    first = truncate_to_second(stored.first_ms)
     try:
         history = fetch_symbol_history(exchange, exchange_name, market, first - PREDECESSOR_MS, until_ms + 999,
                                        pacer.call, window_h)
-        tail_end = _second(stored.last_ms)
+        tail_end = truncate_to_second(stored.last_ms)
         tail = (fetch_symbol_history(exchange, exchange_name, market, until_ms + 1000, tail_end + 999,
                                      pacer.call, window_h) if tail_end > until_ms else [])
     except (FundingFetchError, ccxt.BaseError) as exc:

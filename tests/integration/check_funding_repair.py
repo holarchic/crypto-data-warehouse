@@ -128,19 +128,32 @@ def check_race(dsn, conn):
         cur.execute(fr.DELETE_SQL, {"exchange": "binance", "symbol": SYMBOL, "hi_s": (until + 1000) / 1000})
         cur.executemany(fr.UPSERT_SQL, rows)
     result = {}
+    collector_conn = psycopg.connect(dsn)
+    with collector_conn.cursor() as cur:
+        cur.execute("SELECT pg_backend_pid()")
+        collector_pid = cur.fetchone()[0]
+    collector_conn.commit()
 
     def collector():
-        with psycopg.connect(dsn) as other, other.cursor() as cur:
+        with collector_conn.cursor() as cur:
             cur.execute(funding.INSERT_FUNDING_SQL, collector_row)
             result["rowcount"] = cur.rowcount
-            other.commit()
+        collector_conn.commit()
 
     thread = threading.Thread(target=collector)
     thread.start()
-    time.sleep(1.0)
-    check("collector insert waits on the repair's row", thread.is_alive())
+    with psycopg.connect(dsn) as watcher:
+        blocked = False
+        for _ in range(50):
+            blocked = watcher.execute("SELECT %s = ANY(pg_blocking_pids(%s))",
+                                      (conn.info.backend_pid, collector_pid)).fetchone()[0]
+            if blocked:
+                break
+            time.sleep(0.1)
+    check("collector insert is blocked by the repair's transaction in PostgreSQL", blocked)
     conn.commit()
     thread.join(10)
+    collector_conn.close()
     check("then inserts nothing, and the repair's values stand",
           result.get("rowcount") == 0 and table(conn)[-1] == expected([key_row])[0])
 

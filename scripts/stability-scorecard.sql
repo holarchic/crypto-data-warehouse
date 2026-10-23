@@ -210,6 +210,10 @@ FROM sc_venue ORDER BY section, exchange, timeframe;
 SELECT asset_id, round(max_volume_usd) AS max_volume_usd FROM sc_uncollected ORDER BY max_volume_usd DESC;
 
 \echo
+\echo '=== Funding pairs not measured (interval changed in the window) ==='
+SELECT 'unmeasured' AS funding, exchange, symbol FROM sc_funding_pairs WHERE intervals > 1 ORDER BY exchange, symbol;
+
+\echo
 \echo '=== Database checks ==='
 SELECT check_name AS check, measured, target, CASE WHEN pass THEN 'PASS' ELSE 'FAIL' END AS verdict
 FROM sc_checks ORDER BY ord;

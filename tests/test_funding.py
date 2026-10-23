@@ -4,7 +4,7 @@ bounds), and the hourly poll built on it."""
 
 import dataclasses
 import urllib.parse
-from types import SimpleNamespace
+from types import MappingProxyType, SimpleNamespace
 
 import ccxt
 import funding
@@ -154,7 +154,8 @@ def binance_all(rows_by_page):
 
 
 def test_binance_all_pages_on_raw_ms_and_keeps_same_second_symbols(monkeypatch):
-    monkeypatch.setitem(funding.VENUES, "binance", dataclasses.replace(funding.VENUES["binance"], page_cap=3))
+    monkeypatch.setattr(funding, "VENUES", MappingProxyType(
+        {**funding.VENUES, "binance": dataclasses.replace(funding.VENUES["binance"], page_cap=3)}))
     page1 = [("AUSDT", T0 + 2, 1e-5), ("BUSDT", T0 + 5, 2e-5), ("CUSDT", T0 + 5, 3e-5)]
     page2 = [("CUSDT", T0 + 5, 3e-5), ("DUSDT", T0 + 7, 4e-5)]  # the boundary second, re-fetched
     ex, requests = binance_all([page1, page2])
@@ -164,19 +165,40 @@ def test_binance_all_pages_on_raw_ms_and_keeps_same_second_symbols(monkeypatch):
                       [("AUSDT", 1e-5), ("BUSDT", 2e-5), ("CUSDT", 3e-5), ("DUSDT", 4e-5)]}
 
 
-def test_binance_all_non_advancing_page_steps_once_then_fails(monkeypatch):
-    monkeypatch.setitem(funding.VENUES, "binance", dataclasses.replace(funding.VENUES["binance"], page_cap=2))
-    stuck = [("AUSDT", T0, 1e-5), ("BUSDT", T0, 1e-5)]
-    ex, requests = binance_all([stuck, stuck, stuck])
+def test_binance_all_full_page_in_one_millisecond_fails_rather_than_skip(monkeypatch):
+    # Three symbols settle at the same millisecond and the page holds two: stepping past that
+    # millisecond would lose the third, so the walk fails.
+    monkeypatch.setattr(funding, "VENUES", MappingProxyType(
+        {**funding.VENUES, "binance": dataclasses.replace(funding.VENUES["binance"], page_cap=2)}))
+    rows = [("AUSDT", T0, 1e-5), ("BUSDT", T0, 1e-5), ("CUSDT", T0, 1e-5), ("AUSDT", T0 + HOUR_MS, 1e-5)]
+    ex, requests = binance_all([[r for r in rows if r[1] >= T0][:2]] * 2)
     with pytest.raises(FullPage):
         fetch_binance_all(ex, T0, direct)
-    assert [r["startTime"] for r in requests] == [str(T0), str(T0 + 1)]
+    assert [r["startTime"] for r in requests] == [str(T0)]
 
 
 def test_binance_all_record_without_symbol_fails():
     ex, _ = binance_all([[(None, T0, 1e-5)]])
     with pytest.raises(MalformedRecord):
         fetch_binance_all(ex, T0, direct)
+
+
+def test_binance_all_record_that_is_not_an_object_fails():
+    ex = ccxt.binanceusdm({"enableRateLimit": False})
+    ex.fetch = lambda url, method="GET", headers=None, body=None: [["BTCUSDT", T0, "1e-5"]]
+    with pytest.raises(MalformedRecord):
+        fetch_binance_all(ex, T0, direct)
+
+
+@pytest.mark.parametrize("effective_at", [None, T0, "2026-10-21T00:00:00.000"], ids=["null", "number", "naive"])
+def test_dydx_time_must_be_an_iso_string_with_a_timezone(effective_at):
+    with pytest.raises(MalformedRecord):
+        fetch("dydx", [], T0, T0 + HOUR_MS, extra=[{"effectiveAt": effective_at, "rate": "1e-5"}])
+
+
+def test_an_infinite_time_is_malformed():
+    with pytest.raises(MalformedRecord):
+        fetch("hyperliquid", [], T0, T0 + HOUR_MS, extra=[{"coin": "BTC", "time": float("inf"), "fundingRate": "1e-5"}])
 
 
 # --- funding_rows ---

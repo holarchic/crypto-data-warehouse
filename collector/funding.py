@@ -16,7 +16,9 @@ import time
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from types import MappingProxyType
 
+import ccxt
 from backoff import RETRIABLE_EXCEPTIONS
 from config import FUNDING_LOOP, ExchangeConfig
 from rate_limiter import BINANCE_FUNDING_HISTORY_WEIGHT, RateLimiter, paced_call
@@ -64,7 +66,13 @@ class Settlement:
 
 
 def _iso_to_ms(value: str) -> int:
-    return int(datetime.fromisoformat(value.replace("Z", "+00:00")).timestamp() * 1000)
+    """An ISO-8601 time with a timezone, in ms; a naive time or a non-string raises."""
+    if not isinstance(value, str):
+        raise TypeError(f"not an ISO time: {value!r}")
+    parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    if parsed.tzinfo is None:
+        raise ValueError(f"no timezone: {value!r}")
+    return int(parsed.timestamp() * 1000)
 
 
 def _ms_to_iso(ms: int) -> str:
@@ -91,7 +99,7 @@ class Venue:
 
 
 # Keyed by exchange name (exchanges.yaml), not ccxt class: Binance runs as `binanceusdm`.
-VENUES = {
+VENUES = MappingProxyType({
     "binance": Venue(
         method="fapiPublicGetFundingRate", page_cap=1000, window_h=900,
         window_params=lambda start, end: {"startTime": start, "endTime": end, "limit": 1000},
@@ -124,7 +132,7 @@ VENUES = {
         records=lambda resp: resp["historicalFunding"], time_field="effectiveAt", rate_field="rate",
         parse_time=_iso_to_ms, lower_bounded=False,
     ),
-}
+})
 
 
 def market_params(exchange, venue_name: str, symbol: str) -> dict:
@@ -147,7 +155,7 @@ def _parse(venue: Venue, record: dict) -> tuple[int, float]:
     try:
         raw_ts = venue.parse_time(record[venue.time_field])
         rate = float(record[venue.rate_field])
-    except (KeyError, TypeError, ValueError) as exc:
+    except (KeyError, TypeError, ValueError, AttributeError, OverflowError) as exc:
         raise MalformedRecord(f"{record!r}: {exc!r}") from exc
     if not math.isfinite(rate):
         raise MalformedRecord(f"{record!r}: rate {rate}")
@@ -165,8 +173,9 @@ def _records(venue: Venue, response) -> list:
     return records
 
 
-def _truncate(raw_ts: int) -> int:
-    return raw_ts // 1000 * 1000
+def truncate_to_second(ms: int) -> int:
+    """A settlement's canonical time: venues stamp the same settlement up to ~0.3 s apart."""
+    return ms // 1000 * 1000
 
 
 def fetch_symbol_history(exchange, venue_name: str, market: dict, since_ms: int, until_ms: int,
@@ -189,40 +198,42 @@ def fetch_symbol_history(exchange, venue_name: str, market: dict, since_ms: int,
             raise FullPage(f"{venue_name} {market}: {len(page)} records in {start}..{end}")
         for raw_ts, rate in page:
             if start <= raw_ts <= end:
-                by_second.setdefault(_truncate(raw_ts), Settlement(_truncate(raw_ts), rate))
+                by_second.setdefault(truncate_to_second(raw_ts), Settlement(truncate_to_second(raw_ts), rate))
         start = end + 1
     return [by_second[ts] for ts in sorted(by_second)]
+
+
+def _binance_symbol(record) -> str:
+    symbol = record.get("symbol") if isinstance(record, dict) else None
+    if not isinstance(symbol, str) or not symbol:
+        raise MalformedRecord(f"{record!r}: no symbol")
+    return symbol
 
 
 def fetch_binance_all(exchange, since_ms: int, call: Callable) -> dict[str, list[Settlement]]:
     """Every Binance USDⓈ-M settlement from `since_ms` to now, keyed by Binance's symbol, oldest first.
 
     Pages on the raw millisecond time: the next page starts at the last row's raw time, inclusive,
-    so a page cut inside one settlement re-fetches rows rather than skipping any. Dedup is per
-    (symbol, second), so symbols settling in the same second all stay.
+    so a page cut inside one settlement re-fetches rows rather than skipping any. A full page that
+    can't move past its start (a whole page in one millisecond) raises FullPage: stepping past that
+    millisecond would skip its unseen rows. Dedup is per (symbol, second), so symbols settling in the
+    same second all stay.
     """
     venue = VENUES["binance"]
     seen: dict[str, dict[int, Settlement]] = {}
-    start, advanced_once = since_ms, False
+    start = since_ms
     while True:
         response = call(exchange.fapiPublicGetFundingRate, {"startTime": start, "limit": venue.page_cap})
-        page = []
-        for record in _records(venue, response):
-            symbol = record.get("symbol")
-            if not symbol:
-                raise MalformedRecord(f"{record!r}: no symbol")
-            page.append((symbol, *_parse(venue, record)))
+        page = [(_binance_symbol(record), *_parse(venue, record)) for record in _records(venue, response)]
         for symbol, raw_ts, rate in page:
-            seen.setdefault(symbol, {}).setdefault(_truncate(raw_ts), Settlement(_truncate(raw_ts), rate))
+            second = truncate_to_second(raw_ts)
+            seen.setdefault(symbol, {}).setdefault(second, Settlement(second, rate))
         if len(page) < venue.page_cap:
             break
         last = max(ts for _, ts, _ in page)
-        if last > start:
-            start, advanced_once = last, False
-        elif advanced_once:
+        if last <= start:
             raise FullPage(f"binance all-symbols: {len(page)} records at {start} without progress")
-        else:
-            start, advanced_once = start + 1, True
+        start = last
     return {symbol: [by_second[ts] for ts in sorted(by_second)] for symbol, by_second in seen.items()}
 
 
@@ -278,7 +289,7 @@ def _poll_binance(exchange, config, conn, instruments, cursors, now_ms, call) ->
     for instrument in instruments:
         try:
             venue_symbol = market_params(exchange, "binance", instrument.symbol)["symbol"]
-        except Exception as exc:
+        except ccxt.BadSymbol as exc:
             log.warning("[%s/funding] No market for %s: %s", config.name, instrument.symbol, exc)
             continue
         cursor = cursors.get(instrument.symbol)
@@ -363,7 +374,6 @@ def funding_loop(exchange, config: ExchangeConfig, dsn: str, rate_limiter: RateL
     conn = connect_db(dsn)
 
     while True:
-        # Reconnect if needed
         if conn.closed:
             try:
                 conn = connect_db(dsn)
@@ -372,7 +382,6 @@ def funding_loop(exchange, config: ExchangeConfig, dsn: str, rate_limiter: RateL
                 time.sleep(30)
                 continue
 
-        # Get active pairs
         try:
             pairs = active_instruments(conn, config.name)
         except Exception:
