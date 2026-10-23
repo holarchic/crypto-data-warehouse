@@ -126,7 +126,7 @@ def check_race(dsn, conn):
     # The collector inserts while the repair's transaction holds the key: it waits, then does nothing.
     with conn.cursor() as cur:
         cur.execute(fr.DELETE_SQL, {"exchange": "binance", "symbol": SYMBOL, "hi_s": (until + 1000) / 1000})
-        cur.executemany(fr.UPSERT_SQL, rows)
+        cur.executemany(fr.UPSERT_SQL, [row.params() for row in rows])
     result = {}
     collector_conn = psycopg.connect(dsn)
     with collector_conn.cursor() as cur:
