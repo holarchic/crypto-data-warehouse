@@ -118,7 +118,8 @@ def canonical(history, first_interval=None):
 # --- compare ---
 
 def test_report_counts_each_defect():
-    venue = [{"timestamp": (T0 + i * 4 * HOUR_MS) / 1000, "rate": (i + 1) * 1e-5,
+    rates = [1e-5, 2e-5, 3e-5, 4e-5, 5e-5, 6e-5]
+    venue = [{"timestamp": (T0 + i * 4 * HOUR_MS) / 1000, "rate": rates[i],
               "interval_hours": 4 if i else None} for i in range(6)]
     stored = [
         StoredRow(T0 - 8 * HOUR_MS, 1e-5, 8),  # older than the venue's history
@@ -142,6 +143,13 @@ def test_tail_counts_wrong_rates_and_accepts_jitter():
     assert compare_tail([StoredRow(T0 + 12 * HOUR_MS, 1e-5, 1)], venue) == 0
     assert compare_tail([StoredRow(T0 + 12 * HOUR_MS, 1e-4, 1)], venue) == 1
     assert compare_tail([StoredRow(T0 + 13 * HOUR_MS, 1e-5, 1)], venue) == 1
+
+
+def test_the_repair_upsert_replaces_a_conflicting_row():
+    # The collector's insert does nothing on conflict; the repair's must win (behaviour pinned in
+    # tests/integration/check_funding_repair.py against TimescaleDB).
+    assert "ON CONFLICT (exchange, symbol, timestamp) DO UPDATE" in fr.UPSERT_SQL
+    assert "interval_hours = EXCLUDED.interval_hours" in fr.UPSERT_SQL
 
 
 # --- apply ---
@@ -180,6 +188,7 @@ def test_until_is_inclusive_by_canonical_second_and_newer_rows_survive():
     assert conn.table[(SYMBOL, T0 + 8 * HOUR_MS)] == (rate_at_until, 4)
     assert (SYMBOL, T0 + 8 * HOUR_MS + 5) not in conn.table
     assert conn.table[later] == (4e-5, 4)
+    assert (SYMBOL, T0) not in conn.table  # venue history before the first stored row isn't added
 
 
 def test_retention_advancing_after_apply_is_pre_depth_and_interval_unverified():
