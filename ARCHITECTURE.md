@@ -145,6 +145,13 @@ Every host script that drives the stack sources `scripts/ops-lib.sh`. It defines
 
 No other script runs `docker compose`, except `install-cron.sh`, whose crontab text can't source a lib, or names the database identity. `tests/test_ops_lib.py` enforces both. host-monitor sources the lib behind a guard: without it, the container check pages as a failed probe and the other checks still run. `tests/integration/check_ops_lib.sh` runs migrate, verify-compression and backup against a real db with a non-default user and database.
 
+### Stability scorecard (scripts/stability-scorecard.sh)
+
+An operator report for the v0.8 gate; read-only.
+- **The shell part** reads the deployed config's metadata from the monitor container (`compose exec monitor python`), compares `config.py`, `exchanges.yaml` and `funding.py` hashes across the monitor and every running collector, and times 50 full 500-row `/candles` requests.
+- **The database part** is `scripts/stability-scorecard.sql`, run through `DB_TOOL` with `days`, `meta` and `as_of` as psql variables. It builds one temp row per (section, pair) with the slot length and expected slot range, then counts the stored slots in each range: candle rows, and the distinct funding and OI slots. It aggregates per venue with a cap at expected, and ends in one `SCORECARD-DB` marker line.
+- **Tests:** `tests/integration/check_scorecard.py` plants single faults on TimescaleDB; `tests/test_scorecard_script.py` drives the shell with stub docker and curl.
+
 ### Offsite backup (scripts/backup-offsite.sh, host cron)
 
 A nightly host-cron job at 05:30 UTC, outside compose, that does nothing until `/etc/candle-collector/restic.env` exists.

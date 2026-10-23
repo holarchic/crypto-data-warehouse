@@ -22,11 +22,13 @@ case "$PROJECT_DIR" in
 esac
 dir="$PROJECT_DIR"
 compose="cd $dir && docker compose -f docker-compose.yml -f docker-compose.prod.yml"
+# Every one-shot runs --no-deps: without it, `run` recreates the db whenever its service definition
+# changed since the db started, as a pulled compose edit does.
 block="$BEGIN
 # daily discovery (02:00 UTC)
-0 2 * * * $compose --profile discovery run --rm discovery >> /var/log/candle-collector-discovery.log 2>&1
+0 2 * * * $compose --profile discovery run --rm --no-deps discovery >> /var/log/candle-collector-discovery.log 2>&1
 # daily HL Grade-A liquidation pull (04:00 UTC)
-0 4 * * * $compose --profile liquidations-hl run --rm liquidations-hl >> /var/log/candle-collector-liquidations-hl.log 2>&1
+0 4 * * * $compose --profile liquidations-hl run --rm --no-deps liquidations-hl >> /var/log/candle-collector-liquidations-hl.log 2>&1
 # nightly offsite backup (05:30 UTC; a no-op until the restic env file exists)
 30 5 * * * $dir/scripts/backup-offsite.sh >> /var/log/candle-collector-backup.log 2>&1
 # daily HL 1m repair from REST (06:30 UTC, ~6 h background trickle)

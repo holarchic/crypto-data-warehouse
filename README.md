@@ -144,7 +144,7 @@ Paste this into Claude Code, Codex, Cursor or similar:
 
 ```text
 Install crypto-data-warehouse for me by following
-https://raw.githubusercontent.com/holarchic/crypto-data-warehouse/v0.24.1/docs/agent-install.md
+https://raw.githubusercontent.com/holarchic/crypto-data-warehouse/v0.24.2/docs/agent-install.md
 Ask me before anything that costs money, opens a public port, or deletes data.
 ```
 
@@ -163,7 +163,7 @@ The agent will ask whether you want a laptop trial or a server, check prerequisi
 | `GET /export/parquet` | HyperLiquid context, Binance open interest, HyperLiquid liquidations or Binance 1h premium index for a time window, as parquet. Longer spans: `scripts/export-feed.py` |
 | `GET /health` | Liveness |
 
-Example queries: [`deploy/README.md`](deploy/README.md#api-queries).
+Example queries: [`deploy/README.md`](deploy/README.md#api-queries). Reading the data for analysis or a backtest (row semantics, long pulls, joins without lookahead): [`docs/query-patterns.md`](docs/query-patterns.md).
 
 ## Configuration
 
