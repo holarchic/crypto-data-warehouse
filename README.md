@@ -130,7 +130,7 @@ Paste this into Claude Code, Codex, Cursor or similar:
 
 ```text
 Install crypto-data-warehouse for me by following
-https://raw.githubusercontent.com/holarchic/crypto-data-warehouse/v0.26.0/docs/agent-install.md
+https://raw.githubusercontent.com/holarchic/crypto-data-warehouse/v0.26.1/docs/agent-install.md
 Ask me before anything that costs money, opens a public port, or deletes data.
 ```
 
