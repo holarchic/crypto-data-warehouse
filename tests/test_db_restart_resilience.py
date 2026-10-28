@@ -3,7 +3,7 @@
 Both outages (2026-07-03, 2026-07-04) had the same mechanism — a graceful `db` restart broke the
 loops' long-lived connections; the ensuing DB op raised `OperationalError`, and an unguarded
 rollback/write in the error handler re-raised it out of the loop, killing the thread. These drive the
-two real remaining escape paths (funding bulk insert; candle per-pair status write) and assert the
+two real remaining escape paths (funding's Binance insert; candle per-pair status write) and assert the
 loop survives and reconnects on the next cycle. The `safe_rollback` swallow itself is proved in
 test_db.py against the REAL helper (here `db` is stubbed, so `safe_rollback` is a no-op MagicMock —
 which is fine: these tests prove the try/except GUARDS make the loop survive, not the swallow)."""
@@ -35,8 +35,8 @@ class _FakeOpError(Exception):
     """Stands in for psycopg.OperationalError raised when the server drops the connection."""
 
 
-def test_funding_loop_survives_db_restart_during_bulk_insert(monkeypatch):
-    # _poll_bulk's bulk insert sits outside the fetch handler; a db restart there used to raise
+def test_funding_loop_survives_db_restart_during_insert(monkeypatch):
+    # The Binance poll's insert sits outside the fetch handler; a db restart there used to raise
     # straight out of funding_loop. Drive it: the insert raises + drops the conn on cycle 1; the
     # loop must survive and reconnect on cycle 2 (top-of-cycle `if conn.closed:`).
     conns = []
@@ -59,14 +59,14 @@ def test_funding_loop_survives_db_restart_during_bulk_insert(monkeypatch):
 
     monkeypatch.setattr(funding, "connect_db", fake_connect)
     monkeypatch.setattr(funding, "active_instruments", lambda c, name: [instrument(symbol="BTC/USDT:USDT", asset_id="BTC")])
-    monkeypatch.setattr(funding, "_seed_funding", lambda *a: None)
-    monkeypatch.setattr(funding, "_parse_funding_record", lambda *a, **k: None)
+    monkeypatch.setattr(funding, "stored_cursors", lambda conn, name: {})
+    monkeypatch.setattr(funding, "fetch_binance_all", lambda ex, since, call: {"BTCUSDT": [funding.Settlement(0, 1e-5)]})
+    monkeypatch.setattr(funding, "market_params", lambda ex, venue, symbol: {"symbol": "BTCUSDT"})
     monkeypatch.setattr(funding, "_insert_funding", boom_insert)
-    monkeypatch.setattr(funding, "paced_call", lambda rl, ex, w, fn, *a, **k: fn(*a, **k))
     monkeypatch.setattr(funding, "_heartbeat", lambda *a: None)
     monkeypatch.setattr(funding, "_sleep_until_next_hour", stop)
 
-    ex = SimpleNamespace(fetch_funding_rates=lambda: {"BTC/USDT:USDT": {}}, last_response_headers=None)
+    ex = SimpleNamespace(last_response_headers=None)
     cfg = SimpleNamespace(name="binance", ccxt_class="binanceusdm", market_type="perp")
     try:
         funding.funding_loop(ex, cfg, "dsn", None)

@@ -113,6 +113,16 @@ services:
       WEBHOOK_URL: ${WEBHOOK_URL:-}
     restart: "no"
 
+  # Funding repair (T-035) — one-shot, run by hand per venue, that rebuilds stored funding from the
+  # venue's settled history (deploy/README.md "Funding repair").
+  funding-repair:
+    <<: *collector-common
+    profiles: ["funding-repair"]
+    entrypoint: ["python", "-m", "funding_repair"]
+    environment:
+      <<: *collector-env
+    restart: "no"
+
   api:
     build:
       context: ./api

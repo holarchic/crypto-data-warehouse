@@ -30,17 +30,16 @@ META = {
     "volume_threshold_usd": 1_000_000,
     "funding_exchanges": ["binance", "hyperliquid"],
     "oi_exchanges": ["binance", "hyperliquid"],
-    "funding_interval_hours": {"binance": 8, "hyperliquid": 1},
 }
 
 # The window is 10-18 12:00 → 10-20 12:00. ETH is discovered on a 5m slot inside it.
 #   candles: 5m bars due through 10:55 (end 11:00); 1m through 10:59 (end 11:00)
 #     binance BTC 5m 564, binance ETH 5m 347 (06:05 → 11:00), hyperliquid BTC 5m 564, binance BTC 1m 2820
-#   funding: 8 h slots due through 00:00 (end 08:00), 1 h through 09:00 (end 10:00)
-#     binance BTC 5 (10-18 16:00 … 10-20 00:00), ETH 3 (10-19 08:00 …), hyperliquid BTC 46
+#   funding: a settlement is due 2 h after it happens, so 8 h and 1 h slots are due through 10:00
+#     binance BTC 6 (10-18 16:00 … 10-20 08:00), ETH 4 (10-19 08:00 …), hyperliquid BTC 47 (10-18 12:00 …)
 #   OI: 300 s buckets binance BTC 564, ETH 347; 60 s buckets hyperliquid BTC 2820
 CANDLES = 564 + 347 + 564 + 2820
-FUNDING = 5 + 3 + 46
+FUNDING = 6 + 4 + 47
 OI = 564 + 347 + 2820
 
 PLANT = """
@@ -83,7 +82,7 @@ INSERT INTO discovery_volumes (run_date, asset_id, max_volume_usd) VALUES
     ('2026-10-20', 'BTC', 5e9), ('2026-10-20', 'ETH', 1e9), ('2026-10-20', 'DOGE', 5e5);
 """
 
-CHECKS = ("candle capture", "funding-slot occupancy (collector-assumed interval)",
+CHECKS = ("candle capture", "funding-slot occupancy (stored interval)",
           "OI bucket occupancy (60 s HL, 300 s elsewhere)", "primary keys", "discovery (union of venues)")
 CANDLE, FUNDING_CHECK, OI_CHECK, PK, DISCOVERY = CHECKS
 
@@ -108,6 +107,7 @@ class Report(NamedTuple):
     verdicts: dict      # check name -> Verdict
     venues: dict        # Venue -> Capture
     markers: list       # the SCORECARD-DB lines
+    unmeasured: list    # (exchange, symbol) funding pairs left out for a changed interval
 
 
 def check(name, ok, detail=""):
@@ -127,9 +127,12 @@ def scorecard(as_of=AS_OF, days=DAYS, meta=META):
     out = subprocess.run([*PSQL, "-A", "-v", f"days={days}", "-v", f"meta={json.dumps(meta)}", "-v", f"as_of={as_of}"],
                          input=(ROOT / "scripts/stability-scorecard.sql").read_text(),
                          capture_output=True, text=True, check=True).stdout
-    verdicts, venues = {}, {}
+    verdicts, venues, unmeasured = {}, {}, []
     for line in out.splitlines():
         cells = line.split("|")
+        if len(cells) == 3 and cells[0] == "unmeasured":
+            unmeasured.append((cells[1], cells[2]))
+            continue
         if len(cells) == 4 and cells[0] in CHECKS:
             name, measured, _target, verdict = cells
             check(f"{name} reported once", name not in verdicts)
@@ -138,7 +141,7 @@ def scorecard(as_of=AS_OF, days=DAYS, meta=META):
             section, exchange, timeframe, _pairs, expected, captured, _pct, _measured_to = cells
             venues[Venue(section, exchange, timeframe)] = Capture(int(expected), int(captured))
     markers = [line for line in out.splitlines() if line.startswith("SCORECARD-DB:")]
-    return Report(verdicts, venues, markers)
+    return Report(verdicts, venues, markers, unmeasured)
 
 
 def section_total(report, section):
@@ -191,6 +194,15 @@ DROP_HL_FUNDING_HOURS = """
 DELETE FROM funding_rates WHERE exchange = 'hyperliquid'
   AND timestamp >= :'from'::timestamptz AND timestamp < :'from'::timestamptz + make_interval(hours => :'n'::int);
 """
+CHANGE_ETH_INTERVAL = """
+DELETE FROM funding_rates WHERE symbol = 'ETH/USDT:USDT';
+INSERT INTO funding_rates (exchange, asset_id, symbol, timestamp, rate, interval_hours)
+SELECT 'binance', 'ETH', 'ETH/USDT:USDT', ts, 0.0001, 8
+FROM generate_series(timestamptz '2026-10-18 08:00+00', timestamptz '2026-10-19 08:00+00', interval '8 hours') ts;
+INSERT INTO funding_rates (exchange, asset_id, symbol, timestamp, rate, interval_hours)
+SELECT 'binance', 'ETH', 'ETH/USDT:USDT', ts, 0.0001, 4
+FROM generate_series(timestamptz '2026-10-19 12:00+00', timestamptz '2026-10-20 12:00+00', interval '4 hours') ts;
+"""
 # Exact-threshold universes: one pair whose window yields a round number of expected slots.
 ONLY_BTC_5M_1000_BARS = """
 UPDATE collection_status SET active = (exchange = 'binance' AND symbol = 'BTC/USDT:USDT' AND timeframe = '5m');
@@ -201,10 +213,10 @@ FROM generate_series(timestamptz '2026-10-16 23:40+00', timestamptz '2026-10-18 
 """
 ONLY_HL_100_FUNDING_HOURS = """
 UPDATE collection_status SET active = (exchange = 'hyperliquid');
-UPDATE collection_status SET discovered_at = '2026-10-16 06:00+00' WHERE active;     -- 100 settlements to 10:00
+UPDATE collection_status SET discovered_at = '2026-10-16 07:00+00' WHERE active;     -- 100 settlements through 10:00
 INSERT INTO funding_rates (exchange, asset_id, symbol, timestamp, rate, interval_hours)
 SELECT 'hyperliquid', 'BTC', 'BTC/USDC:USDC', ts, 0.0001, 1
-FROM generate_series(timestamptz '2026-10-16 06:00+00', timestamptz '2026-10-18 07:00+00', interval '1 hour') ts;
+FROM generate_series(timestamptz '2026-10-16 07:00+00', timestamptz '2026-10-18 07:00+00', interval '1 hour') ts;
 """
 ONLY_HL_2000_OI_MINUTES = """
 UPDATE collection_status SET active = (exchange = 'hyperliquid');
@@ -232,16 +244,30 @@ def main():
     try:
         start_db()
         run_case("baseline", expect={"candles": Capture(CANDLES, CANDLES), "funding": Capture(FUNDING, FUNDING),
-                                     "oi": Capture(OI, OI), Venue("funding", "hyperliquid", ""): Capture(46, 46)})
+                                     "oi": Capture(OI, OI), Venue("funding", "hyperliquid", ""): Capture(47, 47)})
 
         # Single faults: each flips only its own check.
         run_case("candles missing five bars", DROP_BTC_5M_BARS, {CANDLE}, **{"from": "2026-10-19 00:00+00", "n": 5},
                  expect={"candles": Capture(CANDLES, CANDLES - 5)})
         run_case("funding missing one settlement", DROP_HL_FUNDING_HOURS, {FUNDING_CHECK},
                  expect={"funding": Capture(FUNDING, FUNDING - 1)}, **{"from": "2026-10-19 05:00+00", "n": 1})
-        # HyperLiquid with no funding rows: its expected slots come from the collector's 1 h assumption.
+        # HyperLiquid with no funding rows: nothing stored names its interval, so its slots are taken
+        # at 8 h (10-18 16:00 … 10-20 08:00), and it captures none of them.
         run_case("funding venue with no rows", "DELETE FROM funding_rates WHERE exchange = 'hyperliquid';", {FUNDING_CHECK},
-                 expect={Venue("funding", "hyperliquid", ""): Capture(46, 0)})
+                 expect={Venue("funding", "hyperliquid", ""): Capture(6, 0)})
+        # ETH moves from 8 h to 4 h settlements mid-window: complete, but with no single slot length,
+        # so it leaves the denominator and is named as not measured.
+        report = run_case("funding interval changed in the window", CHANGE_ETH_INTERVAL,
+                          expect={"funding": Capture(6 + 47, 6 + 47)})
+        check("funding interval changed: the pair is counted and named as not measured",
+              "1 pair(s) not measured (interval changed)" in report.verdicts[FUNDING_CHECK].measured
+              and report.unmeasured == [("binance", "ETH/USDT:USDT")],
+              f"{report.verdicts[FUNDING_CHECK].measured} {report.unmeasured}")
+        # Lag edge: a settlement exactly 2 h before the reference time is due; a second earlier it isn't.
+        run_case("funding settlement exactly at the lag edge", as_of="2026-10-20 10:00:00+00",
+                 expect={Venue("funding", "binance", ""): Capture(10, 10), Venue("funding", "hyperliquid", ""): Capture(47, 47)})
+        run_case("funding one second before the lag edge", as_of="2026-10-20 09:59:59+00",
+                 expect={Venue("funding", "binance", ""): Capture(8, 8), Venue("funding", "hyperliquid", ""): Capture(46, 46)})
         run_case("HL OI every 5 minutes only",
                  "DELETE FROM open_interest WHERE exchange = 'hyperliquid' AND extract(minute FROM timestamp)::int % 5 <> 0;",
                  {OI_CHECK}, expect={Venue("oi", "hyperliquid", ""): Capture(2820, 564)})

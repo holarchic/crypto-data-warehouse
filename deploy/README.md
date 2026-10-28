@@ -94,6 +94,7 @@ Pass: returns ≥1 candle with all OHLCV fields populated, correct exchange/symb
 | Run discovery (prod) | `docker compose -f docker-compose.yml -f docker-compose.prod.yml --profile discovery run --rm --no-deps discovery` |
 | Offsite backup now | `./scripts/backup-offsite.sh` (see Offsite backups) |
 | List offsite snapshots | `(. scripts/offsite-lib.sh; restic_run snapshots)` |
+| Funding repair | see Funding repair below |
 | HL 1m repair, manual window | `docker compose -f docker-compose.yml -f docker-compose.prod.yml --profile hl-candles-repair run --rm --no-deps hl-candles-repair python -m hl_candles_repair --hours N` (1–72; moves the cursor only when it covers the required range) |
 
 ### Code updates
@@ -101,7 +102,7 @@ Pass: returns ≥1 candle with all OHLCV fields populated, correct exchange/symb
 - Code updates never touch the db container. `git pull`, then `./scripts/migrate.sh --status`: apply a pending migration (`./scripts/migrate.sh`) at the point its ROLLOUT note says, before or after the rebuild. Then `build` only the services whose code or config changed, including the profile one-shots `discovery` and `liquidations-hl` (they bake in `collector/` and `exchanges.yaml`), then `up -d --no-deps <svc…>`. A one-shot `run` on the server takes `--no-deps` too: without it, `run` recreates the db when its service definition changed since the db started.
 - **Releases.** `pyproject.toml` holds the release version, and the api reports it on `/openapi.json`. A deploy that rebuilds images bumps it (minor for a feature, patch for a fix) and tags the deployed commit `vX.Y.Z`. Every release rebuilds and recreates `api` too, collector-only ones included, since the api image carries the version and the collector's `config.py`, `feed_health.py` and `exchanges.yaml`. After the deploy, `curl -s localhost:8000/openapi.json | jq -r .info.version` on the server prints the tag's version.
 - Deploy mid-interval (e.g. xx:20 – xx:40), away from the 00/08/16 UTC funding settlements.
-- Restart the HyperLiquid collector only outside a repair run: not while `hl-candles-repair` is running (`docker ps`), not within 1 min of its exit, and not from 06:15 until the 06:30 cron run exits. Its startup funding seed (one 100 h `fundingHistory` call per pair, ~25 weight each, ~10 min for ~170 pairs) shares HL's per-IP weight budget with the repair.
+- Restart the HyperLiquid collector only outside a repair run: not while `hl-candles-repair` is running (`docker ps`), not within 1 min of its exit, and not from 06:15 until the 06:30 cron run exits. Its first funding poll reads each pair from its newest stored settlement, one 21-weight `fundingHistory` call per pair (six for a pair with no row in 7 days), and shares HL's per-IP weight budget with the repair.
 - `deploy/deploy.sh` is for fresh installs and full redeploys only: its `compose pull db` and stack-wide `up -d` can recreate the db onto a moved `latest-pg16`.
 
 ### DB tuning
@@ -137,22 +138,59 @@ TimescaleDB auto-tunes `max_connections` low (~25 on 8GB). Override via `command
 - **Building:** it bakes `collector/`, so rebuild it with `--profile hl-candles-repair build hl-candles-repair` after a code update.
 - **Turning it off:** remove the cron line, stop a running one (`docker ps --filter name=hl-candles-repair -q | xargs -r docker stop`), and deactivate its sentinel so it stops paging: `UPDATE collection_status SET active = FALSE WHERE exchange = 'hyperliquid' AND symbol = '*' AND timeframe = 'candle_repair'`. To turn it back on, set `active = TRUE` again and restore the cron line.
 
+## Funding repair
+
+`python -m funding_repair` rebuilds stored funding from each venue's settled history, one venue per run. It is for rows the collector wrote before it stored settled history. It reports by default and writes only with `--apply`.
+
+> [!CAUTION]
+> `--apply` deletes and rewrites a venue's funding rows. Save the venue's rows first (step 3); rows older than a venue's history (OKX keeps about 92 days) are deleted, not rebuilt.
+
+1. **Pick `--until`.** Note the time D the release that stores settled history was deployed. `--until` is the first whole hour at or after D (e.g. `2026-10-27T13:00:00Z`). Run no earlier than 2 h after it, and pass the same value to every run below.
+2. **Report.** After a code update, build it first: `"${DC[@]}" --profile funding-repair build funding-repair`.
+   ```bash
+   . scripts/ops-lib.sh
+   "${DC[@]}" --profile funding-repair run --rm --no-deps funding-repair --exchange binance --until <until>
+   ```
+   One line per symbol, then a total with the `until` used. `unfetchable` symbols (no market, or no history) are left as they are.
+3. **Save the venue's rows** on the host, with their count and checksum:
+   ```bash
+   "${DB_TOOL[@]}" psql -X -c "COPY (SELECT * FROM funding_rates WHERE exchange = 'binance' AND timestamp < '<until>'::timestamptz + interval '1 second' ORDER BY symbol, timestamp) TO STDOUT WITH CSV" > backups/funding-pre-repair-binance-<until>.csv
+   cd backups && sha256sum funding-pre-repair-binance-<until>.csv > funding-pre-repair-binance-<until>.csv.sha256; wc -l funding-pre-repair-binance-<until>.csv; cd ..
+   ```
+4. **Apply:** step 2's command with `--apply`. It exits 1 if any symbol's fetch failed; those symbols are untouched. A database error stops it; rerun with `--after <last symbol logged>`. HyperLiquid makes one call a minute and waits out the HL 1m repair, so start it in the background (`nohup … &`) and expect it to run across two or three nights. Don't start a manual HL 1m repair while it runs.
+5. **Verify:** step 2's command again. `differ`, `missing`, `unmatched` and `tail_unmatched` are 0 and no symbol is `failed`. On OKX, rows that aged out of its history since the apply show as `pre_depth` and `interval_unverified`.
+6. **Back up:** `./scripts/backup.sh`, then `./scripts/backup-offsite.sh`, and check the new snapshot (Offsite backups).
+
+**Rolling one venue back** restores step 3's file and leaves newer rows, other venues and other tables alone:
+
+```bash
+saved=backups/funding-pre-repair-binance-<until>.csv
+(cd backups && sha256sum -c "${saved##*/}.sha256") &&
+{ echo "BEGIN; DELETE FROM funding_rates WHERE exchange = 'binance' AND timestamp < '<until>'::timestamptz + interval '1 second';"
+  echo "COPY funding_rates FROM STDIN WITH CSV;"
+  cat "$saved" || exit 1          # a failed read never reaches COMMIT: psql rolls the delete back
+  echo '\.'; echo "COMMIT;"
+} | "${DB_TOOL[@]}" psql -X -v ON_ERROR_STOP=1
+```
+
+The checksum check runs first, so a missing or changed file stops before anything is deleted. Then export the same range as in step 3 and compare it with the saved file (`sha256sum`).
+
 ## Stability scorecard
 
 `./scripts/stability-scorecard.sh [--days N]` measures the roadmap's v0.8 stability gate from the stored data. It is read-only. It exits 1 when any measured check fails and prints `SCORECARD: PASS (measured checks only)` or `SCORECARD: FAIL`.
 
 - **When.** Run it mid-interval, away from the 00/08/16 UTC settlements and the 06:30 repair. The default `--days 14` scans two weeks of candles, funding and OI, under a 15-minute statement timeout. Time a `--days 1` run before the first full one. During a full run, watch the newest stored 1m bar (`/candles?exchange=binance&asset_id=BTC&timeframe=1m&limit=1`, now minus its time). Stop the run (Ctrl-C) if that lag passes 1,200 s.
-- **Config consistency.** The intervals, threshold and venue lists come from the running monitor's config. Every running collector must carry the same `config.py`, `exchanges.yaml` and `funding.py`. A `config consistent: FAIL` names the collectors built from another commit. Rebuild them before reading the rest.
-- **Database checks.** These cover the active universe only; a pair deactivated before the run doesn't count. Each pair's window opens at its first discovery, and a slot counts once it should be stored: a bar 1 h after it closes, a funding slot 2 h after it ends, an OI bucket 1 h after it ends.
+- **Config consistency.** The intervals, threshold and venue lists come from the running monitor's config. Every running collector must carry the same `config.py` and `exchanges.yaml`. A `config consistent: FAIL` names the collectors built from another commit. Rebuild them before reading the rest.
+- **Database checks.** These cover the active universe only; a pair deactivated before the run doesn't count. Each pair's window opens at its first discovery, and a slot counts once it should be stored: a bar 1 h after it closes, a funding settlement 2 h after it happens, an OI bucket 1 h after it ends.
   - **Candle capture** (≥ 99.9 %): stored bars against expected bars, by venue and timeframe. HL 1m is streamed and not covered. A venue whose API omits untraded bars (Coinbase) shows them as missed, so check the per-venue rows before reading a FAIL as loss.
-  - **Funding-slot occupancy** (≥ 99 %): slots at the collector's own assumed interval (1 h HL, 8 h elsewhere) that hold a settlement.
+  - **Funding-slot occupancy** (≥ 99 %): slots at each pair's stored interval that hold a settlement. A pair whose interval changed inside the window is named and not measured; a pair with no row in the window counts as missed.
   - **OI bucket occupancy** (≥ 95 %): 60 s buckets on HyperLiquid and 300 s elsewhere that hold a snapshot.
   - **Primary keys** on `candles`, `candles_1m`, `funding_rates` and `open_interest`.
   - **Discovery:** the latest run is dated today or yesterday (UTC), and every asset it qualified is active on some venue.
   - A pair re-activated inside the window (a weekend volume dip) counts its inactive time as missed.
 - **API p95.** 50 requests for 500 BTC 5m rows, each of which must return all 500. Under 0.5 s passes.
 - **Not measured:**
-  - native funding events (no per-symbol schedule is stored);
+  - funding rows against the venue's own history (the funding repair's report checks them);
   - per-venue discovery (discovery stores each asset's cross-venue maximum);
   - auto-recovery and gap-detection latency;
   - HL 1m;

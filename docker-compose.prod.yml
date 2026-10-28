@@ -98,6 +98,14 @@ services:
         limits:
           memory: 256m
 
+  # Holds ccxt's markets and one symbol's history at a time; the collectors run with the same
+  # markets in 512m. Run with --rm, so no logging override.
+  funding-repair:
+    deploy:
+      resources:
+        limits:
+          memory: 512m
+
   api:
     ports: !override
       - "127.0.0.1:8000:8000"

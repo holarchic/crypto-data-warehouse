@@ -37,17 +37,15 @@ AS_OF="${SCORECARD_AS_OF:-}"
 failed=0
 
 # The deployed config, from the monitor's image: the timeframe intervals, the discovery threshold,
-# which venues collect funding and OI, and the collector's assumed funding interval per venue.
+# and which venues collect funding and OI.
 read -r -d '' META_PY <<'PY' || true
-import json, config, funding
+import json, config
 configs = config.load_all_configs()
 print(json.dumps({
     "intervals": config.load_timeframe_intervals(),
     "volume_threshold_usd": config.load_discovery_config()["volume_threshold_usd"],
     "funding_exchanges": [c.name for c in configs if c.has_funding],
     "oi_exchanges": [c.name for c in configs if c.has_oi],
-    "funding_interval_hours": {c.name: funding.FUNDING_INTERVAL_HOURS.get(c.name, funding.DEFAULT_FUNDING_INTERVAL)
-                               for c in configs if c.has_funding},
 }))
 PY
 if ! meta=$("${DC[@]}" exec -T monitor python -c "$META_PY"); then
@@ -57,7 +55,7 @@ fi
 
 # The metadata is the collectors' truth only if every running collector carries the same files.
 config_hashes() {
-    "${DC[@]}" exec -T "$1" sha256sum /app/config.py /app/exchanges.yaml /app/funding.py | awk '{print $1}' | tr '\n' ' '
+    "${DC[@]}" exec -T "$1" sha256sum /app/config.py /app/exchanges.yaml | awk '{print $1}' | tr '\n' ' '
 }
 echo "=== Config consistency ==="
 if ! monitor_hashes=$(config_hashes monitor); then
@@ -149,7 +147,7 @@ else
 fi
 
 echo
-echo "NOT MEASURED: native funding events (the collector stores no per-symbol schedule); per-venue"
+echo "NOT MEASURED: funding rows against venue history (funding_repair's report checks them); per-venue"
 echo "  discovery coverage (discovery stores the cross-venue maximum); auto-recovery (T-030.2 times it);"
 echo "  gap-detection latency; HL 1m (repaired daily); Bybit/OKX 30 s and Binance settlement-window OI density."
 if [ "$failed" -eq 0 ]; then

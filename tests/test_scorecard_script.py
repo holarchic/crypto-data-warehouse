@@ -30,7 +30,7 @@ case " $* " in
     *" sha256sum "*)
         service=$(sed 's/.* exec -T \([^ ]*\) sha256sum.*/\1/' <<<"$*")
         hash=$(cat "$FAKE_HASHES/$service" 2>/dev/null || echo same)
-        for f in config.py exchanges.yaml funding.py; do echo "$hash  /app/$f"; done ;;
+        for f in config.py exchanges.yaml; do echo "$hash  /app/$f"; done ;;
     *" psql "*)
         printf 'stdin:\n%s\n' "$(cat)" >> "$DOCKER_LOG"
         printf '%s\n' "$FAKE_PSQL_OUT"
@@ -105,7 +105,7 @@ def test_everything_passing_exits_0_with_the_not_measured_list(host):
     assert result.returncode == 0, result.stdout + result.stderr
     assert "config consistent: PASS (2 collectors match the monitor)" in result.stdout
     assert "api p95 (500 rows): PASS (0.100 s < 0.500 s, 50 requests)" in result.stdout
-    assert "NOT MEASURED: native funding events" in result.stdout
+    assert "NOT MEASURED: funding rows against venue history" in result.stdout
     assert result.stdout.rstrip().endswith("SCORECARD: PASS (measured checks only)")
     assert (host / "curl.count").read_text().strip() == "50"
 
