@@ -68,7 +68,7 @@ BASE_WEIGHT = 20
 WEIGHT_PER_MIN = 20.0
 MIN_WEIGHT_PER_MIN = 5.0
 BACKOFF_429_S = 120
-# Pacing still applies, so a 46-weight call retries 138 s apart: attempts span 414 s, past 10-25's ~3.5 min outage
+# Pacing still applies: at the starting rate a 46-weight call retries 138 s apart, so its attempts span 414 s
 BACKOFF_5XX_S = 60
 MAX_ATTEMPTS = 4  # the first try plus 3 retries after a 429 or a 5xx
 LOCK_KEY = 0x484C314D  # "HL1M": one repair at a time, across cron and manual runs
@@ -287,6 +287,7 @@ def _post(payload: dict):
         with urllib.request.urlopen(req, timeout=30) as resp:
             return json.loads(resp.read())
     except urllib.error.HTTPError as e:
+        e.close()  # its socket would otherwise stay open through the retry's backoff
         if e.code == 429:
             raise RateLimited() from e
         if 500 <= e.code < 600:

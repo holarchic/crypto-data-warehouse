@@ -2,6 +2,7 @@
 and `run` against a fake HL, a fake DB and a fake clock. The real writer, SQL, bootstrap and lock run
 against TimescaleDB in tests/integration/check_hl_candles_repair.py (conftest stubs psycopg here)."""
 
+import io
 import math
 
 import hl_candles_repair as hl
@@ -152,13 +153,15 @@ def test_paced_429_and_5xx_share_four_attempts(errors, last):
 
 @pytest.mark.parametrize("code, raised", [(502, hl.Unavailable), (500, hl.Unavailable), (599, hl.Unavailable),
                                           (429, hl.RateLimited), (404, hl.FetchError), (600, hl.FetchError)])
-def test_post_maps_http_status_to_retry_class(monkeypatch, code, raised):
+def test_post_maps_http_status_to_retry_class_and_closes_the_body(monkeypatch, code, raised):
+    body = io.BytesIO(b"<html>502 Bad Gateway</html>")
+
     def urlopen(req, timeout):
-        raise hl.urllib.error.HTTPError(hl.HL_INFO_URL, code, "x", {}, None)
+        raise hl.urllib.error.HTTPError(hl.HL_INFO_URL, code, "x", {}, body)
     monkeypatch.setattr(hl.urllib.request, "urlopen", urlopen)
     with pytest.raises(raised) as e:
         hl._post({"type": "meta"})
-    assert type(e.value) is raised
+    assert type(e.value) is raised and body.closed
 
 
 # ---- parsing and coverage ----
@@ -432,7 +435,6 @@ def test_run_429_retries_counts_and_exits_1(monkeypatch):
 
 
 def test_run_retried_5xx_advances_and_exits_0(monkeypatch, caplog):
-    # 10-25: one 502 on kBONK failed its slice, held the cursor a day and paged for 18 h.
     w = World(monkeypatch, cursor=END - 20 * H)
     w.unavailable = {"BTC": 1}
     with caplog.at_level("INFO", logger=hl.log.name):
