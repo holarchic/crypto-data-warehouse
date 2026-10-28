@@ -2,6 +2,7 @@
 and `run` against a fake HL, a fake DB and a fake clock. The real writer, SQL, bootstrap and lock run
 against TimescaleDB in tests/integration/check_hl_candles_repair.py (conftest stubs psycopg here)."""
 
+import io
 import math
 
 import hl_candles_repair as hl
@@ -95,6 +96,72 @@ def test_pacer_charges_every_call_and_halves_on_429():
     p.rate_limited()
     assert (p.per_min, p.http429) == (5.0, 3)
     assert clock.sleeps[1:] == [hl.BACKOFF_429_S] * 3
+
+
+def test_pacer_backs_off_on_5xx_without_halving():
+    clock = FakeClock()
+    p = hl.Pacer(clock, clock.sleep)
+    p.unavailable()
+    assert (p.per_min, p.http5xx, clock.sleeps) == (hl.WEIGHT_PER_MIN, 1, [hl.BACKOFF_5XX_S])
+
+
+def failing_call(clock, errors, value="ok"):
+    """A call that raises `errors` in turn, then returns `value`; records each attempt's clock time."""
+    attempts = []
+
+    def call():
+        attempts.append(clock.t)
+        if len(attempts) <= len(errors):
+            raise errors[len(attempts) - 1]
+        return value
+    return call, attempts
+
+
+@pytest.mark.parametrize("weight, spacing", [(46, 138.0), (20, 60.0)])
+def test_paced_retries_a_5xx_at_the_pacing_or_backoff_spacing(weight, spacing):
+    # A slice call's pacing debt (138 s) outlasts the 60 s backoff; meta's (60 s) equals it.
+    clock = FakeClock()
+    p = hl.Pacer(clock, clock.sleep)
+    call, attempts = failing_call(clock, [hl.Unavailable("HTTP 502")] * 4)
+    with pytest.raises(hl.FetchError, match="after 4 attempts; last HTTP 502"):
+        hl.paced(p, weight, call)
+    assert attempts == pytest.approx([0, spacing, 2 * spacing, 3 * spacing])
+    assert (p.http5xx, p.http429, p.per_min) == (4, 0, hl.WEIGHT_PER_MIN)
+
+
+def test_paced_returns_after_a_5xx():
+    clock = FakeClock()
+    p = hl.Pacer(clock, clock.sleep)
+    call, attempts = failing_call(clock, [hl.Unavailable("HTTP 504")], value=[1])
+    assert hl.paced(p, 46, call) == [1]
+    assert attempts == pytest.approx([0, 138.0]) and p.http5xx == 1
+
+
+@pytest.mark.parametrize("errors, last", [
+    ([hl.RateLimited(), hl.Unavailable("HTTP 502"), hl.Unavailable("HTTP 503"), hl.Unavailable("HTTP 502")],
+     "HTTP 502"),
+    ([hl.Unavailable("HTTP 502")] * 3 + [hl.RateLimited()], "HTTP 429"),
+])
+def test_paced_429_and_5xx_share_four_attempts(errors, last):
+    clock = FakeClock()
+    p = hl.Pacer(clock, clock.sleep)
+    call, attempts = failing_call(clock, errors)
+    with pytest.raises(hl.FetchError, match=f"last {last}$"):
+        hl.paced(p, 46, call)
+    assert len(attempts) == 4 and p.http429 + p.http5xx == 4
+
+
+@pytest.mark.parametrize("code, raised", [(502, hl.Unavailable), (500, hl.Unavailable), (599, hl.Unavailable),
+                                          (429, hl.RateLimited), (404, hl.FetchError), (600, hl.FetchError)])
+def test_post_maps_http_status_to_retry_class_and_closes_the_body(monkeypatch, code, raised):
+    body = io.BytesIO(b"<html>502 Bad Gateway</html>")
+
+    def urlopen(req, timeout):
+        raise hl.urllib.error.HTTPError(hl.HL_INFO_URL, code, "x", {}, body)
+    monkeypatch.setattr(hl.urllib.request, "urlopen", urlopen)
+    with pytest.raises(raised) as e:
+        hl._post({"type": "meta"})
+    assert type(e.value) is raised and body.closed
 
 
 # ---- parsing and coverage ----
@@ -197,6 +264,9 @@ class World:
         self.malformed = set()  # coin whose answers are malformed
         self.fail = set()  # coin whose fetch fails
         self.rate_limit_next = 0
+        self.unavailable = {}  # coin -> how many 5xx it answers before succeeding
+        self.meta_unavailable = 0
+        self.meta_calls = 0
         self.alerts = []
         self.deliver = True
         self.calls = []
@@ -224,6 +294,9 @@ class World:
         if self.rate_limit_next:
             self.rate_limit_next -= 1
             raise hl.RateLimited()
+        if self.unavailable.get(coin):
+            self.unavailable[coin] -= 1
+            raise hl.Unavailable("HTTP 502")
         if coin in self.fail:
             raise hl.FetchError("boom")
         if coin in self.malformed:
@@ -232,11 +305,18 @@ class World:
         return [bar(t, coin=coin, n=0 if (coin, t) in self.untraded else 3)
                 for t in range(first, e, M) if (coin, t) not in self.missing]
 
+    def meta(self):
+        self.meta_calls += 1
+        if self.meta_unavailable:
+            self.meta_unavailable -= 1
+            raise hl.Unavailable("HTTP 502")
+        return NAMES
+
     def deps(self):
         def alert(text):
             self.alerts.append(text)
             return self.deliver
-        return hl.Deps(connect=lambda: object(), fetch_snapshot=self.fetch, fetch_meta=lambda: NAMES,
+        return hl.Deps(connect=lambda: object(), fetch_snapshot=self.fetch, fetch_meta=self.meta,
                        send_alert=alert, sleep=self.clock.sleep, clock=self.clock,
                        wall_ms=lambda: self.wall0 + int(self.clock.t * 1000))
 
@@ -352,6 +432,49 @@ def test_run_429_retries_counts_and_exits_1(monkeypatch):
     assert w.run() == 1
     assert w.advanced == [END]  # complete, so the cursor moves; the 429 still flags the run
     assert hl.BACKOFF_429_S in w.clock.sleeps
+
+
+def test_run_retried_5xx_advances_and_exits_0(monkeypatch, caplog):
+    w = World(monkeypatch, cursor=END - 20 * H)
+    w.unavailable = {"BTC": 1}
+    with caplog.at_level("INFO", logger=hl.log.name):
+        assert w.run() == 0
+    assert w.advanced == [END] and hl.BACKOFF_5XX_S in w.clock.sleeps
+    assert [c[0] for c in w.calls] == ["BTC", "BTC", "kPEPE"]
+    assert "http429=0 http5xx=1 " in next(r.getMessage() for r in caplog.records if r.getMessage().startswith("DONE"))
+
+
+def test_run_5xx_past_every_attempt_fails_the_coin(monkeypatch):
+    w = World(monkeypatch, cursor=END - 20 * H)
+    w.unavailable = {"BTC": hl.MAX_ATTEMPTS}
+    assert w.run() == 1 and w.advanced == []
+    assert [c[0] for c in w.calls].count("BTC") == hl.MAX_ATTEMPTS
+    assert not [s for s, _ in w.writes if s == "BTC/USDC:USDC"]
+
+
+def test_run_retried_5xx_on_meta_proceeds(monkeypatch):
+    w = World(monkeypatch, cursor=END - 20 * H)
+    w.meta_unavailable = 1
+    assert w.run() == 0 and w.advanced == [END] and w.meta_calls == 2
+
+
+def test_run_meta_5xx_past_every_attempt_fetches_nothing(monkeypatch):
+    w = World(monkeypatch, cursor=END - 20 * H)
+    w.meta_unavailable = hl.MAX_ATTEMPTS
+    assert w.run() == 1
+    assert (w.meta_calls, w.calls, w.advanced) == (hl.MAX_ATTEMPTS, [], [])
+
+
+def test_run_5xx_retry_rechecks_expiry(monkeypatch):
+    # The slice is inside REST's reach at its first attempt (meta's 60 s pacing, then 100 s to spare)
+    # and past it at the retry 138 s later: the retry is refused, not fetched and certified.
+    start = END - 72 * H
+    w = World(monkeypatch, cursor=END - 70 * H, pairs=PAIRS[:1],
+              wall_ms=start + hl.EXPIRY_MS - 60_000 - 100_000)
+    w.unavailable = {"BTC": 1}
+    assert w.run() == 1 and w.advanced == []
+    assert [c[1] for c in w.calls].count(start) == 1
+    assert not [ts for _, ts in w.writes if ts and ts[0] < start + hl.SLICE_MS]
 
 
 def test_run_refuses_a_slice_that_aged_past_rest_through_pacing(monkeypatch):
