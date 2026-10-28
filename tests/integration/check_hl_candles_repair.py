@@ -1,6 +1,6 @@
 """hl_candles_repair's SQL and DB functions against a real TimescaleDB, with real psycopg.
 
-The unit tests run with psycopg, db and status stubbed (tests/conftest.py), so this runs outside
+The unit tests run with psycopg and db stubbed (tests/conftest.py), so this runs outside
 pytest, inside the collector image, against a throwaway database at the current schema (db/init.sql, the ledger, then any newer migration):
 
     docker network create cc-check
@@ -24,10 +24,11 @@ import sys
 
 import hl_candles_repair as hl
 import psycopg
+import status
 
 M = hl.MINUTE_MS
 T0 = 1_792_400_000_000 // M * M
-PAIR = {"symbol": "BTC/USDC:USDC", "asset_id": "BTC", "native_symbol": "0", "market_type": "perp"}
+PAIR = status.Instrument(symbol="BTC/USDC:USDC", asset_id="BTC", native_symbol="0", market_type="perp")
 
 
 def check(name, ok, detail=""):
@@ -44,7 +45,7 @@ def bars(*rows):
 def stored(conn):
     with conn.cursor() as cur:
         cur.execute("SELECT (extract(epoch FROM timestamp) * 1000)::bigint, open, high, low, close, volume, "
-                    "trades, quote_volume FROM candles_1m WHERE symbol = %s ORDER BY timestamp", (PAIR["symbol"],))
+                    "trades, quote_volume FROM candles_1m WHERE symbol = %s ORDER BY timestamp", (PAIR.symbol,))
         return cur.fetchall()
 
 
@@ -74,9 +75,19 @@ def main():
     hl.bootstrap_cursor(conn, T0 + 60 * M)
     check("bootstrap is idempotent and keeps its anchor", hl.read_cursor(conn) == T0, str(hl.read_cursor(conn)))
     hl.advance_cursor(conn, T0 + 120 * M)
+    # read_cursor commits on the connection it reads, so a second session proves the advance landed.
+    reader = psycopg.connect(dsn)
+    check("advance is committed (seen from another session)", hl.read_cursor(reader) == T0 + 120 * M)
+    reader.close()
     check("advance moves the cursor", hl.read_cursor(conn) == T0 + 120 * M)
     hl.advance_cursor(conn, T0 + 30 * M)
     check("advance never moves it back (GREATEST)", hl.read_cursor(conn) == T0 + 120 * M)
+
+    status.upsert_discovery_pair(conn, hl.EXCHANGE, hl.MARKET_TYPE, PAIR.symbol, status.UNIVERSE_TIMEFRAME,
+                                 PAIR.asset_id, PAIR.native_symbol, 1e6)
+    conn.commit()
+    check("active instruments: the universe row, never the repair sentinel", hl.active_pairs(conn) == [PAIR],
+          str(hl.active_pairs(conn)))
 
     check("lock taken", hl.take_lock(conn))
     other = psycopg.connect(dsn)

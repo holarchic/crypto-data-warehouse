@@ -2,7 +2,9 @@
 
 from funding import DEFAULT_FUNDING_INTERVAL, FUNDING_INTERVAL_HOURS, _parse_funding_record
 
-PAIR = {"asset_id": "BTC", "symbol": "BTC/USDT:USDT"}
+from tests.instruments import instrument
+
+PAIR = instrument(asset_id="BTC", symbol="BTC/USDT:USDT")
 
 
 # --- Bulk endpoint (from_bulk=True) ---

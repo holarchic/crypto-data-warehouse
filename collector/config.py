@@ -12,7 +12,7 @@ YAML_PATH = Path(__file__).parent / "exchanges.yaml"
 # collection_status row under these pseudo-timeframes (symbol "*") at the end of
 # each poll cycle; the monitor's staleness check flags a silently-dead loop.
 # NOT candle timeframes — deliberately kept out of exchanges.yaml. Intervals feed
-# the monitor's `interval + max(interval, 1800)` threshold: funding → 2h, oi → 35m.
+# feed_health.paging_threshold_s: funding → 2h, oi → 35m.
 #
 # LIQUIDATION_WS is the streaming variant (collector/ws.py): the heartbeat fires on
 # a ~60s connection timer *while the socket is up*, not per event — a WS feed is
@@ -47,9 +47,9 @@ LOOP_INTERVALS = {FUNDING_LOOP: 3600, OI_LOOP: 300, LIQUIDATION_WS: 300, PREMIUM
 # Candle storage tables. A timeframe's `table:` in exchanges.yaml routes its candles to one of these
 # (default `candles`); `1m` routes to `candles_1m` (a separate hypertable on the ts_1m volume
 # tablespace — T-015). This is the SINGLE source of the routing: the collector insert reads
-# TimeframeConfig.table, the monitor gap-scan reads load_candle_tables(), and the api/ container
-# mirrors this allowlist (it can't import collector/). A yaml `table:` outside this set is a config
-# error (fail once at load, below) — never a per-cycle runtime KeyError.
+# TimeframeConfig.table; the monitor's gap scan and the api (which copies this module into its image)
+# read load_candle_tables(). A yaml `table:` outside this set is a config error (fail once at load,
+# below) — never a per-cycle runtime KeyError.
 CANDLE_TABLES = ("candles", "candles_1m")
 
 
@@ -60,6 +60,16 @@ def _validate_candle_table(tf_name: str, table: str) -> str:
     if table not in CANDLE_TABLES:
         raise ValueError(f"Timeframe '{tf_name}' table '{table}' not in allowlist {CANDLE_TABLES}")
     return table
+
+
+def _interval_s(tf_name: str, td: dict) -> int:
+    """A timeframe's `interval_s` must be a positive whole number of seconds. The single validation
+    seam, used by _parse_exchange and load_timeframe_intervals, so the collector, the monitor and the
+    api each fail at load on a bad value rather than computing staleness and gaps from it."""
+    value = td.get("interval_s")
+    if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+        raise ValueError(f"Timeframe '{tf_name}' interval_s must be a positive integer, got {value!r}")
+    return value
 
 
 @dataclass
@@ -137,7 +147,8 @@ def _parse_exchange(exchange_name: str, ex: dict, tf_defs: dict) -> ExchangeConf
             raise ValueError(f"Timeframe '{tf_name}' not defined in timeframes section")
         td = tf_defs[tf_name]
         table = _validate_candle_table(tf_name, td.get("table", "candles"))
-        timeframes.append(TimeframeConfig(name=tf_name, interval_s=td["interval_s"], buffer_s=td["buffer_s"], table=table))
+        timeframes.append(TimeframeConfig(name=tf_name, interval_s=_interval_s(tf_name, td), buffer_s=td["buffer_s"],
+                                          table=table))
 
     return ExchangeConfig(
         name=exchange_name,
@@ -200,9 +211,9 @@ def load_discovery_config() -> dict:
 
 
 def load_timeframe_intervals() -> dict[str, int]:
-    """Return {timeframe: interval_s} for all configured timeframes."""
+    """Return {timeframe: interval_s} for all configured timeframes, each validated."""
     raw = _load_yaml()
-    return {name: td["interval_s"] for name, td in raw["timeframes"].items()}
+    return {name: _interval_s(name, td) for name, td in raw["timeframes"].items()}
 
 
 def load_candle_tables() -> dict[str, str]:

@@ -25,7 +25,7 @@ from candles import poll_limit
 from config import PREMIUM_INTERVAL_S, PREMIUM_LOOP, PREMIUM_TIMEFRAME, ExchangeConfig
 from rate_limiter import RateLimiter, binance_kline_weight, paced_call
 from slots import sleep_until_next_slot
-from status import query_active_pairs, upsert_loop_heartbeat
+from status import Instrument, active_instruments, upsert_loop_heartbeat
 
 from db import connect_db, maybe_reload_markets, safe_rollback
 
@@ -61,7 +61,7 @@ SEED_CURSOR_SQL = """
 """
 
 
-def _build_premium_rows(raw, pair: dict, exchange_name: str, now_ms: int) -> list[dict]:
+def _build_premium_rows(raw, pair: Instrument, exchange_name: str, now_ms: int) -> list[dict]:
     """ccxt `fetch_premium_index_ohlcv` rows → premium_index row dicts. Each raw row is
     `[open_ms, open, high, low, close, volume]` with OHLC = premium-index values; the 6th
     (volume) is a ccxt-dummy and is not persisted. Drops the still-forming last bar (not yet
@@ -72,9 +72,9 @@ def _build_premium_rows(raw, pair: dict, exchange_name: str, now_ms: int) -> lis
             continue  # bar still forming — skip until it closes
         rows.append({
             "exchange": exchange_name,
-            "asset_id": pair["asset_id"],
-            "symbol": pair["symbol"],
-            "native_symbol": pair["native_symbol"],
+            "asset_id": pair.asset_id,
+            "symbol": pair.symbol,
+            "native_symbol": pair.native_symbol,
             "timestamp": ts_ms / 1000,
             "premium_open": o,
             "premium_high": h,
@@ -111,19 +111,20 @@ def _heartbeat(conn, config: ExchangeConfig, thread_name: str) -> None:
     that runs but whose API calls persistently fail keeps a fresh heartbeat (same as funding/oi)."""
     try:
         upsert_loop_heartbeat(conn, config.name, config.market_type, PREMIUM_LOOP)
+        conn.commit()
     except Exception:
         log.exception("[%s] Heartbeat upsert failed", thread_name)
         if not conn.closed:
             safe_rollback(conn)
 
 
-def _collect_premium_pair(exchange, pair: dict, config: ExchangeConfig, rate_limiter,
+def _collect_premium_pair(exchange, pair: Instrument, config: ExchangeConfig, rate_limiter,
                           conn, cursors: dict, now_ms: int) -> tuple[int, int]:
     """Fetch + insert one symbol's premium bars. Returns (closed_bars, inserted). Advances the
     in-memory cursor to the newest closed bar ONLY after a successful commit (a fetch/insert
     failure leaves the cursor unadvanced → retried next cycle, no gap). Non-priority on the
     shared limiter (yields to candles + dense OI)."""
-    symbol = pair["symbol"]
+    symbol = pair.symbol
     cursor = cursors.get(symbol)
     if cursor is None:
         since_ms = None            # forward-only first fetch: latest PREMIUM_SEED_LIMIT bars
@@ -179,7 +180,7 @@ def premium_index_loop(exchange, config: ExchangeConfig, dsn: str, rate_limiter:
                 continue
 
         try:
-            pairs = query_active_pairs(conn, config.name, "5m")
+            pairs = active_instruments(conn, config.name)
         except Exception:
             log.exception("[%s] Failed to query active pairs", thread_name)
             safe_rollback(conn)
@@ -197,7 +198,7 @@ def premium_index_loop(exchange, config: ExchangeConfig, dsn: str, rate_limiter:
         # state does none). A seed FAILURE must not fall through to a forward-only poll (it would
         # skip the gap), so heartbeat for liveness + retry next cycle. A genuinely new symbol has no
         # premium rows → absent from the seed result → stays cursorless → forward-only (correct).
-        active_syms = {p["symbol"] for p in pairs}
+        active_syms = {p.symbol for p in pairs}
         if active_syms - cursors.keys():
             try:
                 cursors.update(_seed_cursors(conn, config.name))
@@ -220,7 +221,7 @@ def premium_index_loop(exchange, config: ExchangeConfig, dsn: str, rate_limiter:
                 inserted += i
             except RETRIABLE_EXCEPTIONS as exc:
                 errors += 1
-                log.warning("[%s] Retriable error on %s: %s", thread_name, pair["symbol"], exc)
+                log.warning("[%s] Retriable error on %s: %s", thread_name, pair.symbol, exc)
                 if conn.closed:
                     try:
                         conn = connect_db(dsn)
@@ -230,7 +231,7 @@ def premium_index_loop(exchange, config: ExchangeConfig, dsn: str, rate_limiter:
                 safe_rollback(conn)  # clear any aborted txn (no per-symbol status row to write)
             except Exception as exc:
                 errors += 1
-                log.warning("[%s] Error on %s: %s", thread_name, pair["symbol"], exc)
+                log.warning("[%s] Error on %s: %s", thread_name, pair.symbol, exc)
                 safe_rollback(conn)
 
         log.info("[%s] Poll: fetched=%d inserted=%d (%d pairs, %d errors)",

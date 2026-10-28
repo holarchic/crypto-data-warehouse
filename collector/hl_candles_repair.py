@@ -44,7 +44,7 @@ from dataclasses import dataclass, field
 import psycopg
 from config import CANDLE_REPAIR
 from monitor import send_webhook
-from status import LOOP_SENTINEL_SYMBOL, query_active_pairs, upsert_status_success
+from status import LOOP_SENTINEL_SYMBOL, Instrument, active_instruments, upsert_status_success
 
 from db import build_dsn, connect_db, safe_rollback
 
@@ -53,7 +53,6 @@ log = logging.getLogger(__name__)
 HL_INFO_URL = "https://api.hyperliquid.xyz/info"
 EXCHANGE = "hyperliquid"
 MARKET_TYPE = "perp"
-PAIRS_TIMEFRAME = "5m"  # the pair set the WS feed subscribes (ws.py)
 
 MINUTE_MS = 60_000
 HOUR_MS = 3_600_000
@@ -334,23 +333,23 @@ def bootstrap_cursor(conn, cursor_ms: int) -> None:
     conn.commit()
 
 
-def stored_minutes(conn, pair: dict, start_ms: int, end_ms: int) -> set[int]:
+def stored_minutes(conn, pair: Instrument, start_ms: int, end_ms: int) -> set[int]:
     with conn.cursor() as cur:
-        cur.execute(STORED_MINUTES_SQL, {"exchange": EXCHANGE, "market_type": pair["market_type"],
-                                         "symbol": pair["symbol"], "start_s": start_ms / 1000,
+        cur.execute(STORED_MINUTES_SQL, {"exchange": EXCHANGE, "market_type": pair.market_type,
+                                         "symbol": pair.symbol, "start_s": start_ms / 1000,
                                          "end_s": end_ms / 1000})
         rows = cur.fetchall()
     conn.commit()
     return {int(r[0]) for r in rows}
 
 
-def write_bars(conn, pair: dict, bars: list[dict]) -> tuple[int, int]:
+def write_bars(conn, pair: Instrument, bars: list[dict]) -> tuple[int, int]:
     """Upsert the traded bars in one transaction; returns (inserted, updated). An unchanged row
     returns no result row, so every result set is read, not just the first."""
     if not bars:
         return 0, 0
-    params = [{"exchange": EXCHANGE, "market_type": pair["market_type"], "asset_id": pair["asset_id"],
-               "symbol": pair["symbol"], "native_symbol": pair.get("native_symbol") or "",
+    params = [{"exchange": EXCHANGE, "market_type": pair.market_type, "asset_id": pair.asset_id,
+               "symbol": pair.symbol, "native_symbol": pair.native_symbol or "",
                "timestamp": b["t"] / 1000, "open": b["open"], "high": b["high"], "low": b["low"],
                "close": b["close"], "volume": b["volume"], "trades": b["n"]} for b in bars]
     inserted = updated = 0
@@ -367,15 +366,17 @@ def write_bars(conn, pair: dict, bars: list[dict]) -> tuple[int, int]:
     return inserted, updated
 
 
-def active_pairs(conn) -> list[dict]:
-    """The WS feed's pair set, with the read transaction closed before hours of paced HTTP."""
-    pairs = query_active_pairs(conn, EXCHANGE, PAIRS_TIMEFRAME)
+def active_pairs(conn) -> list[Instrument]:
+    """The venue's instruments (the set the WS feed subscribes), with the read transaction closed
+    before hours of paced HTTP."""
+    pairs = active_instruments(conn, EXCHANGE)
     conn.commit()
     return pairs
 
 
 def advance_cursor(conn, end_ms: int) -> None:
     upsert_status_success(conn, EXCHANGE, MARKET_TYPE, LOOP_SENTINEL_SYMBOL, CANDLE_REPAIR, end_ms / 1000)
+    conn.commit()
 
 
 @dataclass
@@ -431,7 +432,7 @@ def _result(status: str, conflict: bool = False, inserted: int = 0, updated: int
             "first_minute": first_minute}
 
 
-def repair_slice(session: Session, pacer: Pacer, deps: Deps, pair: dict, coin: str | None,
+def repair_slice(session: Session, pacer: Pacer, deps: Deps, pair: Instrument, coin: str | None,
                  start_ms: int, end_ms: int) -> dict:
     if coin is None:
         return _result("failed")
@@ -466,19 +467,19 @@ def _span(start_ms: int, end_ms: int) -> str:
     return f"{_minute(start_ms)}..{_minute(end_ms)}"
 
 
-def repair(session: Session, pacer: Pacer, deps: Deps, pairs: list[dict], names: dict[str, str],
+def repair(session: Session, pacer: Pacer, deps: Deps, pairs: list[Instrument], names: dict[str, str],
            start_ms: int, end_ms: int) -> dict[str, list[dict]]:
     """Every coin over every slice, oldest slice first; returns each coin's slice results."""
-    results = {p["symbol"]: [] for p in pairs}
+    results = {p.symbol: [] for p in pairs}
     for s, e in slices(start_ms, end_ms):
         for pair in pairs:
-            coin = names.get(pair["asset_id"])
+            coin = names.get(pair.asset_id)
             r = repair_slice(session, pacer, deps, pair, coin, s, e)
-            results[pair["symbol"]].append(r)
+            results[pair.symbol].append(r)
             if r["inserted"] or r["updated"] or r["status"] not in ("complete", "empty") \
                     or r["stored_conflict"]:
                 listed = f" listed_from={_minute(r['first_minute'])}" if r["status"] == "leading" else ""
-                log.info("%s %s: %s inserted=%d updated=%d stored_conflict=%s%s", coin or pair["asset_id"],
+                log.info("%s %s: %s inserted=%d updated=%d stored_conflict=%s%s", coin or pair.asset_id,
                          _span(s, e), r["status"], r["inserted"], r["updated"], r["stored_conflict"], listed)
     return results
 
@@ -510,7 +511,7 @@ def run(now_ms: int, hours: int | None, deps: Deps) -> int:
         delivered = report_loss(win.lost, deps) if win.lost else True
         pairs = session.call(active_pairs)
         if not pairs:
-            log.error("no active %s %s pairs; nothing certified", EXCHANGE, PAIRS_TIMEFRAME)
+            log.error("no active %s instruments; nothing certified", EXCHANGE)
             return 1
         pacer = Pacer(deps.clock, deps.sleep)
         try:

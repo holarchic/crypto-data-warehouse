@@ -1,15 +1,16 @@
-"""Tests for collector/candles.py (poll_limit weight diet) and its wiring into
-_collect_pair. The pure helper is tested directly; the wiring is tested against the
-REAL main module (conftest stubs `main` as a MagicMock, so we load main.py in
-isolation via importlib to exercise the actual limit selection, not a mock).
+"""Tests for collector/candles.py, the REST candle feed: the poll_limit weight diet and its wiring
+into _collect_pair, the per-table INSERTs, the bar-and-cursor transaction, and candle_loop's pacing.
+`candles` is a real module under conftest (only `db`, `main`, `oi` and `backoff` are stubbed), so the
+tests patch its own bindings.
 """
 
-import importlib.util
 from datetime import datetime, timezone
-from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import MagicMock
 
-import config as _config_mod  # real collector module — gives us the collector dir
+import candles as candles_mod
+import pytest
+import status
 from candles import (
     CANDLE_LIMIT_MARGIN,
     CANDLE_LIMIT_MIN,
@@ -18,17 +19,7 @@ from candles import (
 )
 from rate_limiter import binance_kline_weight
 
-_MAIN_PATH = Path(_config_mod.__file__).parent / "main.py"
-
-
-def _load_real_main():
-    """Load collector/main.py under a private name so we run the real _collect_pair /
-    fetch_candles without disturbing the shared `main` stub other tests rely on."""
-    spec = importlib.util.spec_from_file_location("main_real", _MAIN_PATH)
-    mod = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(mod)
-    return mod
-
+from tests.fakes import RecordingConn
 
 # --- poll_limit pure helper ---------------------------------------------------
 
@@ -68,10 +59,10 @@ def test_poll_limit_floors_on_clock_skew():
     assert poll_limit(since_ms, now_ms, interval_s) == CANDLE_LIMIT_MIN
 
 
-# --- _collect_pair wiring (real main) -----------------------------------------
+# --- _collect_pair wiring ----------------------------------------------------
 
 
-def _run_collect_pair(main_mod, monkeypatch, last_timestamp, weight_budget, poll_max_bars=None, results=None,
+def _run_collect_pair(candles_mod, monkeypatch, last_timestamp, weight_budget, poll_max_bars=None, results=None,
                       scan_from=None):
     """Drive the real _collect_pair with fetch_candles patched to capture its `limit` (and every
     call in `captured["calls"]`). `results` lists what successive fetches return (default: [])."""
@@ -85,36 +76,34 @@ def _run_collect_pair(main_mod, monkeypatch, last_timestamp, weight_budget, poll
         captured["calls"].append({"since_ms": since_ms, "until_ms": until_ms})
         return pending.pop(0) if pending else []  # empty → insert_candles/status paths are no-ops
 
-    monkeypatch.setattr(main_mod, "fetch_candles", _fake_fetch)
-    monkeypatch.setattr(main_mod, "insert_candles", lambda conn, candles, table: len(candles))
-    monkeypatch.setattr(main_mod, "upsert_status_success", lambda *a, **k: None)
+    monkeypatch.setattr(candles_mod, "fetch_candles", _fake_fetch)
+    monkeypatch.setattr(candles_mod, "insert_candles", lambda conn, candles, table: len(candles))
+    monkeypatch.setattr(candles_mod, "upsert_status_success", lambda *a, **k: None)
     # Freeze wall clock so the poll_limit gap is deterministic.
     fixed_now = 1_700_000_000.0
-    monkeypatch.setattr(main_mod.time, "time", lambda: fixed_now)
+    monkeypatch.setattr(candles_mod.time, "time", lambda: fixed_now)
 
     config = SimpleNamespace(name="binance", market_type="perp", rate_limit_weight_budget=weight_budget,
                              poll_max_bars=poll_max_bars)
     tf = SimpleNamespace(name="5m", interval_s=300, table="candles")
     pair = {"asset_id": "BTC", "symbol": "BTC/USDT:USDT", "native_symbol": "BTCUSDT",
             "market_type": "perp", "last_timestamp": last_timestamp}
-    main_mod._collect_pair(object(), pair, config, tf, None, None, "binance/5m", {} if scan_from is None else scan_from)
+    candles_mod._collect_pair(object(), pair, config, tf, None, MagicMock(), "binance/5m", {} if scan_from is None else scan_from)
     return captured, fixed_now
 
 
 def test_collect_pair_seed_uses_full_limit(monkeypatch):
     # Seed (no stored candle) fetches max history regardless of venue.
-    main_mod = _load_real_main()
-    captured, _ = _run_collect_pair(main_mod, monkeypatch, last_timestamp=None, weight_budget=2400)
+    captured, _ = _run_collect_pair(candles_mod, monkeypatch, last_timestamp=None, weight_budget=2400)
     assert captured["since_ms"] is None
     assert captured["limit"] == CANDLE_SEED_LIMIT
 
 
 def test_collect_pair_poll_weight_bound_uses_diet(monkeypatch):
     # Poll on a weight-bound venue (Binance) sizes the limit to the gap — small, not 1000.
-    main_mod = _load_real_main()
     interval_s = 300
     stored = datetime.fromtimestamp(1_700_000_000.0 - 3 * interval_s, tz=timezone.utc)
-    captured, now = _run_collect_pair(main_mod, monkeypatch, last_timestamp=stored, weight_budget=2400)
+    captured, now = _run_collect_pair(candles_mod, monkeypatch, last_timestamp=stored, weight_budget=2400)
     expected = poll_limit(captured["since_ms"], int(now * 1000), interval_s)
     assert captured["limit"] == expected
     assert captured["limit"] < CANDLE_SEED_LIMIT  # diet applied
@@ -122,10 +111,9 @@ def test_collect_pair_poll_weight_bound_uses_diet(monkeypatch):
 
 def test_collect_pair_poll_non_weight_bound_keeps_full_limit(monkeypatch):
     # Poll on a non-weight-bound venue keeps the flat 1000 — diet is Binance-only.
-    main_mod = _load_real_main()
     interval_s = 300
     stored = datetime.fromtimestamp(1_700_000_000.0 - 3 * interval_s, tz=timezone.utc)
-    captured, _ = _run_collect_pair(main_mod, monkeypatch, last_timestamp=stored, weight_budget=None)
+    captured, _ = _run_collect_pair(candles_mod, monkeypatch, last_timestamp=stored, weight_budget=None)
     assert captured["limit"] == CANDLE_SEED_LIMIT
 
 
@@ -146,10 +134,9 @@ def _hl_buckets(start_ms, end_ms, interval_s):
 
 def test_collect_pair_poll_caps_the_window_at_poll_max_bars(monkeypatch):
     # HL charges by bars returned: a poll 3 h behind asks for 60 bars, not since→now.
-    main_mod = _load_real_main()
     stored = datetime.fromtimestamp(1_700_000_000.0 - 36 * 300, tz=timezone.utc)
     bar = {"timestamp": 1_699_990_000.0}
-    captured, _ = _run_collect_pair(main_mod, monkeypatch, last_timestamp=stored, weight_budget=None,
+    captured, _ = _run_collect_pair(candles_mod, monkeypatch, last_timestamp=stored, weight_budget=None,
                                     poll_max_bars=60, results=[[bar]])
     since = captured["calls"][0]["since_ms"]
     assert captured["calls"] == [{"since_ms": since, "until_ms": _window_end(since, 300, 60)}]
@@ -158,33 +145,30 @@ def test_collect_pair_poll_caps_the_window_at_poll_max_bars(monkeypatch):
 def test_collect_pair_capped_seed_walks_the_seed_depth_forward(monkeypatch):
     # A cursorless pair on a capped venue starts CANDLE_SEED_LIMIT bars back, one 60-bar window a
     # poll, not with a 1000-bar tail request.
-    main_mod = _load_real_main()
-    captured, now = _run_collect_pair(main_mod, monkeypatch, last_timestamp=None, weight_budget=None,
+    captured, now = _run_collect_pair(candles_mod, monkeypatch, last_timestamp=None, weight_budget=None,
                                       poll_max_bars=60)
     since = int(now * 1000) - CANDLE_SEED_LIMIT * 300 * 1000
     assert captured["calls"] == [{"since_ms": since, "until_ms": _window_end(since, 300, 60)}]
 
 
 def test_collect_pair_uncapped_seed_is_a_tail_request(monkeypatch):
-    main_mod = _load_real_main()
-    captured, _ = _run_collect_pair(main_mod, monkeypatch, last_timestamp=None, weight_budget=None)
+    captured, _ = _run_collect_pair(candles_mod, monkeypatch, last_timestamp=None, weight_budget=None)
     assert captured["calls"] == [{"since_ms": None, "until_ms": None}]
 
 
 def test_collect_pair_empty_capped_window_moves_the_scan_past_it(monkeypatch):
     # A cursor 10 days behind (older than the venue keeps, say): the first 60-bar window is empty.
     # The next poll asks for the following 60 bars, never for since→now in one heavy request.
-    main_mod = _load_real_main()
     stored = datetime.fromtimestamp(1_700_000_000.0 - 10 * 86400, tz=timezone.utc)
     scan_from = {}
-    captured, _ = _run_collect_pair(main_mod, monkeypatch, last_timestamp=stored, weight_budget=None,
+    captured, _ = _run_collect_pair(candles_mod, monkeypatch, last_timestamp=stored, weight_budget=None,
                                     poll_max_bars=60, scan_from=scan_from)
     since = captured["calls"][0]["since_ms"]
     first_end = _window_end(since, 300, 60)
     assert captured["calls"] == [{"since_ms": since, "until_ms": first_end}]
     assert scan_from == {"BTC/USDT:USDT": first_end + 1}
     bar = {"timestamp": (first_end + 600_000) / 1000}
-    captured, _ = _run_collect_pair(main_mod, monkeypatch, last_timestamp=stored, weight_budget=None,
+    captured, _ = _run_collect_pair(candles_mod, monkeypatch, last_timestamp=stored, weight_budget=None,
                                     poll_max_bars=60, scan_from=scan_from, results=[[bar]])
     assert captured["calls"] == [{"since_ms": first_end + 1, "until_ms": _window_end(first_end + 1, 300, 60)}]
     assert scan_from == {}  # bars found: the stored cursor leads again
@@ -192,10 +176,9 @@ def test_collect_pair_empty_capped_window_moves_the_scan_past_it(monkeypatch):
 
 def test_collect_pair_caught_up_empty_window_does_not_move_the_scan(monkeypatch):
     # Caught up (the 60-bar window reaches past now): an empty answer is just no new bar yet.
-    main_mod = _load_real_main()
     stored = datetime.fromtimestamp(1_700_000_000.0 - 300, tz=timezone.utc)
     scan_from = {}
-    captured, _ = _run_collect_pair(main_mod, monkeypatch, last_timestamp=stored, weight_budget=None,
+    captured, _ = _run_collect_pair(candles_mod, monkeypatch, last_timestamp=stored, weight_budget=None,
                                     poll_max_bars=60, scan_from=scan_from)
     assert len(captured["calls"]) == 1
     assert scan_from == {}
@@ -206,7 +189,6 @@ def test_capped_hl_requests_return_at_most_poll_max_bars_raw_candles(monkeypatch
     # poll_max_bars raw candles back, so each weighs 20 + ceil(60 / 60) = 21.
     import ccxt
 
-    main_mod = _load_real_main()
     exchange = ccxt.hyperliquid({"options": {"fetchMarkets": {"types": ["swap"]}}})
     raw_counts = []
 
@@ -225,15 +207,15 @@ def test_capped_hl_requests_return_at_most_poll_max_bars_raw_candles(monkeypatch
 
     exchange.publicPostInfo = post_info
     exchange.load_markets()
-    monkeypatch.setattr(main_mod, "insert_candles", lambda conn, candles, table: len(candles))
-    monkeypatch.setattr(main_mod, "upsert_status_success", lambda *a, **k: None)
+    monkeypatch.setattr(candles_mod, "insert_candles", lambda conn, candles, table: len(candles))
+    monkeypatch.setattr(candles_mod, "upsert_status_success", lambda *a, **k: None)
     config = SimpleNamespace(name="hyperliquid", market_type="perp", rate_limit_weight_budget=None, poll_max_bars=60)
     tf = SimpleNamespace(name="5m", interval_s=300, table="candles")
     behind = datetime.fromtimestamp(datetime.now(timezone.utc).timestamp() - 86400, tz=timezone.utc)  # catch-up
     for last in (behind, None):  # then a seed
         pair = {"asset_id": "BTC", "symbol": "BTC/USDC:USDC", "native_symbol": "", "market_type": "perp",
                 "last_timestamp": last}
-        main_mod._collect_pair(exchange, pair, config, tf, main_mod.RateLimiter(0), None, "hyperliquid/5m", {})
+        candles_mod._collect_pair(exchange, pair, config, tf, candles_mod.RateLimiter(0), MagicMock(), "hyperliquid/5m", {})
     assert raw_counts == [60, 60]
 
 
@@ -242,15 +224,13 @@ def test_capped_hl_requests_return_at_most_poll_max_bars_raw_candles(monkeypatch
 
 def test_insert_sql_is_keyed_by_table():
     # One INSERT per candle table, targeting the right table (built from CANDLE_TABLES at import).
-    main_mod = _load_real_main()
-    assert set(main_mod.INSERT_SQL) == {"candles", "candles_1m"}
-    assert "INTO candles (" in main_mod.INSERT_SQL["candles"]
-    assert "INTO candles_1m (" in main_mod.INSERT_SQL["candles_1m"]
+    assert set(candles_mod.INSERT_SQL) == {"candles", "candles_1m"}
+    assert "INTO candles (" in candles_mod.INSERT_SQL["candles"]
+    assert "INTO candles_1m (" in candles_mod.INSERT_SQL["candles_1m"]
 
 
 def test_insert_candles_selects_table(monkeypatch):
     # insert_candles(table=...) executes the SQL for that table; unknown table fails fast.
-    main_mod = _load_real_main()
     executed = {}
 
     class _Cur:
@@ -266,39 +246,84 @@ def test_insert_candles_selects_table(monkeypatch):
     row = {"exchange": "binance", "market_type": "perp", "asset_id": "BTC", "symbol": "B",
            "native_symbol": "B", "timeframe": "1m", "timestamp": 1.0, "open": 1, "high": 1,
            "low": 1, "close": 1, "volume": 1, "quote_volume": None, "trades": None}
-    main_mod.insert_candles(_Conn(), [row], "candles_1m")
+    candles_mod.insert_candles(_Conn(), [row], "candles_1m")
     assert "INTO candles_1m (" in executed["sql"]
     import pytest
     with pytest.raises(KeyError):
-        main_mod.insert_candles(_Conn(), [row], "no_such_table")
+        candles_mod.insert_candles(_Conn(), [row], "no_such_table")
 
 
 def test_collect_pair_threads_tf_table(monkeypatch):
     # _collect_pair must route the insert to tf.table (so 1m lands in candles_1m).
-    main_mod = _load_real_main()
     captured = {}
-    monkeypatch.setattr(main_mod, "fetch_candles", lambda *a, **k: [{"timestamp": 1.0}])
-    monkeypatch.setattr(main_mod, "insert_candles",
+    monkeypatch.setattr(candles_mod, "fetch_candles", lambda *a, **k: [{"timestamp": 1.0}])
+    monkeypatch.setattr(candles_mod, "insert_candles",
                         lambda conn, candles, table="candles": captured.setdefault("table", table) or 1)
-    monkeypatch.setattr(main_mod, "upsert_status_success", lambda *a, **k: None)
-    monkeypatch.setattr(main_mod.time, "time", lambda: 1_700_000_000.0)
+    monkeypatch.setattr(candles_mod, "upsert_status_success", lambda *a, **k: None)
+    monkeypatch.setattr(candles_mod.time, "time", lambda: 1_700_000_000.0)
     config = SimpleNamespace(name="binance", market_type="perp", rate_limit_weight_budget=None, poll_max_bars=None)
     tf = SimpleNamespace(name="1m", interval_s=60, table="candles_1m")
     pair = {"asset_id": "BTC", "symbol": "B", "native_symbol": "B",
             "market_type": "perp", "last_timestamp": None}
-    main_mod._collect_pair(object(), pair, config, tf, None, object(), "binance/1m", {})
+    candles_mod._collect_pair(object(), pair, config, tf, None, MagicMock(), "binance/1m", {})
     assert captured["table"] == "candles_1m"
 
 
-# --- collect_loop pacing: each cycle paces from its own start ---------------------
+# --- one transaction per pair: bars and cursor commit together -------------------------
+
+
+def _bars(n):
+    return [{"exchange": "binance", "market_type": "perp", "asset_id": "BTC", "symbol": "B", "native_symbol": "B",
+             "timeframe": "5m", "timestamp": 1_699_999_000.0 + 300 * i, "open": 1, "high": 1, "low": 1, "close": 1,
+             "volume": 1, "quote_volume": None, "trades": None} for i in range(n)]
+
+
+def _collect_into(candles_mod, monkeypatch, conn):
+    monkeypatch.setattr(candles_mod, "fetch_candles", lambda *a, **k: _bars(2))
+    config = SimpleNamespace(name="binance", market_type="perp", rate_limit_weight_budget=None, poll_max_bars=None)
+    tf = SimpleNamespace(name="5m", interval_s=300, table="candles")
+    pair = {"asset_id": "BTC", "symbol": "B", "native_symbol": "B", "market_type": "perp", "last_timestamp": None}
+    candles_mod._collect_pair(object(), pair, config, tf, None, conn, "binance/5m", {})
+    return config, tf, pair
+
+
+def test_collect_pair_commits_bars_and_cursor_once(monkeypatch):
+    conn = RecordingConn()
+    _collect_into(candles_mod, monkeypatch, conn)
+    assert conn.kinds() == ["execute", "execute", "execute", "commit"]
+    assert all("INSERT INTO candles (" in e.sql for e in conn.events[:2])
+    assert conn.events[2].sql == status.UPSERT_SUCCESS_SQL
+
+
+class _CursorWriteFails(RecordingConn):
+    def execute(self, sql, params=None):
+        super().execute(sql, params)
+        if sql == status.UPSERT_SUCCESS_SQL:
+            raise RuntimeError("cursor write failed")
+
+
+def test_a_failed_cursor_write_rolls_the_bars_back_then_commits_the_error(monkeypatch):
+    monkeypatch.setattr(candles_mod, "safe_rollback", lambda conn: conn.rollback())  # db.safe_rollback's effect
+    conn = _CursorWriteFails()
+    with pytest.raises(RuntimeError) as failure:
+        _collect_into(candles_mod, monkeypatch, conn)
+    assert "commit" not in conn.kinds()
+    config, tf, pair = SimpleNamespace(name="binance", market_type="perp"), SimpleNamespace(name="5m"), {"symbol": "B"}
+    candles_mod._record_pair_error(conn, config, pair, tf, failure.value)
+    tail = conn.events[3:]
+    assert [e.kind for e in tail] == ["rollback", "execute", "commit"]
+    assert tail[1].sql == status.UPSERT_ERROR_SQL
+
+
+# --- candle_loop pacing: each cycle paces from its own start ---------------------
 
 
 class _StopLoop(Exception):
     pass
 
 
-def _drive_collect_loop(main_mod, monkeypatch, tf, cycles, connect=None):
-    """Run collect_loop for `cycles` pacing calls against fakes and a ticking clock (1000, 1001, …);
+def _drive_candle_loop(candles_mod, monkeypatch, tf, cycles, connect=None):
+    """Run candle_loop for `cycles` pacing calls against fakes and a ticking clock (1000, 1001, …);
     return the recorded `sleep_until_next_slot` arguments."""
     clock = {"t": 999.0}
 
@@ -314,40 +339,37 @@ def _drive_collect_loop(main_mod, monkeypatch, tf, cycles, connect=None):
             raise _StopLoop
 
     conn = SimpleNamespace(closed=False)
-    monkeypatch.setattr(main_mod.time, "time", now)
-    monkeypatch.setattr(main_mod.time, "sleep", lambda s: None)
-    monkeypatch.setattr(main_mod, "connect_db", connect or (lambda dsn: conn))
-    monkeypatch.setattr(main_mod, "maybe_reload_markets", lambda ex: None)
-    monkeypatch.setattr(main_mod, "query_active_pairs", lambda c, n, t: [{"symbol": "BTC/USDT:USDT"}])
+    monkeypatch.setattr(candles_mod.time, "time", now)
+    monkeypatch.setattr(candles_mod.time, "sleep", lambda s: None)
+    monkeypatch.setattr(candles_mod, "connect_db", connect or (lambda dsn: conn))
+    monkeypatch.setattr(candles_mod, "maybe_reload_markets", lambda ex: None)
+    monkeypatch.setattr(candles_mod, "query_active_pairs", lambda c, n, t: [{"symbol": "BTC/USDT:USDT"}])
     # The fake poll reads the clock, as real polls do, so a start taken at cycle end reads later.
-    monkeypatch.setattr(main_mod, "_collect_pair", lambda *a: main_mod.time.time())
-    monkeypatch.setattr(main_mod, "sleep_until_next_slot", pace)
+    monkeypatch.setattr(candles_mod, "_collect_pair", lambda *a: candles_mod.time.time())
+    monkeypatch.setattr(candles_mod, "sleep_until_next_slot", pace)
     cfg = SimpleNamespace(name="binance", market_type="perp")
     try:
-        main_mod.collect_loop(object(), cfg, tf, "dsn", None)
+        candles_mod.candle_loop(object(), cfg, tf, "dsn", None)
     except _StopLoop:
         pass
     return calls
 
 
-def test_collect_loop_paces_each_cycle_from_its_start(monkeypatch):
-    main_mod = _load_real_main()
+def test_candle_loop_paces_each_cycle_from_its_start(monkeypatch):
     tf = SimpleNamespace(name="5m", interval_s=300, buffer_s=30, table="candles")
-    calls = _drive_collect_loop(main_mod, monkeypatch, tf, cycles=2)
+    calls = _drive_candle_loop(candles_mod, monkeypatch, tf, cycles=2)
     # 5m runs its first cycle at once (no wait); each wait then targets the slot after the start
     # of the cycle just ended: 1000, then 1002 (the poll in between reads 1001).
     assert calls == [(300, 30, 1000.0, "binance/5m"), (300, 30, 1002.0, "binance/5m")]
 
 
-def test_collect_loop_deferred_first_cycle_waits_for_the_slot_after_now(monkeypatch):
-    main_mod = _load_real_main()
+def test_candle_loop_deferred_first_cycle_waits_for_the_slot_after_now(monkeypatch):
     tf = SimpleNamespace(name="1h", interval_s=3600, buffer_s=60, table="candles")
-    calls = _drive_collect_loop(main_mod, monkeypatch, tf, cycles=2)
+    calls = _drive_candle_loop(candles_mod, monkeypatch, tf, cycles=2)
     assert calls == [(3600, 60, None, "binance/1h"), (3600, 60, 1000.0, "binance/1h")]
 
 
-def test_collect_loop_drops_scan_state_for_deactivated_pairs(monkeypatch):
-    main_mod = _load_real_main()
+def test_candle_loop_drops_scan_state_for_deactivated_pairs(monkeypatch):
     cycles = iter([["A", "B"], ["A"], ["A"]])
     seen = []
 
@@ -356,9 +378,9 @@ def test_collect_loop_drops_scan_state_for_deactivated_pairs(monkeypatch):
         scan_from[pair["symbol"]] = 1  # as an empty capped window would
 
     tf = SimpleNamespace(name="5m", interval_s=300, buffer_s=30, table="candles")
-    _drive_collect_loop(main_mod, monkeypatch, tf, cycles=2)  # installs the fakes
-    monkeypatch.setattr(main_mod, "query_active_pairs", lambda c, n, t: [{"symbol": s} for s in next(cycles)])
-    monkeypatch.setattr(main_mod, "_collect_pair", collect)
+    _drive_candle_loop(candles_mod, monkeypatch, tf, cycles=2)  # installs the fakes
+    monkeypatch.setattr(candles_mod, "query_active_pairs", lambda c, n, t: [{"symbol": s} for s in next(cycles)])
+    monkeypatch.setattr(candles_mod, "_collect_pair", collect)
     calls = []
 
     def pace(*a):
@@ -366,19 +388,18 @@ def test_collect_loop_drops_scan_state_for_deactivated_pairs(monkeypatch):
         if len(calls) >= 2:
             raise _StopLoop
 
-    monkeypatch.setattr(main_mod, "sleep_until_next_slot", pace)
+    monkeypatch.setattr(candles_mod, "sleep_until_next_slot", pace)
     try:
-        main_mod.collect_loop(object(), SimpleNamespace(name="binance", market_type="perp"), tf, "dsn", None)
+        candles_mod.candle_loop(object(), SimpleNamespace(name="binance", market_type="perp"), tf, "dsn", None)
     except _StopLoop:
         pass
     # Cycle 1 sees A then B; cycle 2 (only A active) has dropped B's entry before polling A.
     assert seen == [[], ["A"], ["A"]]
 
 
-def test_collect_loop_reconnect_failure_retries_from_the_failed_cycles_start(monkeypatch):
+def test_candle_loop_reconnect_failure_retries_from_the_failed_cycles_start(monkeypatch):
     # A failed reconnect sleeps 30 s and loops: the next wait targets the slot after the failed
     # iteration's start, so retries keep to the slot grid instead of hammering a down DB.
-    main_mod = _load_real_main()
     conn = SimpleNamespace(closed=True)
     attempts = {"n": 0}
 
@@ -389,6 +410,6 @@ def test_collect_loop_reconnect_failure_retries_from_the_failed_cycles_start(mon
         return conn
 
     tf = SimpleNamespace(name="5m", interval_s=300, buffer_s=30, table="candles")
-    calls = _drive_collect_loop(main_mod, monkeypatch, tf, cycles=1, connect=connect)
+    calls = _drive_candle_loop(candles_mod, monkeypatch, tf, cycles=1, connect=connect)
     assert attempts["n"] == 2
     assert calls == [(300, 30, 1000.0, "binance/5m")]

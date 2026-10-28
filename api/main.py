@@ -6,6 +6,7 @@ from pathlib import Path
 
 import config
 import export
+import feed_health
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.responses import Response
@@ -269,9 +270,10 @@ def get_liquidations(
 # Status / health monitoring endpoints
 # ---------------------------------------------------------------------------
 
-# Feed metadata comes from the collector's own config module: the api image copies
-# collector/config.py and exchanges.yaml beside this file (api/Dockerfile), so routing, intervals and
-# loop names have one source. Read at import, never per request.
+# Feed metadata comes from the collector's own config module, and the staleness and gap rules from its
+# feed_health module: the api image copies collector/config.py, feed_health.py and exchanges.yaml beside
+# this file (api/Dockerfile), so routing, intervals, loop names and the rules have one source. Read at
+# import, never per request.
 #
 # Timeframes the collectors don't write but whose stored candles this API still serves and
 # gap-checks. They live in `candles`, the default table.
@@ -292,15 +294,6 @@ def _candle_table(timeframe: str) -> str:
 # CONTRACT: every candle-facing collection_status query in this module excludes these sentinel rows;
 # loop liveness is the monitor's surface, not this API's.
 LOOP_TIMEFRAMES = tuple(config.LOOP_INTERVALS)
-
-
-def _status_is_stale(seconds_since_success: float | None, interval_s: int | None) -> bool:
-    """/status's per-pair freshness: no success yet, or none within two intervals (120 s at 1m). An
-    unknown timeframe is never stale here. This is not the monitor's paging threshold, which waits
-    `interval + max(interval, 1800)` (collector/monitor.py compute_staleness)."""
-    if interval_s is None:
-        return False
-    return seconds_since_success is None or seconds_since_success > 2 * interval_s
 
 
 @app.get("/status")
@@ -345,7 +338,8 @@ def get_status(exchange: str | None = None, timeframe: str | None = None):
 
     # Compute is_stale flag (candle TFs only — loop rows are excluded above).
     for row in rows:
-        row["is_stale"] = _status_is_stale(row.get("seconds_since_success"), TIMEFRAME_INTERVALS.get(row["timeframe"]))
+        row["is_stale"] = feed_health.is_stale_for_status(row.get("seconds_since_success"),
+                                                          TIMEFRAME_INTERVALS.get(row["timeframe"]))
         if row.get("last_success") and hasattr(row["last_success"], "isoformat"):
             row["last_success"] = row["last_success"].isoformat()
 
@@ -377,39 +371,8 @@ def get_status_gaps(
     if interval_s is None:
         return {"error": f"Unknown timeframe: {timeframe}", "gaps": []}
 
-    lookback_s = lookback * interval_s
-
-    conditions = [
-        "exchange = %(exchange)s",
-        "timeframe = %(timeframe)s",
-        "timestamp > NOW() - INTERVAL '1 second' * %(lookback_s)s",
-    ]
-    params: dict = {
-        "exchange": exchange,
-        "timeframe": timeframe,
-        "lookback_s": lookback_s,
-        "interval_s": interval_s,
-    }
-
-    if asset_id is not None:
-        conditions.append("asset_id = %(asset_id)s")
-        params["asset_id"] = asset_id
-
-    where = " AND ".join(conditions)
-    query = f"""
-        WITH consecutive AS (
-            SELECT symbol, timestamp,
-                   LEAD(timestamp) OVER (PARTITION BY symbol ORDER BY timestamp) AS next_ts
-            FROM {_candle_table(timeframe)}
-            WHERE {where}
-        )
-        SELECT symbol, timestamp AS gap_after, next_ts AS gap_before,
-               EXTRACT(EPOCH FROM next_ts - timestamp) / %(interval_s)s - 1 AS missing_count
-        FROM consecutive
-        WHERE next_ts IS NOT NULL
-          AND EXTRACT(EPOCH FROM next_ts - timestamp) > %(interval_s)s * 1.5
-        ORDER BY symbol, timestamp
-    """
+    query, params = feed_health.gap_query(_candle_table(timeframe), exchange=exchange, timeframe=timeframe,
+                                          interval_s=interval_s, lookback_count=lookback, asset_id=asset_id)
 
     with pool.connection() as conn:
         rows = conn.execute(query, params).fetchall()

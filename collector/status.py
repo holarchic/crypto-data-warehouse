@@ -1,9 +1,29 @@
-"""collection_status table helpers — upsert on every fetch cycle — plus discovery's volume history."""
+"""collection_status table helpers — upsert on every fetch cycle — plus discovery's volume history.
+
+Every helper runs inside the caller's transaction and never commits or rolls back: the caller
+decides what lands together (the candle loop commits a pair's bars and its cursor as one).
+"""
 
 import logging
+from dataclasses import dataclass
 from datetime import date
 
 log = logging.getLogger(__name__)
+
+# A venue's instrument universe is the pairs discovery activates at this candle timeframe. Every
+# venue polls it, so it is the one timeframe whose active rows list every collected instrument.
+UNIVERSE_TIMEFRAME = "5m"
+
+
+@dataclass(frozen=True)
+class Instrument:
+    """One instrument in a venue's active universe. asset_id and native_symbol are NULL only on a
+    row the candle loop created before discovery ever ran (its BTC bootstrap)."""
+
+    symbol: str
+    asset_id: str | None
+    native_symbol: str | None
+    market_type: str
 
 # Sentinel symbol for the per-loop liveness heartbeat rows (funding/OI poll loops and
 # the streaming WS loop). One row per (exchange, loop), keyed (exchange, market_type,
@@ -58,6 +78,13 @@ DEACTIVATE_STALE_SQL = """
       AND symbol != ALL(%(active_symbols)s)
 """
 
+QUERY_ACTIVE_INSTRUMENTS_SQL = """
+    SELECT symbol, asset_id, native_symbol, market_type
+    FROM collection_status
+    WHERE exchange = %(exchange)s AND timeframe = %(timeframe)s AND active = TRUE
+    ORDER BY symbol
+"""
+
 QUERY_ACTIVE_PAIRS_SQL = """
     SELECT symbol, asset_id, native_symbol, market_type, last_timestamp
     FROM collection_status
@@ -108,7 +135,6 @@ def upsert_status_success(conn, exchange: str, market_type: str, symbol: str, ti
     }
     with conn.cursor() as cur:
         cur.execute(UPSERT_SUCCESS_SQL, params)
-    conn.commit()
 
 
 def upsert_status_error(conn, exchange: str, market_type: str, symbol: str, timeframe: str, error_msg: str):
@@ -122,7 +148,6 @@ def upsert_status_error(conn, exchange: str, market_type: str, symbol: str, time
     }
     with conn.cursor() as cur:
         cur.execute(UPSERT_ERROR_SQL, params)
-    conn.commit()
 
 
 def upsert_loop_heartbeat(conn, exchange: str, market_type: str, loop: str):
@@ -140,7 +165,6 @@ def upsert_loop_heartbeat(conn, exchange: str, market_type: str, loop: str):
     }
     with conn.cursor() as cur:
         cur.execute(UPSERT_LOOP_HEARTBEAT_SQL, params)
-    conn.commit()
 
 
 def upsert_discovery_pair(conn, exchange: str, market_type: str, symbol: str, timeframe: str, asset_id: str, native_symbol: str, volume: float):
@@ -186,8 +210,18 @@ def query_recent_max_volumes(conn, since: date) -> dict[str, float]:
         return {asset_id: volume for asset_id, volume in cur.fetchall()}
 
 
+def active_instruments(conn, exchange: str) -> list[Instrument]:
+    """The venue's active instrument universe, ordered by symbol. Loop heartbeat rows never match:
+    their timeframe is a loop name."""
+    with conn.cursor() as cur:
+        cur.execute(QUERY_ACTIVE_INSTRUMENTS_SQL, {"exchange": exchange, "timeframe": UNIVERSE_TIMEFRAME})
+        return [Instrument(symbol, asset_id, native_symbol, market_type)
+                for symbol, asset_id, native_symbol, market_type in cur.fetchall()]
+
+
 def query_active_pairs(conn, exchange: str, timeframe: str) -> list[dict]:
-    """Return active pairs for this exchange/timeframe from collection_status."""
+    """The candle loop's active rows for one timeframe, each with its collection cursor
+    (`last_timestamp`). Feeds that need the venue's instruments read `active_instruments`."""
     with conn.cursor() as cur:
         cur.execute(QUERY_ACTIVE_PAIRS_SQL, {"exchange": exchange, "timeframe": timeframe})
         columns = [desc[0] for desc in cur.description]

@@ -6,6 +6,7 @@ import time
 from collections import deque
 from datetime import date, datetime, timezone
 
+import feed_health
 import monitor
 from config import (
     CANDLE_REPAIR,
@@ -17,8 +18,6 @@ from config import (
     PREMIUM_LOOP,
 )
 from monitor import (
-    _TF_SCAN_INTERVALS,
-    GAP_SQL_BY_TABLE,
     HEARTBEAT_CANDLES_SQL,
     LOOP_TIMEFRAMES,
     alert_due,
@@ -43,39 +42,34 @@ LOOP_AWARE_INTERVALS = {**TF_INTERVALS, **LOOP_INTERVALS}
 # --- candle-table gap-scan routing (T-015) ---
 
 
-def test_gap_sql_by_table_routes():
-    assert set(GAP_SQL_BY_TABLE) == {"candles", "candles_1m"}
-    assert "FROM candles\n" in GAP_SQL_BY_TABLE["candles"]
-    assert "FROM candles_1m\n" in GAP_SQL_BY_TABLE["candles_1m"]
-    assert "candles_1m" not in GAP_SQL_BY_TABLE["candles"]  # candles query must NOT hit 1m table
-
-
-def test_detect_gaps_selects_table():
+def test_detect_gaps_runs_the_shared_query_for_its_table_and_keeps_datetimes():
     # detect_gaps(table='candles_1m') must scan candles_1m (else 1m gaps are invisible).
     captured = {}
+    after = datetime(2026, 3, 29, 10, 0, tzinfo=timezone.utc)
+    before = datetime(2026, 3, 29, 10, 3, tzinfo=timezone.utc)
 
     class _Cur:
         description = [("symbol",), ("gap_after",), ("gap_before",), ("missing_count",)]
         def __enter__(self): return self
         def __exit__(self, *a): return False
-        def execute(self, sql, params): captured["sql"] = sql
-        def fetchall(self): return []
+        def execute(self, sql, params): captured.update(sql=sql, params=params)
+        def fetchall(self): return [("BTC/USDT:USDT", after, before, 2)]
 
     class _Conn:
         def cursor(self): return _Cur()
 
-    detect_gaps(_Conn(), "binance", "1m", 60, "candles_1m")
+    gaps = detect_gaps(_Conn(), "binance", "1m", 60, "candles_1m")
+    expected_sql, expected_params = feed_health.gap_query("candles_1m", exchange="binance", timeframe="1m",
+                                                          interval_s=60, lookback_count=10)
+    assert (captured["sql"], captured["params"]) == (expected_sql, expected_params)
     assert "FROM candles_1m" in captured["sql"]
+    assert gaps == [{"symbol": "BTC/USDT:USDT", "gap_after": after, "gap_before": before, "missing_count": 2}]
 
 
 def test_heartbeat_candles_sql_sums_both_tables():
     # The weekly heartbeat count must include candles_1m (the densest feed), not only candles.
     assert "FROM candles WHERE" in HEARTBEAT_CANDLES_SQL
     assert "FROM candles_1m WHERE" in HEARTBEAT_CANDLES_SQL
-
-
-def test_tf_scan_intervals_has_1m():
-    assert _TF_SCAN_INTERVALS["1m"] == 300
 
 
 # --- compute_staleness ---
@@ -257,12 +251,13 @@ def test_format_stale_alert_truncates_large_lists():
 
 def test_format_gap_alert():
     gaps = [
-        {"symbol": "BTC/USDT:USDT", "gap_after": "2026-03-29T10:00:00+00:00", "gap_before": "2026-03-29T10:15:00+00:00", "missing_count": 2},
+        {"symbol": "BTC/USDT:USDT", "gap_after": datetime(2026, 3, 29, 10, 0, tzinfo=timezone.utc),
+         "gap_before": datetime(2026, 3, 29, 10, 15, tzinfo=timezone.utc), "missing_count": 2},
     ]
     text = format_gap_alert("binance", "5m", gaps)
     assert "1 candle gap" in text
     assert "binance" in text
-    assert "BTC/USDT:USDT" in text
+    assert "BTC/USDT:USDT: 2 missing after 2026-03-29T10:00:00+00:00" in text
 
 
 def test_format_gap_alert_empty():
@@ -440,7 +435,8 @@ def test_monitor_loop_retries_an_undelivered_gap_alert_next_cycle(monkeypatch):
     monkeypatch.setattr(monitor, "fetch_status_rows", lambda conn: [])
     monkeypatch.setattr(monitor, "_get_exchange_timeframe_pairs", lambda conn: [("binance", "12h")])
     monkeypatch.setattr(monitor, "detect_gaps", lambda *a: [{"symbol": "BTC/USDT:USDT", "missing_count": 1,
-                                                             "gap_after": "t0", "gap_before": "t1"}])
+                                                             "gap_after": datetime(2026, 3, 29, tzinfo=timezone.utc),
+                                                             "gap_before": datetime(2026, 3, 29, 12, tzinfo=timezone.utc)}])
     monkeypatch.setattr(monitor, "should_send_heartbeat", lambda *a: False)
     monkeypatch.setattr(monitor, "send_webhook", lambda url, text: attempts.append(text) or next(deliveries))
     monkeypatch.setattr(monitor, "ping_healthcheck", lambda url: None)
@@ -735,3 +731,49 @@ def test_format_alarming_alert_truncates_large_lists():
     assert "500 alarming-stale" in text
     assert "plus 485 more" in text
     assert len(text) < 2000
+
+
+
+def test_monitor_sustain_default_has_one_owner(monkeypatch):
+    """run() passes ALARMING_SUSTAIN_CYCLES, defaulting to the same 3 that monitor_loop's signature
+    uses, so a caller that omits it alarms on the cycle count the SPEC names."""
+    import inspect
+
+    loop_signature = inspect.signature(monitor.monitor_loop)
+    assert loop_signature.parameters["sustain_cycles"].default == monitor.DEFAULT_SUSTAIN_CYCLES == 3
+    captured = {}
+    monkeypatch.setattr(monitor, "monitor_loop",
+                        lambda *a, **k: captured.update(loop_signature.bind(*a, **k).arguments))
+    monkeypatch.setattr(monitor, "load_timeframe_intervals", lambda: {"5m": 300})
+    monkeypatch.setenv("POSTGRES_USER", "u")
+    monkeypatch.setenv("POSTGRES_PASSWORD", "p")
+    monkeypatch.delenv("ALARMING_SUSTAIN_CYCLES", raising=False)
+    monitor.run()
+    assert captured["sustain_cycles"] == 3
+
+
+def test_gap_scan_tiers_follow_each_timeframes_interval_floored_at_the_tick(monkeypatch):
+    # 1m and 5m scan at most every 300 s (the floor holds 1m back at T+120); 12h waits its interval.
+    ticks = [10**9, 10**9 + 120, 10**9 + 300, 10**9 + 43200]
+    scanned = []
+    cycles = {"n": 0}
+    monkeypatch.setattr(sys.modules["psycopg"], "connect", lambda *a, **k: _FakeConn())
+    monkeypatch.setattr(monitor, "fetch_status_rows", lambda conn: [])
+    monkeypatch.setattr(monitor, "_get_exchange_timeframe_pairs",
+                        lambda conn: [("binance", "1m"), ("binance", "5m"), ("binance", "12h")])
+    monkeypatch.setattr(monitor, "detect_gaps", lambda conn, ex, tf, *a: scanned.append((cycles["n"], tf)) or [])
+    monkeypatch.setattr(monitor, "should_send_heartbeat", lambda *a: False)
+    monkeypatch.setattr(monitor, "ping_healthcheck", lambda url: None)
+    monkeypatch.setattr(monitor.time, "time", lambda: ticks[cycles["n"]])  # logging reads it too
+
+    def sleep(s):
+        cycles["n"] += 1
+        if cycles["n"] >= len(ticks):
+            raise _StopMonitor
+
+    monkeypatch.setattr(monitor.time, "sleep", sleep)
+    try:
+        monitor.monitor_loop("dsn", {"1m": 60, "5m": 300, "12h": 43200}, "https://hook.invalid")
+    except _StopMonitor:
+        pass
+    assert scanned == [(0, "1m"), (0, "5m"), (0, "12h"), (2, "1m"), (2, "5m"), (3, "1m"), (3, "5m"), (3, "12h")]

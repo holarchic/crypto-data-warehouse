@@ -1,19 +1,22 @@
 """Tests for collector/oi.py — HL 1-min cadence + asset_ctxs bundle dual-write.
 
-The repo has NO real-DB test harness (conftest stubs psycopg/db/status/backoff with
-MagicMock). So DB-engine behaviour (real ON-CONFLICT dedup, real rollback) is verified
+The repo has NO real-DB test harness (conftest stubs psycopg/db/backoff with MagicMock).
+So DB-engine behaviour (real ON-CONFLICT dedup, real rollback) is verified
 in prod; here we test cc's own logic: parsing, the pacing call, and the loop's
 insert/commit/rollback discipline via a fake conn/cursor that records calls.
 """
 
 import sys
+from unittest.mock import MagicMock
 
 import pytest
 
-# conftest stubs `oi` to a MagicMock; remove the stub so we test the real module.
-sys.modules.pop("oi", None)
+# conftest stubs `oi` to a MagicMock; remove the stub (never an already-loaded real module).
+if isinstance(sys.modules.get("oi"), MagicMock):
+    del sys.modules["oi"]
 
 import oi  # noqa: E402, I001  (must follow stub removal)
+from tests.instruments import instrument  # noqa: E402
 
 
 # --- Slice A: pure unit -------------------------------------------------------
@@ -183,7 +186,7 @@ def test_insert_hl_snapshot_ctx_failure_no_commit():
 
 def test_build_hl_snapshots_assembly_and_derivation():
     universe, ctxs = _fixture_universe_ctxs()
-    asset_to_pair = {p["asset_id"]: p for p in _pairs()}
+    asset_to_pair = {p.asset_id: p for p in _pairs()}
     oi_rows, ctx_rows = oi._build_hl_snapshots(universe, ctxs, asset_to_pair, "hyperliquid", 42.0)
     assert len(oi_rows) == 3 and len(ctx_rows) == 3
     oi_by = {r["asset_id"]: r for r in oi_rows}
@@ -201,7 +204,7 @@ def test_build_hl_snapshots_assembly_and_derivation():
 def test_build_hl_snapshots_skips_unknown_assets():
     universe = [{"name": "BTC"}, {"name": "UNLISTED"}]
     ctxs = [_full_ctx(), _full_ctx()]
-    asset_to_pair = {"BTC": {"asset_id": "BTC", "symbol": "BTC/USDC:USDC"}}
+    asset_to_pair = {"BTC": instrument(asset_id="BTC", symbol="BTC/USDC:USDC")}
     oi_rows, ctx_rows = oi._build_hl_snapshots(universe, ctxs, asset_to_pair, "hyperliquid", 1.0)
     assert [r["asset_id"] for r in oi_rows] == ["BTC"]
     assert len(ctx_rows) == 1
@@ -214,7 +217,7 @@ def test_build_hl_snapshots_captures_1000x_token_via_upper_bridge():
     # (cross-venue), hl_asset_ctxs = HL-native `kPEPE` (= backtester seed coin, T-011 passthrough).
     universe = [{"name": "kPEPE"}]
     ctxs = [_full_ctx()]
-    asset_to_pair = {"KPEPE": {"asset_id": "KPEPE", "symbol": "KPEPE/USDC:USDC"}}
+    asset_to_pair = {"KPEPE": instrument(asset_id="KPEPE", symbol="KPEPE/USDC:USDC")}
     oi_rows, ctx_rows = oi._build_hl_snapshots(universe, ctxs, asset_to_pair, "hyperliquid", 1.0)
     assert len(oi_rows) == 1 and len(ctx_rows) == 1
     assert oi_rows[0]["asset_id"] == "KPEPE"    # ccxt-canonical (cross-venue open_interest)
@@ -227,7 +230,7 @@ def test_build_hl_snapshots_null_name_dropped_not_aborted():
     # `.upper()` and abort the whole cycle. A valid coin in the same response still lands.
     universe = [{"name": None}, {"name": "BTC"}]
     ctxs = [_full_ctx(), _full_ctx()]
-    asset_to_pair = {"BTC": {"asset_id": "BTC", "symbol": "BTC/USDC:USDC"}}
+    asset_to_pair = {"BTC": instrument(asset_id="BTC", symbol="BTC/USDC:USDC")}
     oi_rows, ctx_rows = oi._build_hl_snapshots(universe, ctxs, asset_to_pair, "hyperliquid", 1.0)
     assert [r["asset_id"] for r in ctx_rows] == ["BTC"]   # null-name asset dropped, BTC survives
 
@@ -245,8 +248,8 @@ def test_build_hl_snapshots_drops_malformed_asset():
     bad["openInterest"] = "not-a-number"
     ctxs = [_full_ctx(), bad]
     asset_to_pair = {
-        "BTC": {"asset_id": "BTC", "symbol": "BTC/USDC:USDC"},
-        "ETH": {"asset_id": "ETH", "symbol": "ETH/USDC:USDC"},
+        "BTC": instrument(asset_id="BTC", symbol="BTC/USDC:USDC"),
+        "ETH": instrument(asset_id="ETH", symbol="ETH/USDC:USDC"),
     }
     oi_rows, ctx_rows = oi._build_hl_snapshots(universe, ctxs, asset_to_pair, "hyperliquid", 1.0)
     assert [r["asset_id"] for r in oi_rows] == ["BTC"]  # ETH dropped, not stored as NULL
@@ -259,8 +262,8 @@ def test_build_hl_snapshots_non_dict_row_dropped_not_aborted():
     universe = [{"name": "BTC"}, {"name": "ETH"}]
     ctxs = [_full_ctx(), ["not", "a", "dict"]]
     asset_to_pair = {
-        "BTC": {"asset_id": "BTC", "symbol": "BTC/USDC:USDC"},
-        "ETH": {"asset_id": "ETH", "symbol": "ETH/USDC:USDC"},
+        "BTC": instrument(asset_id="BTC", symbol="BTC/USDC:USDC"),
+        "ETH": instrument(asset_id="ETH", symbol="ETH/USDC:USDC"),
     }
     oi_rows, ctx_rows = oi._build_hl_snapshots(universe, ctxs, asset_to_pair, "hyperliquid", 1.0)
     assert [r["asset_id"] for r in oi_rows] == ["BTC"]
@@ -282,9 +285,9 @@ def _fixture_universe_ctxs():
 
 def _pairs():
     return [
-        {"asset_id": "BTC", "symbol": "BTC/USDC:USDC"},
-        {"asset_id": "ETH", "symbol": "ETH/USDC:USDC"},
-        {"asset_id": "ILLIQ", "symbol": "ILLIQ/USDC:USDC"},
+        instrument(asset_id="BTC", symbol="BTC/USDC:USDC"),
+        instrument(asset_id="ETH", symbol="ETH/USDC:USDC"),
+        instrument(asset_id="ILLIQ", symbol="ILLIQ/USDC:USDC"),
     ]
 
 
@@ -297,7 +300,7 @@ def _drive_one_cycle(monkeypatch, conn, universe, ctxs, pairs, clock=lambda: 1_7
     collects the end-of-cycle pacing call's arguments."""
     from types import SimpleNamespace
     monkeypatch.setattr(oi, "connect_db", lambda dsn: conn)
-    monkeypatch.setattr(oi, "_get_active_pairs", lambda c, name: pairs)
+    monkeypatch.setattr(oi, "active_instruments", lambda c, name: pairs)
     monkeypatch.setattr(oi, "_fetch_hl_meta_and_ctxs", lambda: (universe, ctxs))
     # `db` is a conftest MagicMock, so `oi.safe_rollback` is a no-op unless another test file happens to
     # un-stub it first (cross-file ordering) — pin it to the fake conn's rollback so the rollback test is
@@ -355,7 +358,7 @@ def test_oi_loops_pace_from_their_cycle_start_on_the_no_pairs_path(monkeypatch, 
         raise _StopLoop
 
     monkeypatch.setattr(oi, "connect_db", lambda dsn: FakeConn())
-    monkeypatch.setattr(oi, "_get_active_pairs", lambda c, name: [])
+    monkeypatch.setattr(oi, "active_instruments", lambda c, name: [])
     monkeypatch.setattr(oi, "_heartbeat", lambda *a: None)
     monkeypatch.setattr(oi, "sleep_until_next_slot", stop)
     monkeypatch.setattr(oi.time, "time", _ticking_clock())
@@ -381,7 +384,7 @@ def test_bulk_loop_paces_from_its_cycle_start_on_a_full_cycle(monkeypatch):
         raise _StopLoop
 
     monkeypatch.setattr(oi, "connect_db", lambda dsn: FakeConn())
-    monkeypatch.setattr(oi, "_get_active_pairs", lambda c, name: [{"asset_id": "BTC", "symbol": "BTC/USDT:USDT"}])
+    monkeypatch.setattr(oi, "active_instruments", lambda c, name: [instrument(asset_id="BTC", symbol="BTC/USDT:USDT")])
     monkeypatch.setattr(oi, "paced_call", lambda rl, ex, w, fn, *a, priority=False, **k: fn(*a, **k))
     monkeypatch.setattr(oi, "_insert_oi", lambda conn, rows: len(rows))
     monkeypatch.setattr(oi, "_heartbeat", lambda *a: None)
@@ -447,8 +450,8 @@ def test_zip_mismatch_aborts_cycle(monkeypatch):
 
 def _bulk_active():
     return {
-        "BTC/USDT:USDT": {"asset_id": "BTC", "symbol": "BTC/USDT:USDT"},
-        "ETH/USDT:USDT": {"asset_id": "ETH", "symbol": "ETH/USDT:USDT"},
+        "BTC/USDT:USDT": instrument(asset_id="BTC", symbol="BTC/USDT:USDT"),
+        "ETH/USDT:USDT": instrument(asset_id="ETH", symbol="ETH/USDT:USDT"),
     }
 
 
@@ -516,9 +519,9 @@ def _fr(next_funding_s, mark=None):
 
 def _binance_active():
     return {
-        "BTC/USDT:USDT": {"asset_id": "BTC", "symbol": "BTC/USDT:USDT"},
-        "ETH/USDT:USDT": {"asset_id": "ETH", "symbol": "ETH/USDT:USDT"},
-        "XRP/USDT:USDT": {"asset_id": "XRP", "symbol": "XRP/USDT:USDT"},
+        "BTC/USDT:USDT": instrument(asset_id="BTC", symbol="BTC/USDT:USDT"),
+        "ETH/USDT:USDT": instrument(asset_id="ETH", symbol="ETH/USDT:USDT"),
+        "XRP/USDT:USDT": instrument(asset_id="XRP", symbol="XRP/USDT:USDT"),
     }
 
 
@@ -531,26 +534,26 @@ def test_dense_set_pre_window_and_out_of_window():
     }
     prev, sett = {}, {}
     dense = oi._binance_dense_set(fr, active, NOW, WINDOW, prev, sett)
-    assert {p["asset_id"] for p in dense} == {"BTC", "ETH"}
+    assert {p.asset_id for p in dense} == {"BTC", "ETH"}
     # state populated for all seen symbols (enables next-tick change-detection)
     assert set(prev) == set(active)
 
 
 def test_dense_set_post_window_via_change_detection():
-    active = {"BTC/USDT:USDT": {"asset_id": "BTC", "symbol": "BTC/USDT:USDT"}}
+    active = {"BTC/USDT:USDT": instrument(asset_id="BTC", symbol="BTC/USDT:USDT")}
     # nextFundingTime far future (pre-window false), but it JUST changed vs prior tick →
     # a settlement occurred → post-window keeps it dense.
     prev = {"BTC/USDT:USDT": int((NOW - 100) * 1000)}  # old next-funding
     sett = {}
     fr = {"BTC/USDT:USDT": _fr(NOW + 28800)}  # rolled to +8h
     dense = oi._binance_dense_set(fr, active, NOW, WINDOW, prev, sett)
-    assert [p["asset_id"] for p in dense] == ["BTC"]
+    assert [p.asset_id for p in dense] == ["BTC"]
     assert sett["BTC/USDT:USDT"] == NOW  # settlement stamped
 
 
 def test_dense_set_first_tick_no_post_window():
     # Empty prev (restart): a far-future settlement is NOT dense (post can't fire yet).
-    active = {"BTC/USDT:USDT": {"asset_id": "BTC", "symbol": "BTC/USDT:USDT"}}
+    active = {"BTC/USDT:USDT": instrument(asset_id="BTC", symbol="BTC/USDT:USDT")}
     fr = {"BTC/USDT:USDT": _fr(NOW + 28800)}
     dense = oi._binance_dense_set(fr, active, NOW, WINDOW, {}, {})
     assert dense == []
@@ -610,7 +613,7 @@ def test_baseline_sweep_advances_cursor_after_commit(monkeypatch):
     ]})
     conn = FakeConn()
     cursor, last_fetch = {}, {}
-    due = [{"asset_id": "BTC", "symbol": "BTC/USDT:USDT"}]
+    due = [instrument(asset_id="BTC", symbol="BTC/USDT:USDT")]
     n = oi._binance_baseline_sweep(ex, "binance", None, conn, due, cursor, last_fetch, NOW, "binance/oi")
     assert n == 2
     assert cursor["BTC/USDT:USDT"] == 1_700_000_600.0  # advanced to max ts (seconds)
@@ -631,7 +634,7 @@ def test_baseline_sweep_since_from_cursor(monkeypatch):
 
     conn = FakeConn()
     cursor = {"BTC/USDT:USDT": 1_700_000_600.0}
-    oi._binance_baseline_sweep(_Ex(), "binance", None, conn, [{"asset_id": "BTC", "symbol": "BTC/USDT:USDT"}],
+    oi._binance_baseline_sweep(_Ex(), "binance", None, conn, [instrument(asset_id="BTC", symbol="BTC/USDT:USDT")],
                                cursor, {}, NOW, "binance/oi")
     assert seen["since"] == 1_700_000_600_000 + 1  # cursor(s)→ms + 1
 
@@ -642,7 +645,7 @@ def test_baseline_sweep_fetch_error_leaves_cursor_unadvanced(monkeypatch):
     conn = FakeConn()
     cursor = {"BTC/USDT:USDT": 500.0}
     last_fetch = {}
-    n = oi._binance_baseline_sweep(ex, "binance", None, conn, [{"asset_id": "BTC", "symbol": "BTC/USDT:USDT"}],
+    n = oi._binance_baseline_sweep(ex, "binance", None, conn, [instrument(asset_id="BTC", symbol="BTC/USDT:USDT")],
                                    cursor, last_fetch, NOW, "binance/oi")
     assert n == 0
     assert cursor["BTC/USDT:USDT"] == 500.0        # unchanged → no gap
@@ -658,8 +661,8 @@ def test_dense_fetch_sequential_usd_and_skips(monkeypatch):
         "ETH/USDT:USDT": {"openInterestAmount": 50.0},
     })
     dense_pairs = [
-        {"asset_id": "BTC", "symbol": "BTC/USDT:USDT"},
-        {"asset_id": "ETH", "symbol": "ETH/USDT:USDT"},
+        instrument(asset_id="BTC", symbol="BTC/USDT:USDT"),
+        instrument(asset_id="ETH", symbol="ETH/USDT:USDT"),
     ]
     fr = {"BTC/USDT:USDT": _fr(NOW, mark=60000.0), "ETH/USDT:USDT": _fr(NOW)}
     rows = oi._binance_dense_fetch(ex, "binance", None, dense_pairs, fr, NOW, "binance/oi")
@@ -672,7 +675,7 @@ def test_dense_fetch_sequential_error_isolation_and_empty(monkeypatch):
     _patch_paced_and_sleep(monkeypatch)
     ex = _FakeExchange(oi_by_symbol={"A/USDT:USDT": {"openInterestAmount": 1.0}},
                        raise_oi={"B/USDT:USDT"})
-    pairs = [{"asset_id": "A", "symbol": "A/USDT:USDT"}, {"asset_id": "B", "symbol": "B/USDT:USDT"}]
+    pairs = [instrument(asset_id="A", symbol="A/USDT:USDT"), instrument(asset_id="B", symbol="B/USDT:USDT")]
     rows = oi._binance_dense_fetch(ex, "binance", None, pairs, {}, NOW, "binance/oi")
     assert [r["symbol"] for r in rows] == ["A/USDT:USDT"]  # B raised → skipped, A lands
     assert oi._binance_dense_fetch(ex, "binance", None, [], {}, NOW, "binance/oi") == []
@@ -682,7 +685,7 @@ def test_dense_fetch_sequential_uses_priority_lane(monkeypatch):
     # Every dense per-symbol fetch rides the priority weight lane (T-007.4).
     calls = _patch_paced_and_sleep(monkeypatch)
     ex = _FakeExchange(oi_by_symbol={f"C{i}/USDT:USDT": {"openInterestAmount": 1.0} for i in range(3)})
-    pairs = [{"asset_id": f"C{i}", "symbol": f"C{i}/USDT:USDT"} for i in range(3)]
+    pairs = [instrument(asset_id=f"C{i}", symbol=f"C{i}/USDT:USDT") for i in range(3)]
     oi._binance_dense_fetch(ex, "binance", None, pairs, {}, NOW, "binance/oi")
     assert calls == [("fetch_open_interest", True)] * 3  # all dense calls priority=True
 
@@ -752,7 +755,7 @@ def test_dense_pool_fetches_all_no_concurrent_reuse(monkeypatch):
     factory = _pool_factory({s: {"openInterestAmount": float(i)} for i, s in enumerate(syms)}, shared=shared)
     pool = _mk_pool(monkeypatch, factory, concurrency=4)
     try:
-        pairs = [{"asset_id": f"C{i}", "symbol": s} for i, s in enumerate(syms)]
+        pairs = [instrument(asset_id=f"C{i}", symbol=s) for i, s in enumerate(syms)]
         fr = {s: _fr(NOW, mark=2.0) for s in syms}
         rows = pool.fetch(pairs, None, fr, NOW, "binance", "binance/oi")
         assert {r["symbol"] for r in rows} == set(syms)           # every symbol landed
@@ -771,7 +774,7 @@ def test_dense_pool_error_isolation_and_market_refresh(monkeypatch):
     )
     pool = _mk_pool(monkeypatch, factory, concurrency=3)
     try:
-        pairs = [{"asset_id": f"C{i}", "symbol": s} for i, s in enumerate(syms)]
+        pairs = [instrument(asset_id=f"C{i}", symbol=s) for i, s in enumerate(syms)]
         # market refresh runs before submit — force reload by pretending markets are ancient.
         monkeypatch.setattr(oi, "maybe_reload_markets", lambda ex: ex.load_markets(reload=True))
         rows = pool.fetch(pairs, None, {s: _fr(NOW, mark=1.0) for s in syms}, NOW, "binance", "binance/oi")
@@ -790,7 +793,7 @@ def test_dense_pool_uses_priority_lane(monkeypatch):
     factory = _pool_factory({s: {"openInterestAmount": float(i)} for i, s in enumerate(syms)})
     pool = oi._DenseFetchPool(_cfg_binance(), 3, exchange_factory=factory)
     try:
-        pairs = [{"asset_id": f"C{i}", "symbol": s} for i, s in enumerate(syms)]
+        pairs = [instrument(asset_id=f"C{i}", symbol=s) for i, s in enumerate(syms)]
         pool.fetch(pairs, None, {s: _fr(NOW, mark=1.0) for s in syms}, NOW, "binance", "binance/oi")
         assert len(calls) == 5 and all(c == ("fetch_open_interest", True) for c in calls)
     finally:
@@ -829,9 +832,9 @@ def test_binance_loop_skips_baseline_when_seed_fails(monkeypatch):
     # since=None sweep would skip the restart gap); dense still runs.
     from types import SimpleNamespace
     conn = FakeConn()
-    pairs = [{"asset_id": "BTC", "symbol": "BTC/USDT:USDT"}]
+    pairs = [instrument(asset_id="BTC", symbol="BTC/USDT:USDT")]
     monkeypatch.setattr(oi, "connect_db", lambda dsn: conn)
-    monkeypatch.setattr(oi, "_get_active_pairs", lambda c, name: pairs)
+    monkeypatch.setattr(oi, "active_instruments", lambda c, name: pairs)
 
     def _seed_boom(*a):
         raise RuntimeError("seed boom")
@@ -886,7 +889,7 @@ def _drive_binance_reserve_cycle(monkeypatch, caplog, dense_pairs, reserve):
     from types import SimpleNamespace
     conn = FakeConn()
     monkeypatch.setattr(oi, "connect_db", lambda dsn: conn)
-    monkeypatch.setattr(oi, "_get_active_pairs", lambda c, name: [{"asset_id": "BTC", "symbol": "BTC/USDT:USDT"}])
+    monkeypatch.setattr(oi, "active_instruments", lambda c, name: [instrument(asset_id="BTC", symbol="BTC/USDT:USDT")])
     monkeypatch.setattr(oi, "_seed_baseline_cursor", lambda *a: {})
     monkeypatch.setattr(oi, "_binance_dense_set", lambda *a: list(dense_pairs))
     monkeypatch.setattr(oi, "_binance_dense_fetch", lambda *a: [])
@@ -918,7 +921,7 @@ def _drive_binance_reserve_cycle(monkeypatch, caplog, dense_pairs, reserve):
 def test_binance_loop_warns_when_dense_weight_exceeds_reserve(monkeypatch, caplog):
     # T-007.4 runtime check: a cycle whose dense weight (len(dense)×OI-weight) exceeds the
     # reserve band logs a contention warning (the rate-based signal, not the old in-flight one).
-    dense = [{"asset_id": f"A{i}", "symbol": f"A{i}/USDT:USDT"} for i in range(5)]  # weight 5
+    dense = [instrument(asset_id=f"A{i}", symbol=f"A{i}/USDT:USDT") for i in range(5)]  # weight 5
     records = _drive_binance_reserve_cycle(monkeypatch, caplog, dense, reserve=2)  # 5 > 2 → warn
     assert any("exceeds rate_limit_priority_reserve" in r.message for r in records)
 
@@ -931,13 +934,13 @@ def test_binance_loop_reserve_warning_is_edge_triggered_across_cycles(monkeypatc
     from types import SimpleNamespace
 
     def _pairs(n):
-        return [{"asset_id": f"A{i}", "symbol": f"A{i}/USDT:USDT"} for i in range(n)]
+        return [instrument(asset_id=f"A{i}", symbol=f"A{i}/USDT:USDT") for i in range(n)]
 
     dense_by_cycle = [_pairs(5), _pairs(5), _pairs(0), _pairs(5)]  # weights 5,5,0,5 vs reserve 2
     it = iter(dense_by_cycle)
     conn = FakeConn()
     monkeypatch.setattr(oi, "connect_db", lambda dsn: conn)
-    monkeypatch.setattr(oi, "_get_active_pairs", lambda c, name: [{"asset_id": "BTC", "symbol": "BTC/USDT:USDT"}])
+    monkeypatch.setattr(oi, "active_instruments", lambda c, name: [instrument(asset_id="BTC", symbol="BTC/USDT:USDT")])
     monkeypatch.setattr(oi, "_seed_baseline_cursor", lambda *a: {})
     monkeypatch.setattr(oi, "_binance_dense_set", lambda *a: next(it))
     monkeypatch.setattr(oi, "_binance_dense_fetch", lambda *a: [])
@@ -972,7 +975,7 @@ def test_binance_loop_reserve_warning_is_edge_triggered_across_cycles(monkeypatc
 
 def test_binance_loop_silent_when_dense_weight_within_reserve(monkeypatch, caplog):
     # Dense weight under the reserve band → no contention warning (avoids false alarms every cycle).
-    dense = [{"asset_id": f"A{i}", "symbol": f"A{i}/USDT:USDT"} for i in range(5)]  # weight 5
+    dense = [instrument(asset_id=f"A{i}", symbol=f"A{i}/USDT:USDT") for i in range(5)]  # weight 5
     records = _drive_binance_reserve_cycle(monkeypatch, caplog, dense, reserve=600)  # 5 < 600 → silent
     assert not any("exceeds rate_limit_priority_reserve" in r.message for r in records)
 

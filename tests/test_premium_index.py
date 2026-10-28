@@ -3,17 +3,18 @@
 Pure helpers (row build, insert, cursor seed) run against a fake conn; `_collect_premium_pair`
 runs against a fake exchange + real RateLimiter(0) so the forward-only-vs-diet `since`/`limit`
 selection and cursor advance are exercised without a live wire. Loop wiring (has_premium_index
-launches the thread) is covered in test_candles-style real-main loading (see test at bottom).
+adds the feed) is covered by tests/test_main_feeds.py.
 """
 
-from pathlib import Path
 
 import premium_index as pi
 import pytest
 from candles import poll_limit
 from rate_limiter import RateLimiter, binance_kline_weight
 
-PAIR = {"asset_id": "BTC", "symbol": "BTC/USDT:USDT", "native_symbol": "BTCUSDT"}
+from tests.instruments import instrument
+
+PAIR = instrument(asset_id="BTC", symbol="BTC/USDT:USDT", native_symbol="BTCUSDT")
 INTERVAL = pi.PREMIUM_INTERVAL_S
 
 
@@ -156,7 +157,7 @@ def test_collect_pair_caught_up_uses_weight_diet():
     cursor_s = now_ms / 1000 - 3 * INTERVAL
     ex = FakeExchange([_closed_bar(now_ms - 2 * INTERVAL * 1000)])
     conn = FakeConn()
-    cursors = {PAIR["symbol"]: cursor_s}
+    cursors = {PAIR.symbol: cursor_s}
     pi._collect_premium_pair(ex, PAIR, _cfg(), RateLimiter(0), conn, cursors, now_ms)
     call = ex.calls[0]
     assert call["since"] == int(cursor_s * 1000) + 1
@@ -173,7 +174,7 @@ def test_collect_pair_advances_cursor_to_newest_closed_bar():
     cursors = {}
     fetched, inserted = pi._collect_premium_pair(ex, PAIR, _cfg(), RateLimiter(0), conn, cursors, now_ms)
     assert (fetched, inserted) == (2, 2)
-    assert cursors[PAIR["symbol"]] == t1 / 1000  # advanced to the newest closed bar
+    assert cursors[PAIR.symbol] == t1 / 1000  # advanced to the newest closed bar
 
 
 # --- helpers -----------------------------------------------------------------
@@ -184,18 +185,6 @@ def _cfg():
     return SimpleNamespace(name="binance", market_type="perp")
 
 
-# --- run() wiring (source-pin — run() is a blocking daemon entry point) -------
-
-
-def test_run_wires_premium_thread_behind_flag():
-    """The premium loop is imported and launched only when has_premium_index is set. Source-pinned
-    because run() blocks forever; a live launch test would hang."""
-    src = (Path(pi.__file__).parent / "main.py").read_text()
-    assert "from premium_index import premium_index_loop" in src
-    assert "config.has_premium_index" in src
-    assert "target=premium_index_loop" in src
-
-
 # --- loop control flow (max_cycles-bounded) ----------------------------------
 
 
@@ -203,7 +192,7 @@ def _patch_loop(monkeypatch, conn, pairs, seed_fn, hb):
     monkeypatch.setattr(pi, "sleep_until_next_slot", lambda *a: None)
     monkeypatch.setattr(pi, "maybe_reload_markets", lambda *a: None)
     monkeypatch.setattr(pi, "connect_db", lambda *a, **k: conn)
-    monkeypatch.setattr(pi, "query_active_pairs", lambda *a, **k: pairs)
+    monkeypatch.setattr(pi, "active_instruments", lambda *a, **k: pairs)
     monkeypatch.setattr(pi, "_seed_cursors", seed_fn)
     monkeypatch.setattr(pi, "upsert_loop_heartbeat", lambda *a, **k: hb.__setitem__("n", hb["n"] + 1))
     monkeypatch.setattr(pi, "safe_rollback", lambda *a: None)
@@ -215,7 +204,7 @@ def test_loop_seed_failure_skips_poll_and_heartbeats(monkeypatch):
     def _boom(*a, **k):
         raise RuntimeError("db down during seed")
     conn, ex, hb = FakeConn(), FakeExchange([_closed_bar(1_600_000_000_000)]), {"n": 0}
-    pairs = [dict(PAIR, market_type="perp", last_timestamp=None)]
+    pairs = [PAIR]
     _patch_loop(monkeypatch, conn, pairs, _boom, hb)
     pi.premium_index_loop(ex, _cfg(), "dsn", RateLimiter(0), max_cycles=1)
     assert ex.calls == []   # never polled forward-only over the gap
@@ -225,7 +214,7 @@ def test_loop_seed_failure_skips_poll_and_heartbeats(monkeypatch):
 def test_loop_seeds_empty_then_polls(monkeypatch):
     # A clean seed (empty table → {}) proceeds to the forward-only poll (fetch happens).
     conn, ex, hb = FakeConn(), FakeExchange([_closed_bar(1_600_000_000_000)]), {"n": 0}
-    pairs = [dict(PAIR, market_type="perp", last_timestamp=None)]
+    pairs = [PAIR]
     _patch_loop(monkeypatch, conn, pairs, lambda *a: {}, hb)
     pi.premium_index_loop(ex, _cfg(), "dsn", RateLimiter(0), max_cycles=1)
     assert len(ex.calls) == 1              # polled the one pair
@@ -237,7 +226,7 @@ def test_loop_paces_each_cycle_from_its_start(monkeypatch):
     # The first wait has no previous cycle (slot after now); the second targets the slot after the
     # first cycle's start, its first clock read (1000), not a later read inside the cycle.
     conn, ex, hb = FakeConn(), FakeExchange([_closed_bar(1_600_000_000_000)]), {"n": 0}
-    pairs = [dict(PAIR, market_type="perp", last_timestamp=None)]
+    pairs = [PAIR]
     _patch_loop(monkeypatch, conn, pairs, lambda *a: {}, hb)
     clock = {"t": 999.0}
 
@@ -259,8 +248,8 @@ def test_loop_reactivated_symbol_resumes_from_db_cursor(monkeypatch):
     # symbol missing from the in-memory cursor map is re-seeded from the DB before first-run.
     cursor_ts = 1_600_000_000.0
     conn, ex, hb = FakeConn(), FakeExchange([_closed_bar(1_600_000_500_000)]), {"n": 0}
-    pairs = [dict(PAIR, market_type="perp", last_timestamp=None)]
-    _patch_loop(monkeypatch, conn, pairs, lambda *a: {PAIR["symbol"]: cursor_ts}, hb)
+    pairs = [PAIR]
+    _patch_loop(monkeypatch, conn, pairs, lambda *a: {PAIR.symbol: cursor_ts}, hb)
     pi.premium_index_loop(ex, _cfg(), "dsn", RateLimiter(0), max_cycles=1)
     assert len(ex.calls) == 1
     assert ex.calls[0]["since"] == int(cursor_ts * 1000) + 1   # resumed from DB, not since=None

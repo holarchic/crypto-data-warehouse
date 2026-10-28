@@ -65,7 +65,7 @@ def test_candle_ws_loop_sentinel_registered():
 
 def test_hl_1m_streamed_not_polled():
     # T-015.1: HL 1m must NEVER be a configured timeframe (regardless of the has_candle_ws flag) — else
-    # run() would launch the per-symbol REST 1m collect_loop that starves HL's shared limiter.
+    # build_feeds would add the per-symbol REST 1m candle_loop that starves HL's shared limiter.
     cfg = load_config("hyperliquid")
     assert "1m" not in {tf.name for tf in cfg.timeframes}
 
@@ -222,12 +222,32 @@ def test_poll_max_bars_defaults_to_uncapped():
 
 def test_load_candle_tables_validates_bad_table(monkeypatch):
     # The MONITOR path (load_candle_tables) never runs _parse_exchange, so it must validate too —
-    # else a bad table: reaches GAP_SQL_BY_TABLE[table] as a per-cycle KeyError (codex correctness).
+    # else a bad table: reaches feed_health.gap_query as a per-cycle KeyError (codex correctness).
     import config
     monkeypatch.setattr(config, "_load_yaml",
                         lambda: {"timeframes": {"5m": {"interval_s": 300, "buffer_s": 30, "table": "bogus"}}})
     with pytest.raises(ValueError, match="not in allowlist"):
         load_candle_tables()
+
+
+@pytest.mark.parametrize("bad", ["60", None, 0, -5, 60.0, True])
+def test_interval_s_rejects_anything_but_a_positive_int_at_both_loaders(monkeypatch, bad):
+    """The collector (_parse_exchange) and the monitor and api (load_timeframe_intervals) each fail at
+    load, never computing staleness or a gap window from a quoted, null, zero or bool interval."""
+    import config
+    ex = {"ccxt_class": "x", "btc_symbol": "B", "market_type": "perp", "supported_timeframes": ["5m"]}
+    tf_defs = {"5m": {"interval_s": bad, "buffer_s": 30}}
+    with pytest.raises(ValueError, match="interval_s must be a positive integer"):
+        _parse_exchange("x", ex, tf_defs)
+    monkeypatch.setattr(config, "_load_yaml", lambda: {"timeframes": tf_defs})
+    with pytest.raises(ValueError, match="interval_s must be a positive integer"):
+        config.load_timeframe_intervals()
+
+
+def test_interval_s_missing_raises():
+    ex = {"ccxt_class": "x", "btc_symbol": "B", "market_type": "perp", "supported_timeframes": ["5m"]}
+    with pytest.raises(ValueError, match="interval_s must be a positive integer"):
+        _parse_exchange("x", ex, {"5m": {"buffer_s": 30}})
 
 
 def test_timeframe_table_defaults_to_candles():

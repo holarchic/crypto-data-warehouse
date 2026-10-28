@@ -1,6 +1,5 @@
 """Tests for collector/discovery.py — union qualification with hysteresis over a keep window."""
 
-import importlib.util
 import re
 from datetime import date, datetime, timezone
 from pathlib import Path
@@ -76,23 +75,7 @@ def test_init_sql_and_migration_012_create_the_same_discovery_volumes_table():
     assert "PRIMARY KEY (run_date, asset_id)" in init
 
 
-def _real_status_module():
-    """conftest stubs `status` for host runs; load the real file (stdlib imports only) to pin its SQL."""
-    path = ROOT / "collector" / "status.py"
-    spec = importlib.util.spec_from_file_location("status_real", path)
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    return module
-
-
-def test_collector_success_write_never_reactivates_a_pair():
-    """Hysteresis reads `active`, so only discovery may set it: a collector cycle holding a pre-discovery
-    pair list must not resurrect a pair discovery just dropped (it would then re-enter at the keep threshold)."""
-    on_conflict = _real_status_module().UPSERT_SUCCESS_SQL.split("DO UPDATE SET", 1)[1]
-    assert not re.search(r"\bactive\s*=", on_conflict)
-
-
-# --- discover() wiring: status/db are conftest stubs, so each run patches fresh mocks -----------
+# --- discover() wiring: each run patches fresh status/db mocks ------------------------------------
 
 RUN_DATE = date(2026, 10, 18)
 
