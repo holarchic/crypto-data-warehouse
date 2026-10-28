@@ -12,7 +12,8 @@ at 21, the 20-weight OI snapshot, which bypasses that limiter, and a 40-weight p
 reload), so a minute holding one of this job's calls must leave room for the largest, 46.
 The job trickles: every call it makes is charged `20 + ceil(minutes / 60)` and the next call waits
 `weight × 60 / budget` seconds (an average 20 weight/min, one 46-weight call per 26 h slice every
-138 s). A 429 backs off and halves the budget for the rest of the run.
+138 s). A 429 backs off and halves the budget for the rest of the run. A 5xx (an HL gateway or server
+outage) backs off 60 s and leaves the budget alone: it says nothing about weight. The two share three retries.
 
 **Cursor.** `repaired_through` is the `last_timestamp` of the `candle_repair` loop sentinel: every
 minute before it has been repaired, or reported lost. A run covers the last 26 h, or back to the
@@ -67,7 +68,9 @@ BASE_WEIGHT = 20
 WEIGHT_PER_MIN = 20.0
 MIN_WEIGHT_PER_MIN = 5.0
 BACKOFF_429_S = 120
-MAX_ATTEMPTS = 4  # the first try plus 3 retries after a 429
+# Pacing still applies, so a 46-weight call retries 138 s apart: attempts span 414 s, past 10-25's ~3.5 min outage
+BACKOFF_5XX_S = 60
+MAX_ATTEMPTS = 4  # the first try plus 3 retries after a 429 or a 5xx
 LOCK_KEY = 0x484C314D  # "HL1M": one repair at a time, across cron and manual runs
 
 UPSERT_REPAIR_SQL = """
@@ -115,6 +118,10 @@ SENTINEL = {"exchange": EXCHANGE, "market_type": MARKET_TYPE, "symbol": LOOP_SEN
 
 class RateLimited(Exception):
     """HL answered 429: the shared per-IP weight budget is spent."""
+
+
+class Unavailable(Exception):
+    """HL answered a 5xx: its gateway or server failed, which a later attempt usually gets past."""
 
 
 class FetchError(Exception):
@@ -174,6 +181,7 @@ class Pacer:
     per_min: float = WEIGHT_PER_MIN
     ready_at: float | None = None
     http429: int = 0
+    http5xx: int = 0
 
     def charge(self, weight: int) -> None:
         now = self.clock()
@@ -186,6 +194,10 @@ class Pacer:
         self.http429 += 1
         self.per_min = max(self.per_min / 2, MIN_WEIGHT_PER_MIN)
         self.sleep(BACKOFF_429_S)
+
+    def unavailable(self) -> None:
+        self.http5xx += 1
+        self.sleep(BACKOFF_5XX_S)
 
 
 # ---------------------------------------------------------------------------
@@ -277,6 +289,8 @@ def _post(payload: dict):
     except urllib.error.HTTPError as e:
         if e.code == 429:
             raise RateLimited() from e
+        if 500 <= e.code < 600:
+            raise Unavailable(f"HTTP {e.code}") from e
         raise FetchError(f"HTTP {e.code}") from e
     except (urllib.error.URLError, OSError, ValueError) as e:
         raise FetchError(str(e)) from e
@@ -298,14 +312,19 @@ def fetch_meta_names() -> dict[str, str]:
 
 
 def paced(pacer: Pacer, weight: int, call):
-    """One HL call through the pacer, retrying after a 429. Every attempt is charged."""
+    """One HL call through the pacer, retrying after a 429 or a 5xx. Every attempt is charged."""
+    last = ""
     for _ in range(MAX_ATTEMPTS):
         pacer.charge(weight)
         try:
             return call()
         except RateLimited:
+            last = "HTTP 429"
             pacer.rate_limited()
-    raise FetchError(f"429 on {MAX_ATTEMPTS} attempts")
+        except Unavailable as e:
+            last = str(e)
+            pacer.unavailable()
+    raise FetchError(f"retry budget exhausted after {MAX_ATTEMPTS} attempts; last {last}")
 
 
 # ---------------------------------------------------------------------------
@@ -532,9 +551,10 @@ def _finish(session: Session, win: Window, start: int, delivered: bool, results:
     if advanced:
         session.call(advance_cursor, win.end)
     flat = [r for rs in results.values() for r in rs]
-    log.info("DONE window=%s coins=%d inserted=%d updated=%d incomplete=%d http429=%d lost=%s advanced=%s%s",
+    log.info("DONE window=%s coins=%d inserted=%d updated=%d incomplete=%d http429=%d http5xx=%d lost=%s "
+             "advanced=%s%s",
              _span(start, win.end), len(results), sum(r["inserted"] for r in flat),
-             sum(r["updated"] for r in flat), len(incomplete), pacer.http429,
+             sum(r["updated"] for r in flat), len(incomplete), pacer.http429, pacer.http5xx,
              _span(*win.lost) if win.lost else "none", advanced,
              "" if covers else " (manual window short of the required range)")
     if incomplete:

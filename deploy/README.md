@@ -131,7 +131,7 @@ TimescaleDB auto-tunes `max_connections` low (~25 on 8GB). Override via `command
 
 `python -m hl_candles_repair` replaces recent HyperLiquid 1m bars with REST's closed values: the WebSocket feed can drop minutes or stop short of a minute's last trades, and REST only keeps ~3.5 days. It shares HL's per-IP request budget with the collector, so it trickles at 20 weight a minute.
 
-- **Logs:** `/var/log/candle-collector-hl-candles-repair.log`. The `DONE` line counts inserted (missing minutes filled) and updated (unclosed bars corrected) bars, incomplete coins and 429s.
+- **Logs:** `/var/log/candle-collector-hl-candles-repair.log`. The `DONE` line counts inserted (missing minutes filled) and updated (unclosed bars corrected) bars, incomplete coins, 429s and 5xx. A 429 makes the run exit 1; a 5xx that a retry got past doesn't.
 - **Paging:** the monitor pages when the `candle_repair` sentinel has no success for 36 h. A span that aged past REST's history before it could be repaired is posted to `WEBHOOK_URL`; the cursor moves past it only once that post is delivered.
 - **After a failure** nothing is needed: the next run reaches back to the last repaired minute (up to 72 h).
 - **Building:** it bakes `collector/`, so rebuild it with `--profile hl-candles-repair build hl-candles-repair` after a code update.
