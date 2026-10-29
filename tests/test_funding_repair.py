@@ -47,6 +47,8 @@ class TableConn:
             lo, hi = params["lo_s"] * 1000, params["hi_s"] * 1000
             self.result = sorted((t, r, i) for (s, t), (r, i) in self.table.items()
                                  if s == params["symbol"] and lo <= t < hi)
+        elif sql == fr.CUSTOM_PLAN_SQL:
+            pass  # plan choice only matters to a real TimescaleDB (check_funding_repair.py)
         elif sql == fr.DELETE_SQL:
             self.deletes.append(params)
             for key in [k for k in self.table if k[0] == params["symbol"] and k[1] < params["hi_s"] * 1000]:

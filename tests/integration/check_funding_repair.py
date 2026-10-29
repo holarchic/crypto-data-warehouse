@@ -221,6 +221,44 @@ def check_cursors(conn):
     check("stored_cursors gives the newest row within 7 days, in ms", cursors.get(OTHER) == now - 2 * H + 5, repr(cursors))
 
 
+def check_generic_plan(conn):
+    """replace_rows decompresses only its own symbol's batches, even once its DELETE is prepared and
+    the session would plan it generically."""
+    with conn.cursor() as cur:
+        cur.execute("DELETE FROM funding_rates")
+        cur.executemany(funding.INSERT_FUNDING_SQL, [r.params() for r in venue_rows(12)])
+        cur.executemany(funding.INSERT_FUNDING_SQL,
+                        [dataclasses.replace(r, asset_id="BTC", symbol=OTHER).params()
+                         for r in venue_rows(600, step_h=1)])
+    conn.commit()
+    with conn.cursor() as cur:
+        cur.execute("SELECT count(compress_chunk(c, if_not_compressed => true)) "
+                    "FROM show_chunks('funding_rates', older_than => now() - interval '30 days') c")
+        cur.execute("SET timescaledb.max_tuples_decompressed_per_dml_transaction = 200")
+        cur.execute("SET plan_cache_mode = force_generic_plan")
+    conn.commit()
+    until = T0 + 60 * H
+    params = {"exchange": "binance", "symbol": SYMBOL, "hi_s": (until + 1000) / 1000}
+    try:
+        with conn.cursor() as cur:
+            cur.execute(fr.DELETE_SQL, params, prepare=True)
+        tripped = False
+    except psycopg.Error:
+        tripped = True
+    conn.rollback()
+    check("a generic DELETE decompresses the other symbol and trips the limit", tripped)
+
+    rows = venue_rows(12)
+    for _ in range(7):  # past psycopg's prepare threshold
+        fr.replace_rows(conn, "binance", SYMBOL, until, rows)
+    check("replace_rows keeps a custom plan through repeated runs",
+          table(conn) == expected(rows) and len(table(conn, OTHER)) == 600)
+    with conn.cursor() as cur:
+        cur.execute("RESET plan_cache_mode")
+        cur.execute("RESET timescaledb.max_tuples_decompressed_per_dml_transaction")
+    conn.commit()
+
+
 def main():
     dsn = os.environ["CC_PG_TEST_DSN"]
     conn = psycopg.connect(dsn)
@@ -229,6 +267,7 @@ def main():
     check_locks(dsn, conn)
     check_csv_rollback(conn)
     check_cursors(conn)
+    check_generic_plan(conn)
     print("all funding repair checks passed")
 
 

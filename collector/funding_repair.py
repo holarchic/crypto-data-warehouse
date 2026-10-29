@@ -84,6 +84,10 @@ STORED_SQL = """
     WHERE exchange = %(exchange)s AND symbol = %(symbol)s
       AND timestamp >= to_timestamp(%(lo_s)s) AND timestamp < to_timestamp(%(hi_s)s)
 """
+# psycopg prepares a statement on its 5th run, and Postgres may then plan it generically. A generic
+# DELETE leaves TimescaleDB no symbol to pick compressed batches by, so it decompresses every batch in
+# range (~2.2M rows) and trips its 100k-per-transaction limit.
+CUSTOM_PLAN_SQL = "SET LOCAL plan_cache_mode = force_custom_plan"
 DELETE_SQL = """
     DELETE FROM funding_rates
     WHERE exchange = %(exchange)s AND symbol = %(symbol)s AND timestamp < to_timestamp(%(hi_s)s)
@@ -247,6 +251,7 @@ def replace_rows(conn, exchange_name: str, symbol: str, until_ms: int, rows: lis
     """One transaction: delete the symbol's rows below `until + 1 s`, upsert the venue's."""
     try:
         with conn.cursor() as cur:
+            cur.execute(CUSTOM_PLAN_SQL)
             cur.execute(DELETE_SQL, {"exchange": exchange_name, "symbol": symbol, "hi_s": (until_ms + 1000) / 1000})
             cur.executemany(UPSERT_SQL, [row.params() for row in rows])
         conn.commit()
